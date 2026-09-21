@@ -1,0 +1,35 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Application data when launched from the source directory
+/app.json
+/app.json.*
+/task_ids.json
+/task_ids.json.*
+/log.jsonl
+/log.jsonl.*
+/chats/
+/agents/
+/calendar/
+/context/
+/credentials/
+/scheduled_tasks/
+/skills/
+/vault/
+/velox-data/
+
+# Local configuration and generated output
+.env
+.env.*
+*.cred
+*.log
+/build*/
+/dist/
+*.zip
+.DS_Store
+Thumbs.db
