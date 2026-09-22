@@ -93,6 +93,37 @@ def _paths_equivalent(a: Path, b: Path) -> bool:
         except OSError:
             return os.path.normcase(str(pa)) == os.path.normcase(str(pb))
 
+def _independent_display_datetime(value: str | None) -> str:
+    """Derive the local display for a UTC ISO timestamp independently.
+
+    Mirrors velox.format_display_datetime's conversion (parse, astimezone,
+    format) without calling that helper, so an assertion can verify the local
+    tooltip date against the fixture timestamp on any host timezone.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone()
+        return f"{local.strftime('%B')} {local.day} {local.year}, {local.strftime('%H:%M')}"
+    except Exception:
+        return raw
+
+def _create_fixture_symlink(link: Path, target: Path) -> None:
+    """Create a fixture symlink, skipping only when native privilege is absent."""
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            raise unittest.SkipTest("symlink privilege not held (WinError 1314)")
+        raise
+
+
+
 class _TestDummyFont:
     """Deterministic font metrics for layout tests."""
 
@@ -12524,8 +12555,9 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         }
         thinking_tip = panel._chat_section_stats_tooltip({"kind": "thinking", "turn": turn})
         assistant_tip = panel._chat_section_stats_tooltip({"kind": "assistant", "turn": turn})
+        local_date = _independent_display_datetime("2026-08-05T07:07:00Z")
         for tooltip in (thinking_tip, assistant_tip):
-            self.assertIn("August 5 2026, 07:07", tooltip)
+            self.assertIn(local_date, tooltip)
             self.assertIn("Total", tooltip)
             self.assertIn("Input", tooltip)
             self.assertIn("Gen", tooltip)
@@ -12542,6 +12574,31 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("header_h = self._chat_card_header_height()", draw_source)
         section_source = inspect.getsource(velox.Panels._chat_sections)
         self.assertNotIn('section["tooltip"] =', section_source)
+
+    def test_format_display_datetime_timezone_and_dst(self) -> None:
+        if not hasattr(time, "tzset"):
+            self.skipTest("TZ control requires time.tzset (POSIX)")
+        saved_tz = os.environ.get("TZ")
+        try:
+            cases = [
+                ("UTC", "2026-08-05T07:07:00Z", "August 5 2026, 07:07"),
+                ("America/Toronto", "2026-08-05T07:07:00Z", "August 5 2026, 03:07"),
+                ("America/Toronto", "2026-01-05T07:07:00Z", "January 5 2026, 02:07"),
+                ("America/Toronto", "2026-03-08T06:59:00Z", "March 8 2026, 01:59"),
+                ("America/Toronto", "2026-03-08T07:01:00Z", "March 8 2026, 03:01"),
+            ]
+            for tz, timestamp, expected in cases:
+                with self.subTest(tz=tz, timestamp=timestamp):
+                    os.environ["TZ"] = tz
+                    time.tzset()
+                    self.assertEqual(velox.format_display_datetime(timestamp), expected)
+        finally:
+            if saved_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved_tz
+            if hasattr(time, "tzset"):
+                time.tzset()
 
     def test_chat_runtime_stats_use_weighted_rates_and_statistics_dialog(self) -> None:
         turns = [
@@ -29087,10 +29144,26 @@ class ProcessAndOwnershipTests(_AsyncRuntimeFixture):
     def test_screenshot_suffix_rewrite_cannot_follow_outside_symlink(self) -> None:
         root = self.paths.chat_workspace_dir(self.cid)
         outside = Path(self.temp.name) / "outside.png"; outside.write_bytes(b"not overwritten")
-        (root / "capture.png").symlink_to(outside)
+        _create_fixture_symlink(root / "capture.png", outside)
         with self.assertRaises((PermissionError, ValueError)):
             self.tools.browser_tools._playback_capture_path(self.cid, str(root / "capture.jpg"))
         self.assertEqual(outside.read_bytes(), b"not overwritten")
+
+    def test_symlink_capability_guard_skips_only_winerror_1314(self) -> None:
+        link = Path(self.temp.name) / "priv.png"
+        outside = Path(self.temp.name) / "target.png"
+        privilege_error = OSError(1314, "privilege not held")
+        privilege_error.winerror = 1314
+        with mock.patch.object(Path, "symlink_to", side_effect=privilege_error):
+            with self.assertRaises(unittest.SkipTest):
+                _create_fixture_symlink(link, outside)
+
+    def test_symlink_capability_guard_rejects_unrelated_errors(self) -> None:
+        link = Path(self.temp.name) / "unrelated.png"
+        outside = Path(self.temp.name) / "target.png"
+        with mock.patch.object(Path, "symlink_to", side_effect=OSError(1, "broken")):
+            with self.assertRaises(OSError):
+                _create_fixture_symlink(link, outside)
     def test_terminal_record_must_match_agent_parent_chat(self) -> None:
         terminal = self.tools.terminal_runtime
         record = {"owner_type": "agent", "owner_id": "agent-A", "parent_chat_id": "chat-A"}
