@@ -32129,6 +32129,7 @@ class RealLoopbackCancellationTests(unittest.TestCase):
             server.server_close()
             worker.join(2)
 
+    @unittest.skipUnless(os.name == "nt", "Winsock closesocket boundary is Windows-only")
     def test_interruption_boundary_failure_is_observable(self) -> None:
         class FakeSocket:
             def fileno(self) -> int:
