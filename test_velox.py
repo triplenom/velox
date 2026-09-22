@@ -31874,7 +31874,282 @@ class RealLoopbackCancellationTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             worker.join(2)
+    def _find_openssl(self) -> str:
+        exe = shutil.which("openssl")
+        if exe:
+            return exe
+        for candidate in (r"C:\Program Files\Git\usr\bin\openssl.exe", "/usr/bin/openssl", "/usr/local/bin/openssl"):
+            if os.path.exists(candidate):
+                return candidate
+        self.skipTest("openssl unavailable to provision the local TLS fixture")
 
+    def _tls_fixture(self) -> tuple[ssl.SSLContext, ssl.SSLContext]:
+        openssl = self._find_openssl()
+        tmp = tempfile.mkdtemp(prefix="velox_tls_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cert = os.path.join(tmp, "cert.pem")
+        key = os.path.join(tmp, "key.pem")
+        result = subprocess.run(
+            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-keyout", key, "-out", cert,
+             "-days", "1", "-nodes", "-subj", "/CN=localhost",
+             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+             "-addext", "basicConstraints=critical,CA:TRUE",
+             "-addext", "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0 or not os.path.exists(cert) or not os.path.exists(key):
+            self.skipTest("openssl could not provision the local TLS fixture")
+        srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        srv_ctx.load_cert_chain(certfile=cert, keyfile=key)
+        cli_ctx = ssl.create_default_context(cafile=cert)
+        return srv_ctx, cli_ctx
+
+    def test_stalled_https_body_read_is_interrupted_by_transport_close(self) -> None:
+        srv_ctx, cli_ctx = self._tls_fixture()
+        stall = threading.Event()
+
+        class StalledHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                try:
+                    self.wfile.write(b"partial\n")
+                    self.wfile.flush()
+                    stall.wait(20.0)
+                    self.wfile.write(b"done\n")
+                except Exception:
+                    pass
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
+        try:
+            server.socket = srv_ctx.wrap_socket(server.socket, server_side=True)
+        except Exception as exc:  # pragma: no cover - environment TLS failure
+            server.server_close()
+            self.skipTest(f"could not wrap loopback socket with TLS: {exc}")
+        port = int(server.server_address[1])
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        entered = threading.Event()
+        completed = threading.Event()
+        output: list[Any] = []
+        response_holder: dict[str, Any] = {}
+
+        def request() -> None:
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"https://localhost:{port}/", data=b"x", method="POST"
+                    ),
+                    timeout=10,
+                    context=cli_ctx,
+                )
+                response_holder["response"] = response
+                entered.set()
+                output.append(response.read(4096))
+            except Exception as exc:
+                output.append(exc)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5), "client never reached the stalled HTTPS body")
+            time.sleep(0.2)
+            self.assertFalse(completed.is_set(), "read completed before close")
+            velox.LLMClient._close_response_transport(response_holder["response"])
+            self.assertTrue(completed.wait(5), "blocked HTTPS read was not interrupted")
+            self.assertNotIn(b"done\n", output[0] if isinstance(output[0], bytes) else b"")
+        finally:
+            stall.set()
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+
+    def test_repeated_transport_close_is_harmless(self) -> None:
+        stall = threading.Event()
+
+        class StalledHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(b"partial\n")
+                    self.wfile.flush()
+                    stall.wait(20.0)
+                    self.wfile.write(b"done\n")
+                except Exception:
+                    pass
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
+        port = int(server.server_address[1])
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        entered = threading.Event()
+        completed = threading.Event()
+        response_holder: dict[str, Any] = {}
+
+        def request() -> None:
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(f"http://127.0.0.1:{port}/", data=b"x", method="POST"),
+                    timeout=10,
+                )
+                response_holder["response"] = response
+                entered.set()
+                response.read(4096)
+            except Exception:
+                pass
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            velox.LLMClient._close_response_transport(response_holder["response"])
+            self.assertTrue(completed.wait(5))
+            # A repeated close must be harmless: no exception and no reused
+            # descriptor is closed once the socket was detached.
+            velox.LLMClient._close_response_transport(response_holder["response"])
+        finally:
+            stall.set()
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+
+    def test_two_callers_cancelling_same_response_is_harmless(self) -> None:
+        stall = threading.Event()
+
+        class StalledHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(b"partial\n")
+                    self.wfile.flush()
+                    stall.wait(20.0)
+                    self.wfile.write(b"done\n")
+                except Exception:
+                    pass
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
+        port = int(server.server_address[1])
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        entered = threading.Event()
+        completed = threading.Event()
+        response_holder: dict[str, Any] = {}
+
+        def request() -> None:
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(f"http://127.0.0.1:{port}/", data=b"x", method="POST"),
+                    timeout=10,
+                )
+                response_holder["response"] = response
+                entered.set()
+                response.read(4096)
+            except Exception:
+                pass
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        errors: list[Any] = []
+
+        def closer() -> None:
+            try:
+                velox.LLMClient._close_response_transport(response_holder["response"])
+            except Exception as exc:
+                errors.append(exc)
+
+        closer_a = threading.Thread(target=closer)
+        closer_b = threading.Thread(target=closer)
+        try:
+            self.assertTrue(entered.wait(5))
+            closer_a.start()
+            closer_b.start()
+            closer_a.join(5)
+            closer_b.join(5)
+            self.assertTrue(completed.wait(5), "blocked read was not interrupted")
+            self.assertEqual(errors, [])
+        finally:
+            stall.set()
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+
+    def test_cancellation_racing_normal_completion_is_bounded(self) -> None:
+        class DoneHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "5")
+                self.end_headers()
+                self.wfile.write(b"done\n")
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DoneHandler)
+        port = int(server.server_address[1])
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        entered = threading.Event()
+        completed = threading.Event()
+        response_holder: dict[str, Any] = {}
+
+        def request() -> None:
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(f"http://127.0.0.1:{port}/", data=b"x", method="POST"),
+                    timeout=10,
+                )
+                response_holder["response"] = response
+                entered.set()
+                response.read()
+            except Exception:
+                pass
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            # Close races normal completion; either the read finishes normally
+            # or the close interrupts it, but it must never hang or corrupt.
+            velox.LLMClient._close_response_transport(response_holder["response"])
+            self.assertTrue(completed.wait(5), "read neither completed nor was interrupted")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+
+    def test_interruption_boundary_failure_is_observable(self) -> None:
+        class FakeSocket:
+            def fileno(self) -> int:
+                return 5
+            def detach(self) -> int:
+                return 7
+
+        binding = SimpleNamespace(
+            closesocket=lambda fd: -1,
+            WSAGetLastError=lambda: 10054,
+        )
+        snapshot = list(velox._TRANSPORT_CLOSE_DIAGNOSTICS)
+        try:
+            with mock.patch.object(velox, "_win_ws2_32", return_value=binding):
+                velox._interrupt_blocked_socket(FakeSocket())
+            self.assertTrue(
+                any("closesocket failed" in message for message in velox._TRANSPORT_CLOSE_DIAGNOSTICS),
+                velox._TRANSPORT_CLOSE_DIAGNOSTICS,
+            )
+        finally:
+            velox._TRANSPORT_CLOSE_DIAGNOSTICS[:] = snapshot
 
 class DashboardAndSleepTests(_AsyncRuntimeFixture):
     def setUp(self) -> None:
