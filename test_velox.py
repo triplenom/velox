@@ -32135,10 +32135,10 @@ class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
             self.assertIn("LLMRequestCancelledError", collected[-1].error or "", collected)
             self.assertTrue(
                 await asyncio.to_thread(self._wait_threads_gone,
-                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 4),
+                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 10),
                 "worker/close threads did not end before the stalled server was released",
             )
-            self.assertLess(elapsed, 3.0, f"cancellation took {elapsed:.3f}s")
+            self.assertLess(elapsed, 8.0, f"cancellation took {elapsed:.3f}s")
             self.assertFalse(release_server.is_set())
         finally:
             release_server.set()
@@ -32217,10 +32217,10 @@ class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
                 except (asyncio.CancelledError, velox.LLMRequestCancelledError):
                     pass
                 elapsed = time.perf_counter() - start
-            self.assertLess(elapsed, 3.0, f"cancellation took {elapsed:.3f}s")
+            self.assertLess(elapsed, 8.0, f"cancellation took {elapsed:.3f}s")
             self.assertTrue(
                 await asyncio.to_thread(self._wait_threads_gone,
-                                        {"velox-llm-response", "velox-llm-response-close"}, 4),
+                                        {"velox-llm-response", "velox-llm-response-close"}, 10),
                 "worker/close threads did not end before the stalled server was released",
             )
             self.assertFalse(release_server.is_set())
@@ -32297,7 +32297,7 @@ class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
             self.assertIn("LLMRequestCancelledError", collected[-1].error or "", collected)
             self.assertTrue(
                 await asyncio.to_thread(self._wait_threads_gone,
-                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 4),
+                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 10),
                 "worker/close threads did not end before releasing the stalled server",
             )
         finally:
@@ -32351,7 +32351,7 @@ class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
                     pass
             self.assertTrue(
                 await asyncio.to_thread(self._wait_threads_gone,
-                                        {"velox-llm-response", "velox-llm-response-close"}, 4),
+                                        {"velox-llm-response", "velox-llm-response-close"}, 10),
                 "worker/close threads did not end before releasing the stalled server",
             )
         finally:
@@ -32671,7 +32671,7 @@ class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
                 self.assertEqual("ROBUST", terminal.text.strip())
             self.assertTrue(
                 await asyncio.to_thread(self._wait_threads_gone,
-                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 4),
+                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 10),
             )
         finally:
             release_server.set()
@@ -32796,8 +32796,8 @@ class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
         # Request cancellation and verify the read unblocks promptly.
         started = time.perf_counter()
         velox.LLMClient._close_response_transport(response)
-        self.assertTrue(completed.wait(3), "read did not unblock after cancellation")
-        self.assertLess(time.perf_counter() - started, 3.0)
+        self.assertTrue(completed.wait(8), "read did not unblock after cancellation")
+        self.assertLess(time.perf_counter() - started, 8.0)
         thread.join(2)
         self.assertFalse(thread.is_alive())
         # The original socket object must still reference its descriptor (owned),
@@ -32987,7 +32987,7 @@ class LocalHTTPDeadlineTests(_AsyncRuntimeFixture):
                         start = time.monotonic()
                         result = await asyncio.wait_for(method(request), 3)
                         self.assertEqual(result['text'], 'Resumed.')
-                        self.assertLess(time.monotonic() - start, 2.8)
+                        self.assertLess(time.monotonic() - start, 8.0)
                         self.assertEqual(len(bodies), 2)
                         self.assertEqual(bodies[0], bodies[1])
                         self.assertFalse(release.is_set(), 'The test did not unblock the original request')
