@@ -18205,7 +18205,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
         self.assertIn('"title": "Title"', dashboard)
         self.assertNotIn("Live per-endpoint inference queues", dashboard)
         runner = inspect.getsource(run_test_suite)
-        self.assertIn('_build_test_groups(class_rows, isolated=isolated)', runner)
+        self.assertIn('for name, count in class_rows', runner)
         self.assertIn('argument = str(row["argument"])', runner)
         self.assertIn('count = int(row["count"])', runner)
         self.assertIn('VELOX_TEST_SUCCESS_MARKER', runner)
@@ -22298,65 +22298,8 @@ def run_test_class(class_name: str) -> NoReturn:
     os._exit(0 if result.wasSuccessful() else 1)
 
 
-# These classes intentionally exercise process/transport failure boundaries.
-_ISOLATED_TEST_CLASSES = frozenset({
-    "TestRunnerIntegrityTests",
-    "TestResultMarkerTests",
-    "TransportDeadlineTests",
-    "RealLoopbackCancellationTests",
-})
-
-
-def _build_test_groups(
-    class_rows: list[tuple[str, int]],
-    *,
-    isolated: bool = False,
-) -> list[dict[str, Any]]:
-    """Pack ordinary test classes into a bounded set of disposable child shards.
-
-    Each batch is comma-separated for ``run_test_class`` and may hold up to
-    ``MAX_BATCH_TESTS`` tests or ``MAX_BATCH_CLASSES`` classes. Classes that
-    manipulate process state, exercise native/transport boundaries, or are very
-    large run alone so a shared child cannot be destabilized. The finished
-    parent still validates every child result exactly once.
-    """
-    groups: list[dict[str, Any]] = []
-    batch: list[tuple[str, int]] = []
-    batch_count = 0
-    max_batch_tests = 100
-    max_batch_classes = 8
-
-    def emit() -> None:
-        nonlocal batch_count
-        if not batch:
-            return
-        names = ",".join(name for name, _count in batch)
-        groups.append({
-            "label": names,
-            "argument": names,
-            "count": batch_count,
-        })
-        batch.clear()
-        batch_count = 0
-
-    for name, count in class_rows:
-        if count <= 0:
-            raise ValueError(f"Empty test class: {name}")
-        alone = isolated or name in _ISOLATED_TEST_CLASSES or count >= 100
-        if alone:
-            emit()
-            groups.append({"label": name, "argument": name, "count": count})
-            continue
-        if batch and (batch_count + count > max_batch_tests or len(batch) >= max_batch_classes):
-            emit()
-        batch.append((name, count))
-        batch_count += count
-    emit()
-    return groups
-
-
-def run_test_suite(*, isolated: bool = False) -> int:
-    """Discover the full suite and run each class in a disposable process.
+def run_test_suite() -> int:
+    """Discover the full suite and run each class in its own disposable process.
 
     Native code, background writers and async fixtures need process isolation.
     Retain bounded execution and exact child-result checks so a hung fixture
@@ -22368,7 +22311,10 @@ def run_test_suite(*, isolated: bool = False) -> int:
         if tests:
             class_rows.append((tests[0].__class__.__name__, len(tests)))
 
-    groups = _build_test_groups(class_rows, isolated=isolated)
+    groups = [
+        {"label": name, "argument": name, "count": count}
+        for name, count in class_rows
+    ]
 
     velox.CoalescingAtomicJSONWriter.shutdown_all(timeout=3.0)
     velox.BatchedJSONLWriter.shutdown_all(timeout=3.0)
@@ -42250,55 +42196,83 @@ class TestRunnerIntegrityTests(unittest.TestCase):
                 writer.write('OK')
             self.assertFalse(marker.exists(), 'Only a completed successful TestResult may publish the marker')
 
-    def test_build_groups_packs_ordinary_classes_within_bounds(self) -> None:
-        rows = [("ClassA", 30), ("ClassB", 30), ("ClassC", 30), ("ClassD", 30), ("ClassE", 30)]
-        groups = _build_test_groups(rows)
-        # Every ordinary class is packed; no single batch exceeds 100 tests or 8 classes.
-        self.assertEqual(len(groups), 2)
-        for group in groups:
-            self.assertLessEqual(group["count"], 100)
-            self.assertLessEqual(len(group["argument"].split(",")), 8)
-            self.assertEqual(group["label"], group["argument"])
-        self.assertEqual(sum(g["count"] for g in groups), 150)
+    def test_each_discovered_class_produces_one_separate_child_selection(self) -> None:
+        # The runner must launch exactly one separate disposable child per
+        # discovered TestCase class, with that class's own test count, no
+        # omissions and no duplicates. This replaces the removed batch-packing
+        # mechanics (which shared a single child across many classes).
+        class Alpha(unittest.TestCase):
+            def test_one(self) -> None: pass
+            def test_two(self) -> None: pass
+        class Beta(unittest.TestCase):
+            def test_one(self) -> None: pass
+            def test_two(self) -> None: pass
+            def test_three(self) -> None: pass
+        class Gamma(unittest.TestCase):
+            def test_one(self) -> None: pass
+            def test_two(self) -> None: pass
+            def test_three(self) -> None: pass
+            def test_four(self) -> None: pass
 
-    def test_build_groups_isolates_process_boundary_and_large_classes(self) -> None:
-        rows = [
-            ("TestRunnerIntegrityTests", 1),
-            ("RealLoopbackCancellationTests", 33),
-            ("HugeClass", 120),
-            ("Ordinary", 10),
-        ]
-        groups = _build_test_groups(rows)
-        labels = [g["label"] for g in groups]
-        self.assertIn("TestRunnerIntegrityTests", labels)
-        self.assertIn("RealLoopbackCancellationTests", labels)
-        self.assertIn("HugeClass", labels)
-        # Large/native/process-boundary classes run alone in one-row batches.
-        for name in ("TestRunnerIntegrityTests", "RealLoopbackCancellationTests", "HugeClass"):
-            self.assertEqual(groups[labels.index(name)]["argument"], name)
-        # Packed Ordinary shares a batch with no isolated class.
-        ordinary = next(g for g in groups if "Ordinary" in g["argument"])
-        self.assertEqual(ordinary["argument"], "Ordinary")
+        expected = {"Alpha": 2, "Beta": 3, "Gamma": 4}
 
-    def test_build_groups_selects_every_identity_exactly_once(self) -> None:
-        rows = [("A", 12), ("B", 34), ("C", 56), ("D", 99), ("E", 1)]
-        groups = _build_test_groups(rows)
-        chosen = [name for g in groups for name in g["argument"].split(",")]
-        self.assertEqual(sorted(chosen), sorted(name for name, _ in rows))
-        self.assertEqual(len(chosen), len(rows))
-        self.assertEqual(sum(g["count"] for g in groups), sum(count for _, count in rows))
+        def class_suite(cls: type[unittest.TestCase], count: int) -> unittest.TestSuite:
+            names = unittest.defaultTestLoader.getTestCaseNames(cls)[:count]
+            return unittest.TestSuite(cls(name) for name in names)
 
-    def test_build_groups_isolated_mode_keeps_every_class_alone(self) -> None:
-        rows = [("A", 5), ("B", 5), ("C", 5)]
-        groups = _build_test_groups(rows, isolated=True)
-        self.assertEqual([g["argument"] for g in groups], ["A", "B", "C"])
-        self.assertEqual([g["count"] for g in groups], [5, 5, 5])
+        inventory = unittest.TestSuite([
+            class_suite(Alpha, expected["Alpha"]),
+            class_suite(Beta, expected["Beta"]),
+            class_suite(Gamma, expected["Gamma"]),
+        ])
 
-    def test_build_groups_rejects_empty_class(self) -> None:
-        with self.assertRaises(ValueError):
-            _build_test_groups([("Empty", 0)])
-        with self.assertRaises(ValueError):
-            _build_test_groups([("Empty", 0), ("Good", 1)])
+        launches: list[tuple[str, int]] = []
+        pid_base = 987000000
+
+        class FakeChild:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+            def poll(self) -> int:
+                return 0
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+            def terminate(self) -> None:
+                pass
+            def kill(self) -> None:
+                pass
+
+        def launch(*args: Any, **kwargs: Any) -> Any:
+            command = args[0]
+            name = str(command[-1])
+            count = expected[name]
+            pid = pid_base + len(launches)
+            marker = Path(kwargs["env"]["VELOX_TEST_SUCCESS_MARKER"])
+            token = str(kwargs["env"]["VELOX_TEST_RUN_TOKEN"])
+            identity = marker.with_name(marker.name + ".identity")
+            identity.write_text(json.dumps({"token": token, "pid": pid, "count": count}))
+            payload = {
+                "schema": f"velox_test_result.v{velox.SOURCE_REVISION}",
+                "pid": pid, "tests": count, "failures": 0, "errors": 0,
+                "skipped": 0, "successful": True,
+            }
+            marker.write_text(json.dumps(payload))
+            launches.append((name, count))
+            return FakeChild(pid)
+
+        with mock.patch.object(unittest.defaultTestLoader, "loadTestsFromModule", return_value=inventory), \
+             mock.patch.object(subprocess, "Popen", side_effect=launch), \
+             mock.patch(f"{__name__}._raw_test_status_write") as status:
+            code = run_test_suite()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launches), len(expected))
+        self.assertEqual(set(name for name, _ in launches), set(expected))
+        self.assertEqual(len(set(name for name, _ in launches)), len(expected))
+        self.assertEqual([count for _name, count in sorted(launches)], [expected[n] for n in sorted(expected)])
+        self.assertEqual(sum(count for _name, count in launches), 9)
+        text = " ".join(str(call) for call in status.call_args_list)
+        self.assertIn("Ran 9 tests in", text)
+        self.assertIn("OK", text)
 
 
 class ReportQueueRecoveryTests(_AsyncRuntimeFixture):
@@ -43566,11 +43540,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Velox regression suite.")
     parser.add_argument("--test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--test-class", default="", metavar="CLASS", help="run a test class or comma-separated classes")
-    parser.add_argument("--isolated", action="store_true", help="run every test class in its own disposable process (no batching)")
     args = parser.parse_args()
     if args.test_class:
         run_test_class(args.test_class)
-    exit_after_tests(run_test_suite(isolated=bool(args.isolated)))
+    exit_after_tests(run_test_suite())
 
 
 if __name__ == "__main__":
