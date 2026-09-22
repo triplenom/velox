@@ -150,17 +150,21 @@ def _drain_storage_log_writer(storage: velox.Storage) -> None:
     """Flush and release the app-log writer for this storage's log path.
 
     Run before a data-root TemporaryDirectory is removed on Windows so an open
-    log.jsonl handle cannot make rmtree fail with WinError 32. Then clear the
-    data-root registrations so a later test does not see a stale root.
+    log.jsonl handle cannot make rmtree fail with WinError 32. A path-scoped
+    drain is attempted first; only if it times out is a bounded global drain
+    used, and its result is checked too. On any failed drain this raises rather
+    than silently clearing the data-root registrations.
     """
     try:
         log_path = Path(storage.log_path())
     except Exception:
         log_path = None
     if log_path is not None:
-        drained = velox.APP_LOG_WRITER.flush((log_path,), timeout=3.0)
-        if not drained:
-            velox.APP_LOG_WRITER.flush(timeout=3.0)
+        if not velox.APP_LOG_WRITER.flush((log_path,), timeout=3.0):
+            if not velox.APP_LOG_WRITER.flush(timeout=3.0):
+                raise RuntimeError(
+                    f"app-log writer did not drain {log_path} before teardown"
+                )
     velox.DATA_ROOTS.clear_for_tests()
 
 
@@ -18121,7 +18125,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
         self.assertIn('"count": count', runner)
         self.assertIn('VELOX_TEST_SUCCESS_MARKER', runner)
         self.assertIn('deadline = time.monotonic() + 1800.0', runner)
-        self.assertIn('_test_result_matches(success_marker, process.pid, count)', runner)
+        self.assertIn('_test_result_matches(success_marker, child_pid, count)', runner)
         self.assertIn('process.wait(timeout=5.0)', runner)
         self.assertIn('terminate_process_tree(process)', runner)
         class_runner = inspect.getsource(run_test_class)
@@ -41690,6 +41694,191 @@ class TestResultMarkerTests(unittest.TestCase):
             self.assertFalse(_test_result_matches(path, os.getpid(), 3))
 
 
+
+
+class JsonlAppendHandleTests(unittest.TestCase):
+    """Ownership and error handling for the Windows JSONL append handle."""
+
+    @staticmethod
+    def _kernel(create_result: Any, closed: list[int]) -> SimpleNamespace:
+        def create(*_args: Any, **_kwargs: Any) -> Any:
+            return create_result
+
+        def close(handle: int) -> int:
+            closed.append(handle)
+            return 1
+
+        kernel = SimpleNamespace()
+        kernel.CreateFileW = create
+        kernel.CloseHandle = close
+        return kernel
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle path")
+    def test_create_file_failure_raises_winerror_and_closes_nothing(self) -> None:
+        closed: list[int] = []
+        kernel = self._kernel(None, closed)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.jsonl"
+            with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
+                 mock.patch.object(velox.ctypes, 'get_last_error', return_value=32), \
+                 mock.patch('msvcrt.open_osfhandle') as adopt, \
+                 mock.patch.object(velox.os, 'fdopen') as fdopen:
+                with self.assertRaises(OSError) as cm:
+                    velox._open_jsonl_append_handle(path)
+        self.assertEqual(getattr(cm.exception, 'winerror', None), 32)
+        self.assertEqual(closed, [])
+        adopt.assert_not_called()
+        fdopen.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle path")
+    def test_descriptor_adoption_failure_closes_raw_handle(self) -> None:
+        closed: list[int] = []
+        kernel = self._kernel(0x1234, closed)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.jsonl"
+            with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
+                 mock.patch('msvcrt.open_osfhandle', side_effect=OSError("adopt failed")), \
+                 mock.patch.object(velox.os, 'fdopen') as fdopen:
+                with self.assertRaises(OSError) as cm:
+                    velox._open_jsonl_append_handle(path)
+        self.assertIn("adopt failed", str(cm.exception))
+        self.assertEqual(closed, [0x1234])
+        fdopen.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle path")
+    def test_stream_construction_failure_closes_descriptor_not_raw_handle(self) -> None:
+        closed: list[int] = []
+        kernel = self._kernel(0x1234, closed)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.jsonl"
+            with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
+                 mock.patch('msvcrt.open_osfhandle', return_value=7), \
+                 mock.patch.object(velox.os, 'fdopen', side_effect=OSError("stream failed")), \
+                 mock.patch.object(velox.os, 'close') as close:
+                with self.assertRaises(OSError) as cm:
+                    velox._open_jsonl_append_handle(path)
+        self.assertIn("stream failed", str(cm.exception))
+        self.assertEqual(closed, [])
+        close.assert_called_once_with(7)
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle path")
+    def test_normal_stream_closure_returns_stream_without_closing(self) -> None:
+        closed: list[int] = []
+        kernel = self._kernel(0x1234, closed)
+        sentinel = object()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.jsonl"
+            with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
+                 mock.patch('msvcrt.open_osfhandle', return_value=7), \
+                 mock.patch.object(velox.os, 'fdopen', return_value=sentinel), \
+                 mock.patch.object(velox.os, 'close') as close:
+                result = velox._open_jsonl_append_handle(path)
+        self.assertIs(result, sentinel)
+        self.assertEqual(closed, [])
+        close.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle path")
+    def test_stream_construction_failure_secondary_close_failure_preserves_primary(self) -> None:
+        closed: list[int] = []
+        kernel = self._kernel(0x1234, closed)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.jsonl"
+            with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
+                 mock.patch('msvcrt.open_osfhandle', return_value=7), \
+                 mock.patch.object(velox.os, 'fdopen', side_effect=OSError("stream failed")), \
+                 mock.patch.object(velox.os, 'close', side_effect=OSError("close failed")):
+                with self.assertRaises(OSError) as cm:
+                    velox._open_jsonl_append_handle(path)
+        self.assertIn("stream failed", str(cm.exception))
+        self.assertNotIn("close failed", str(cm.exception))
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle path")
+    def test_native_handle_read_write_delete_share_final_close(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "shared.jsonl"
+            path.write_bytes(b"seed")
+            handle = velox._open_jsonl_append_handle(path)
+            try:
+                self.assertTrue(handle.writable())
+                handle.seek(0, os.SEEK_END)
+                handle.write(b"tail")
+                handle.flush()
+                path.unlink()
+                self.assertFalse(path.exists())
+            finally:
+                handle.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows native handle path")
+    def test_native_controlled_open_failure_retains_winerror_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "does-not-exist.jsonl"
+            with self.assertRaises(OSError) as cm:
+                velox._open_jsonl_append_handle(missing)
+            self.assertEqual(getattr(cm.exception, 'winerror', None), 2)
+            self.assertEqual(str(cm.exception.filename), str(missing))
+
+
+class StorageLogDrainTests(unittest.TestCase):
+    """Drain behavior for the app-log background writer helper."""
+
+    @staticmethod
+    def _fake_storage(log_path: Path) -> SimpleNamespace:
+        return SimpleNamespace(log_path=lambda: str(log_path))
+
+    def test_drain_immediate_success(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "log.jsonl"
+            storage = self._fake_storage(log_path)
+            flush_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+            def flush(*args: Any, **kwargs: Any) -> bool:
+                flush_calls.append((args, kwargs))
+                return True
+
+            writer = mock.Mock()
+            writer.flush.side_effect = flush
+            with mock.patch.object(velox, 'APP_LOG_WRITER', writer), \
+                 mock.patch.object(velox.DATA_ROOTS, 'clear_for_tests') as clear:
+                _drain_storage_log_writer(storage)
+            self.assertEqual(len(flush_calls), 1)
+            self.assertEqual(flush_calls[0][0], ((log_path,),))
+            clear.assert_called_once()
+
+    def test_drain_path_scoped_failure_then_global_success(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "log.jsonl"
+            storage = self._fake_storage(log_path)
+            flush_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+            def flush(*args: Any, **kwargs: Any) -> bool:
+                flush_calls.append((args, kwargs))
+                return len(flush_calls) == 2
+
+            writer = mock.Mock()
+            writer.flush.side_effect = flush
+            with mock.patch.object(velox, 'APP_LOG_WRITER', writer), \
+                 mock.patch.object(velox.DATA_ROOTS, 'clear_for_tests') as clear:
+                _drain_storage_log_writer(storage)
+            self.assertEqual(len(flush_calls), 2)
+            self.assertEqual(flush_calls[0][0], ((log_path,),))
+            self.assertEqual(flush_calls[1][0], ())
+            clear.assert_called_once()
+
+    def test_drain_exhausted_attempts_fails_without_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "log.jsonl"
+            storage = self._fake_storage(log_path)
+
+            def flush(*args: Any, **kwargs: Any) -> bool:
+                return False
+
+            writer = mock.Mock()
+            writer.flush.side_effect = flush
+            with mock.patch.object(velox, 'APP_LOG_WRITER', writer), \
+                 mock.patch.object(velox.DATA_ROOTS, 'clear_for_tests') as clear:
+                with self.assertRaises(RuntimeError):
+                    _drain_storage_log_writer(storage)
+            clear.assert_not_called()
 
 
 class ReleaseSchemaTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):

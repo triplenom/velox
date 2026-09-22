@@ -6830,19 +6830,16 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def _open_jsonl_append_handle(path: "Path") -> Any:
-    """Open a JSONL file for binary append, allowing the file to be deleted
-    concurrently on Windows.
+    """Open a JSONL file for binary append with Windows delete sharing.
 
-    On Windows the default open() shares only read/write, not delete. A test
-    (or a root reset) that removes the containing data root while a background
-    batch is mid-write then fails with WinError 32 because the handle holds the
-    file. Opening with FILE_SHARE_DELETE lets the directory entry be unlinked
-    immediately; the writer's handle stays valid until it closes, so an in-flight
-    batch never corrupts the file it was already writing.
+    On Windows the file is opened with FILE_SHARE_DELETE so a concurrent unlink
+    (for example a data-root reset) cannot fail with WinError 32 while a
+    background batch holds the handle.
     """
     if os.name != "nt":
         return path.open("r+b")
-    kernel32 = ctypes.windll.kernel32
+    # Lazy Windows-only binding with reliable last-error capture.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.restype = ctypes.c_void_p
     kernel32.CreateFileW.argtypes = [
         ctypes.c_wchar_p,
@@ -6853,6 +6850,8 @@ def _open_jsonl_append_handle(path: "Path") -> Any:
         ctypes.c_uint32,
         ctypes.c_void_p,
     ]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     GENERIC_READ = 0x80000000
     GENERIC_WRITE = 0x40000000
     FILE_SHARE_READ = 0x00000001
@@ -6860,7 +6859,7 @@ def _open_jsonl_append_handle(path: "Path") -> Any:
     FILE_SHARE_DELETE = 0x00000004
     OPEN_EXISTING = 3
     FILE_ATTRIBUTE_NORMAL = 0x00000080
-    handle = kernel32.CreateFileW(
+    raw_handle = kernel32.CreateFileW(
         str(path),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -6869,13 +6868,37 @@ def _open_jsonl_append_handle(path: "Path") -> Any:
         FILE_ATTRIBUTE_NORMAL,
         None,
     )
-    if handle in (None, ctypes.c_void_p(-1).value):
+    if raw_handle in (None, ctypes.c_void_p(-1).value):
         error = ctypes.get_last_error()
-        raise OSError(error, os.strerror(error), str(path))
+        exc = ctypes.WinError(error)
+        exc.filename = str(path)
+        raise exc
     import msvcrt
 
-    fd = msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
-    return os.fdopen(fd, "r+b")
+    # Ownership: until a CRT descriptor is adopted, this function owns the raw
+    # handle and must close it on any failure before the helper returns.
+    try:
+        fd = msvcrt.open_osfhandle(int(raw_handle), os.O_RDWR | os.O_BINARY)
+    except OSError:
+        kernel32.CloseHandle(raw_handle)
+        raise
+    if fd < 0:
+        last_error = ctypes.get_last_error()
+        kernel32.CloseHandle(raw_handle)
+        exc = ctypes.WinError(last_error or 6)
+        exc.filename = str(path)
+        raise exc
+    try:
+        # The returned stream owns the descriptor and handle from here on; the
+        # helper must not close them.
+        return os.fdopen(fd, "r+b")
+    except Exception:
+        # The descriptor owns the handle; close the descriptor to release it.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
 
 
 def _prepare_jsonl_for_append(handle: Any) -> None:
