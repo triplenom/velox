@@ -68,6 +68,11 @@ from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, NoReturn, Optional
+
+# Instrumentation clock bound before any test may patch time.monotonic/time.time.
+_TIMING_PERF = time.perf_counter
+_TIMING_TIME = time.time
+_CHILD_STARTED = _TIMING_PERF()
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import velox
@@ -171,9 +176,31 @@ class _WriterDataRootsIsolatedTestMixin(_DataRootsIsolatedTestMixin):
         super().tearDown()
 
 
+def _deterministic_host_environment() -> dict[str, Any]:
+    """Fast deterministic toolchain snapshot for ordinary runtime/storage fixtures.
+
+    Storage.ensure_first_run_files() regenerates the native C/C++ Skill from live
+    Visual Studio/CMake discovery on every fresh root. Ordinary runtime/storage
+    fixtures do not need that host discovery; injecting a deterministic snapshot
+    keeps the same skill-markdown generation and storage behavior without invoking
+    host subprocess/vswhere probes for every test. Real host/toolchain discovery
+    tests call detect_native_cpp_environment() directly and are unaffected.
+    """
+    if velox.host_operating_system_name() == "Windows":
+        return _test_windows_toolchain_environment()
+    return {
+        "hostOs": velox.host_operating_system_name(),
+        "compiler": "/usr/bin/clang++",
+        "cCompiler": "/usr/bin/clang",
+        "cmakeInstallations": [{"path": "/usr/bin/cmake", "version": "3.30.0"}],
+        "cmakeExecutables": ["/usr/bin/cmake"],
+        "cmake": "/usr/bin/cmake",
+    }
+
+
 def _make_test_storage(root: Path) -> velox.Storage:
     storage = velox.Storage(velox.AppPaths(root))
-    storage.ensure_first_run_files()
+    storage.ensure_first_run_files(environment=_deterministic_host_environment())
     return storage
 
 
@@ -202,7 +229,7 @@ def _drain_storage_log_writer(storage: velox.Storage) -> None:
 def _make_test_chat_stack(root: Path) -> tuple[velox.AppPaths, velox.Storage, velox.ChatStore]:
     paths = velox.AppPaths(root)
     storage = velox.Storage(paths)
-    storage.ensure_first_run_files()
+    storage.ensure_first_run_files(environment=_deterministic_host_environment())
     return paths, storage, velox.ChatStore(storage)
 
 
@@ -211,7 +238,7 @@ def _make_test_connector_stack(
 ) -> tuple[velox.AppPaths, velox.Storage, velox.VaultStore, velox.CredentialStore, velox.VaultQueryService]:
     paths = velox.AppPaths(root)
     storage = velox.Storage(paths)
-    storage.ensure_first_run_files()
+    storage.ensure_first_run_files(environment=_deterministic_host_environment())
     vault = velox.VaultStore(storage)
     return paths, storage, vault, velox.CredentialStore(paths), velox.VaultQueryService(vault)
 
@@ -18178,8 +18205,9 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
         self.assertIn('"title": "Title"', dashboard)
         self.assertNotIn("Live per-endpoint inference queues", dashboard)
         runner = inspect.getsource(run_test_suite)
-        self.assertIn('"argument": class_name', runner)
-        self.assertIn('"count": count', runner)
+        self.assertIn('_build_test_groups(class_rows, isolated=isolated)', runner)
+        self.assertIn('argument = str(row["argument"])', runner)
+        self.assertIn('count = int(row["count"])', runner)
         self.assertIn('VELOX_TEST_SUCCESS_MARKER', runner)
         self.assertIn('deadline = time.monotonic() + 1800.0', runner)
         self.assertIn('_test_result_matches(success_marker, child_pid, count)', runner)
@@ -22193,6 +22221,26 @@ def _read_child_identity(marker: Path, token: str) -> int:
     return -1
 
 
+def _emit_child_timing(class_name: str, t0: float, t1: float, t2: float) -> None:
+    """Emit an opt-in per-shard timing trace to stderr for the parent report.
+
+    The clock is bound at module import (_TIMING_PERF) before any test may patch
+    time.monotonic/time.time, so a mocked clock cannot corrupt the measurement.
+    startup = import + suite construction; body = test execution; cleanup =
+    post-result bookkeeping (writing the completed result) before os._exit.
+    """
+    if not str(os.environ.get("VELOX_TEST_RUNNER_TRACE") or "").strip():
+        return
+    startup = t0 - _CHILD_STARTED
+    body = t1 - t0
+    cleanup = t2 - t1
+    total = t2 - _CHILD_STARTED
+    sys.stderr.write(
+        f"[timing] class={class_name} startup={startup:.3f} body={body:.3f} "
+        f"cleanup={cleanup:.3f} total={total:.3f}\n"
+    )
+
+
 def run_test_class(class_name: str) -> NoReturn:
     """Run selected TestCase classes in this disposable child process.
 
@@ -22237,8 +22285,12 @@ def run_test_class(class_name: str) -> NoReturn:
     # a Windows virtual-environment redirector) before the suite runs so the
     # parent can validate the completed result against the real interpreter.
     _write_child_identity(str(os.environ.get("VELOX_TEST_RUN_TOKEN") or "").strip(), _count)
+    t0 = _TIMING_PERF()
     result = unittest.TextTestRunner(stream=_RawFDTestStream(2), verbosity=2).run(suite)
+    t1 = _TIMING_PERF()
     _publish_test_result(result, _count)
+    t2 = _TIMING_PERF()
+    _emit_child_timing(class_name, t0, t1, t2)
     # This command runs in a disposable shard process. Exit at the exact point
     # unittest has emitted its definitive result. Returning through the module's
     # fixture-heavy main/finally path can wait on unrelated native/background
@@ -22246,7 +22298,64 @@ def run_test_class(class_name: str) -> NoReturn:
     os._exit(0 if result.wasSuccessful() else 1)
 
 
-def run_test_suite() -> int:
+# These classes intentionally exercise process/transport failure boundaries.
+_ISOLATED_TEST_CLASSES = frozenset({
+    "TestRunnerIntegrityTests",
+    "TestResultMarkerTests",
+    "TransportDeadlineTests",
+    "RealLoopbackCancellationTests",
+})
+
+
+def _build_test_groups(
+    class_rows: list[tuple[str, int]],
+    *,
+    isolated: bool = False,
+) -> list[dict[str, Any]]:
+    """Pack ordinary test classes into a bounded set of disposable child shards.
+
+    Each batch is comma-separated for ``run_test_class`` and may hold up to
+    ``MAX_BATCH_TESTS`` tests or ``MAX_BATCH_CLASSES`` classes. Classes that
+    manipulate process state, exercise native/transport boundaries, or are very
+    large run alone so a shared child cannot be destabilized. The finished
+    parent still validates every child result exactly once.
+    """
+    groups: list[dict[str, Any]] = []
+    batch: list[tuple[str, int]] = []
+    batch_count = 0
+    max_batch_tests = 100
+    max_batch_classes = 8
+
+    def emit() -> None:
+        nonlocal batch_count
+        if not batch:
+            return
+        names = ",".join(name for name, _count in batch)
+        groups.append({
+            "label": names,
+            "argument": names,
+            "count": batch_count,
+        })
+        batch.clear()
+        batch_count = 0
+
+    for name, count in class_rows:
+        if count <= 0:
+            raise ValueError(f"Empty test class: {name}")
+        alone = isolated or name in _ISOLATED_TEST_CLASSES or count >= 100
+        if alone:
+            emit()
+            groups.append({"label": name, "argument": name, "count": count})
+            continue
+        if batch and (batch_count + count > max_batch_tests or len(batch) >= max_batch_classes):
+            emit()
+        batch.append((name, count))
+        batch_count += count
+    emit()
+    return groups
+
+
+def run_test_suite(*, isolated: bool = False) -> int:
     """Discover the full suite and run each class in a disposable process.
 
     Native code, background writers and async fixtures need process isolation.
@@ -22259,14 +22368,7 @@ def run_test_suite() -> int:
         if tests:
             class_rows.append((tests[0].__class__.__name__, len(tests)))
 
-    groups = [
-        {
-            "label": class_name,
-            "argument": class_name,
-            "count": count,
-        }
-        for class_name, count in class_rows
-    ]
+    groups = _build_test_groups(class_rows, isolated=isolated)
 
     velox.CoalescingAtomicJSONWriter.shutdown_all(timeout=3.0)
     velox.BatchedJSONLWriter.shutdown_all(timeout=3.0)
@@ -31733,13 +31835,16 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
         response = SimpleNamespace(fp=reader, close=reader.close)
         if wrapped:
             response = urllib.error.HTTPError('http://test/', 504, 'stalled body', {}, response)
+        velox._prepare_response_transport(response, lambda: False)
         def reading() -> None:
             entered.set()
             try:
                 output.append(reader.readline())
-            except (OSError, ValueError):
+            except (OSError, ValueError, velox.LLMRequestCancelledError):
                 pass  # Cancellation is permitted to interrupt, not complete, a read.
             finally:
+                # The reader owns final closure and must close its own response.
+                reader.close()
                 completed.set()
         thread = threading.Thread(target=reading, daemon=True)
         thread.start()
@@ -31748,19 +31853,19 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             await asyncio.sleep(.02)
             self.assertFalse(completed.is_set())
             await asyncio.wait_for(asyncio.to_thread(self.llm._close_response_transport, response), 1)
-            self.assertTrue(completed.is_set())
+            self.assertTrue(await asyncio.to_thread(completed.wait, 3), "blocked read was not interrupted")
             self.assertFalse(output and output[0])
+            self.assertTrue(reader.closed, "reader must own final closure")
         finally:
             peer.close()
             client.close()
             await asyncio.to_thread(thread.join, 1)
-            reader.close()
 
 
 
     async def test_transport_close_interrupts_only_its_own_transport(self) -> None:
-        # Closing one response transport must interrupt its own blocked read
-        # without disturbing an unrelated transport's socket.
+        # Closing one prepared response transport must interrupt its own blocked
+        # read without disturbing an unrelated transport's socket.
         client_a, peer_a = socket.socketpair()
         client_b, peer_b = socket.socketpair()
         reader_a = client_a.makefile('rb')
@@ -31768,13 +31873,15 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
         entered_a, completed_a = threading.Event(), threading.Event()
         output_a = []
         response_a = SimpleNamespace(fp=reader_a, close=reader_a.close)
+        velox._prepare_response_transport(response_a, lambda: False)
         def reading_a() -> None:
             entered_a.set()
             try:
                 output_a.append(reader_a.readline())
-            except (OSError, ValueError):
+            except (OSError, ValueError, velox.LLMRequestCancelledError):
                 pass
             finally:
+                reader_a.close()
                 completed_a.set()
         thread_a = threading.Thread(target=reading_a, daemon=True)
         thread_a.start()
@@ -31783,7 +31890,7 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             await asyncio.sleep(.02)
             self.assertFalse(completed_a.is_set())
             await asyncio.wait_for(asyncio.to_thread(self.llm._close_response_transport, response_a), 1)
-            self.assertTrue(completed_a.is_set())
+            self.assertTrue(await asyncio.to_thread(completed_a.wait, 3), "blocked read was not interrupted")
             self.assertFalse(output_a and output_a[0])
             # transport_b must remain usable: send data on its peer and read it back.
             output_b = []
@@ -31810,83 +31917,96 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             peer_a.close()
             client_a.close()
             await asyncio.to_thread(thread_a.join, 1)
-            reader_a.close()
 
-class RealLoopbackCancellationTests(unittest.TestCase):
-    """Real loopback HTTP cancellation through the production transport close."""
 
-    def test_stalled_http_body_read_is_interrupted_by_transport_close(self) -> None:
-        stall = threading.Event()
 
-        class StalledHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                try:
-                    self.wfile.write(b"partial\n")
-                    self.wfile.flush()
-                    stall.wait(20.0)
-                    self.wfile.write(b"done\n")
-                except Exception:
-                    pass
+def _run_negative_control_child() -> NoReturn:
+    """Reproduce the old weak behavior: an adapter that ignores cancellation and
+    waits for the ordinary socket timeout.
 
-            def log_message(self, *_args: Any) -> None:
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
-        port = int(server.server_address[1])
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        server_thread.start()
-        entered = threading.Event()
-        completed = threading.Event()
-        output: list[Any] = []
-        response_holder: dict[str, Any] = {}
-
-        def request() -> None:
-            try:
-                response = urllib.request.urlopen(
-                    urllib.request.Request(
-                        f"http://127.0.0.1:{port}/", data=b"x", method="POST"
-                    ),
-                    timeout=10,
-                )
-                response_holder["response"] = response
-                entered.set()
-                output.append(response.read(4096))
-            except Exception as exc:  # Cancellation may interrupt, not complete.
-                output.append(exc)
-            finally:
-                completed.set()
-
-        worker = threading.Thread(target=request, daemon=True)
-        worker.start()
+    This is only ever launched from ``test_negative_control_is_rejected`` as a
+    disposable child under an outer watchdog. It deliberately blocks until the
+    ordinary 30s socket timeout so the parent can show that a non-cooperative
+    read is NOT accepted as a successful cancellation before that timer.
+    """
+    release = threading.Event()
+    body = b"data: [DONE]\n\n"
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            pass
+        def do_POST(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.flush()
+            release.wait(60.0)
+            self.wfile.write(body)
+            self.wfile.flush()
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True).start()
+    port = int(server.server_address[1])
+    response = urllib.request.urlopen(
+        urllib.request.Request(f"http://127.0.0.1:{port}/", data=b"x", method="POST"),
+        timeout=30,
+    )
+    velox._prepare_response_transport(response, lambda: False)
+    # Make the read adapter ignore cancellation entirely: the old weak behavior
+    # waits for the ordinary socket timeout instead of a cooperative cancel.
+    velox._CancellableSocketRead._check_cancelled = lambda self: None
+    completed = threading.Event()
+    def reading() -> None:
         try:
-            self.assertTrue(entered.wait(5), "client never reached the stalled body")
-            time.sleep(0.2)
-            self.assertFalse(completed.is_set(), "read completed before close")
-            velox.LLMClient._close_response_transport(response_holder["response"])
-            self.assertTrue(completed.wait(5), "blocked read was not interrupted")
-            # The read is interrupted (no 'done' body), not completed normally.
-            self.assertNotIn(b"done\n", output[0] if isinstance(output[0], bytes) else b"")
+            response.read()
+        except Exception:
+            pass
         finally:
-            stall.set()
-            server.shutdown()
-            server.server_close()
-            worker.join(2)
-    def _find_openssl(self) -> str:
+            completed.set()
+    threading.Thread(target=reading, daemon=True).start()
+    velox.LLMClient._close_response_transport(response)
+    # The read must NOT unblock from cancellation; it waits for the 30s socket
+    # timeout. The parent kills this child before that timer.
+    completed.wait(60)
+    server.shutdown()
+    server.server_close()
+class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
+    """Real loopback HTTP/HTTPS cancellation through the request-worker adapter."""
+
+    _tls_cached: tuple[ssl.SSLContext, ssl.SSLContext] | None = None
+    _tls_tmp: str | None = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        try:
+            cls._tls_cached = cls._provision_tls_fixture()
+        except Exception as exc:  # pragma: no cover - environment TLS failure
+            cls._tls_cached = None
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        tmp = cls._tls_tmp
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+            cls._tls_tmp = None
+        super().tearDownClass()
+
+    @classmethod
+    def _find_openssl(cls) -> str:
         exe = shutil.which("openssl")
         if exe:
             return exe
         for candidate in (r"C:\Program Files\Git\usr\bin\openssl.exe", "/usr/bin/openssl", "/usr/local/bin/openssl"):
             if os.path.exists(candidate):
                 return candidate
-        self.skipTest("openssl unavailable to provision the local TLS fixture")
+        raise RuntimeError("openssl unavailable to provision the local TLS fixture")
 
-    def _tls_fixture(self) -> tuple[ssl.SSLContext, ssl.SSLContext]:
-        openssl = self._find_openssl()
+    @classmethod
+    def _provision_tls_fixture(cls) -> tuple[ssl.SSLContext, ssl.SSLContext]:
+        openssl = cls._find_openssl()
         tmp = tempfile.mkdtemp(prefix="velox_tls_")
-        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cls._tls_tmp = tmp
         cert = os.path.join(tmp, "cert.pem")
         key = os.path.join(tmp, "key.pem")
         result = subprocess.run(
@@ -31898,260 +32018,793 @@ class RealLoopbackCancellationTests(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode != 0 or not os.path.exists(cert) or not os.path.exists(key):
-            self.skipTest("openssl could not provision the local TLS fixture")
+            raise RuntimeError("openssl could not provision the local TLS fixture")
         srv_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         srv_ctx.load_cert_chain(certfile=cert, keyfile=key)
         cli_ctx = ssl.create_default_context(cafile=cert)
         return srv_ctx, cli_ctx
 
-    def test_stalled_https_body_read_is_interrupted_by_transport_close(self) -> None:
-        srv_ctx, cli_ctx = self._tls_fixture()
-        stall = threading.Event()
-
-        class StalledHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                try:
-                    self.wfile.write(b"partial\n")
-                    self.wfile.flush()
-                    stall.wait(20.0)
-                    self.wfile.write(b"done\n")
-                except Exception:
-                    pass
-            def log_message(self, *_args: Any) -> None:
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
-        try:
-            server.socket = srv_ctx.wrap_socket(server.socket, server_side=True)
-        except Exception as exc:  # pragma: no cover - environment TLS failure
-            server.server_close()
-            self.skipTest(f"could not wrap loopback socket with TLS: {exc}")
-        port = int(server.server_address[1])
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        entered = threading.Event()
-        completed = threading.Event()
-        output: list[Any] = []
-        response_holder: dict[str, Any] = {}
-
-        def request() -> None:
-            try:
-                response = urllib.request.urlopen(
-                    urllib.request.Request(
-                        f"https://localhost:{port}/", data=b"x", method="POST"
-                    ),
-                    timeout=10,
-                    context=cli_ctx,
-                )
-                response_holder["response"] = response
-                entered.set()
-                output.append(response.read(4096))
-            except Exception as exc:
-                output.append(exc)
-            finally:
-                completed.set()
-
-        worker = threading.Thread(target=request, daemon=True)
-        worker.start()
-        try:
-            self.assertTrue(entered.wait(5), "client never reached the stalled HTTPS body")
-            time.sleep(0.2)
-            self.assertFalse(completed.is_set(), "read completed before close")
-            velox.LLMClient._close_response_transport(response_holder["response"])
-            self.assertTrue(completed.wait(5), "blocked HTTPS read was not interrupted")
-            self.assertNotIn(b"done\n", output[0] if isinstance(output[0], bytes) else b"")
-        finally:
-            stall.set()
-            server.shutdown()
-            server.server_close()
-            worker.join(2)
-
-    def test_repeated_transport_close_is_harmless(self) -> None:
-        stall = threading.Event()
-
-        class StalledHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                self.send_response(200)
-                self.end_headers()
-                try:
-                    self.wfile.write(b"partial\n")
-                    self.wfile.flush()
-                    stall.wait(20.0)
-                    self.wfile.write(b"done\n")
-                except Exception:
-                    pass
-            def log_message(self, *_args: Any) -> None:
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
-        port = int(server.server_address[1])
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        entered = threading.Event()
-        completed = threading.Event()
-        response_holder: dict[str, Any] = {}
-
-        def request() -> None:
-            try:
-                response = urllib.request.urlopen(
-                    urllib.request.Request(f"http://127.0.0.1:{port}/", data=b"x", method="POST"),
-                    timeout=10,
-                )
-                response_holder["response"] = response
-                entered.set()
-                response.read(4096)
-            except Exception:
-                pass
-            finally:
-                completed.set()
-
-        worker = threading.Thread(target=request, daemon=True)
-        worker.start()
-        try:
-            self.assertTrue(entered.wait(5))
-            velox.LLMClient._close_response_transport(response_holder["response"])
-            self.assertTrue(completed.wait(5))
-            # A repeated close must be harmless: no exception and no reused
-            # descriptor is closed once the socket was detached.
-            velox.LLMClient._close_response_transport(response_holder["response"])
-        finally:
-            stall.set()
-            server.shutdown()
-            server.server_close()
-            worker.join(2)
-
-    def test_two_callers_cancelling_same_response_is_harmless(self) -> None:
-        stall = threading.Event()
-
-        class StalledHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                self.send_response(200)
-                self.end_headers()
-                try:
-                    self.wfile.write(b"partial\n")
-                    self.wfile.flush()
-                    stall.wait(20.0)
-                    self.wfile.write(b"done\n")
-                except Exception:
-                    pass
-            def log_message(self, *_args: Any) -> None:
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
-        port = int(server.server_address[1])
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        entered = threading.Event()
-        completed = threading.Event()
-        response_holder: dict[str, Any] = {}
-
-        def request() -> None:
-            try:
-                response = urllib.request.urlopen(
-                    urllib.request.Request(f"http://127.0.0.1:{port}/", data=b"x", method="POST"),
-                    timeout=10,
-                )
-                response_holder["response"] = response
-                entered.set()
-                response.read(4096)
-            except Exception:
-                pass
-            finally:
-                completed.set()
-
-        worker = threading.Thread(target=request, daemon=True)
-        worker.start()
-        errors: list[Any] = []
-
-        def closer() -> None:
-            try:
-                velox.LLMClient._close_response_transport(response_holder["response"])
-            except Exception as exc:
-                errors.append(exc)
-
-        closer_a = threading.Thread(target=closer)
-        closer_b = threading.Thread(target=closer)
-        try:
-            self.assertTrue(entered.wait(5))
-            closer_a.start()
-            closer_b.start()
-            closer_a.join(5)
-            closer_b.join(5)
-            self.assertTrue(completed.wait(5), "blocked read was not interrupted")
-            self.assertEqual(errors, [])
-        finally:
-            stall.set()
-            server.shutdown()
-            server.server_close()
-            worker.join(2)
-
-    def test_cancellation_racing_normal_completion_is_bounded(self) -> None:
-        class DoneHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                self.send_response(200)
-                self.send_header("Content-Length", "5")
-                self.end_headers()
-                self.wfile.write(b"done\n")
-            def log_message(self, *_args: Any) -> None:
-                pass
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DoneHandler)
-        port = int(server.server_address[1])
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        entered = threading.Event()
-        completed = threading.Event()
-        response_holder: dict[str, Any] = {}
-
-        def request() -> None:
-            try:
-                response = urllib.request.urlopen(
-                    urllib.request.Request(f"http://127.0.0.1:{port}/", data=b"x", method="POST"),
-                    timeout=10,
-                )
-                response_holder["response"] = response
-                entered.set()
-                response.read()
-            except Exception:
-                pass
-            finally:
-                completed.set()
-
-        worker = threading.Thread(target=request, daemon=True)
-        worker.start()
-        try:
-            self.assertTrue(entered.wait(5))
-            # Close races normal completion; either the read finishes normally
-            # or the close interrupts it, but it must never hang or corrupt.
-            velox.LLMClient._close_response_transport(response_holder["response"])
-            self.assertTrue(completed.wait(5), "read neither completed nor was interrupted")
-        finally:
-            server.shutdown()
-            server.server_close()
-            worker.join(2)
-
-    @unittest.skipUnless(os.name == "nt", "Winsock closesocket boundary is Windows-only")
-    def test_interruption_boundary_failure_is_observable(self) -> None:
-        class FakeSocket:
-            def fileno(self) -> int:
-                return 5
-            def detach(self) -> int:
-                return 7
-
-        binding = SimpleNamespace(
-            closesocket=lambda fd: -1,
-            WSAGetLastError=lambda: 10054,
+    def _endpoint(self, transport: str, port: int, *, tls: bool = False) -> None:
+        cfg = self.storage.load_config()
+        velox.endpoint_profile_ref(cfg, self.eid).update(
+            api_transport=transport, provider="generic",
+            base_url=f"{'https' if tls else 'http'}://localhost:{port}/v1",
+            api_key="", rate_limit_enabled=False, error_recovery_enabled=False,
+            adaptive_token_estimation=False, error_recovery_attempts=0,
+            timeout_seconds=30,
         )
-        snapshot = list(velox._TRANSPORT_CLOSE_DIAGNOSTICS)
+        self.storage.write_config(cfg)
+
+    @staticmethod
+    def _start_server(handler_cls: Any, *, srv_ctx: ssl.SSLContext | None = None):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        server.daemon_threads = True
+        if srv_ctx is not None:
+            server.socket = srv_ctx.wrap_socket(server.socket, server_side=True)
+        port = int(server.server_address[1])
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+        thread.start()
+        return server, thread, port
+
+    def _wait_threads_gone(self, names: set[str], timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not any(t.name in names and t.is_alive() for t in threading.enumerate()):
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _signals_reads(self, read_wait: threading.Event) -> Any:
+        original = velox._CancellableSocketRead.recv_into
+        def signaling(self, *args: Any, **kwargs: Any) -> int:
+            read_wait.set()
+            return original(self, *args, **kwargs)
+        return mock.patch.object(velox._CancellableSocketRead, "recv_into", signaling)
+
+    def _stream_method(self, transport: str, request: velox.LLMRequest):
+        return self.llm._responses_stream(request) if transport == "responses" else self.llm._chat_completions_stream_unqueued(request)
+
+    def _nonstream_method(self, transport: str, request: velox.LLMRequest):
+        return self.llm._responses_once_full(request) if transport == "responses" else self.llm._chat_completions_once_full_unqueued(request)
+
+    async def _stream_cancel(self, transport: str, *, tls: bool = False) -> None:
+        headers_received = threading.Event()
+        read_wait = threading.Event()
+        release_server = threading.Event()
+        if transport == "responses":
+            full = {"id": "r1", "object": "response", "status": "completed", "output": [
+                {"id": "m1", "type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "ROBUST"}]}]}
+            event = {"type": "response.completed", "response": full}
+        else:
+            event = {"id": "c1", "choices": [{"index": 0, "delta": {"content": "ROBUST"}, "finish_reason": "stop"}]}
+        body = b"data: " + json.dumps(event).encode() + b"\n\ndata: [DONE]\n\n"
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                headers_received.set()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.flush()
+                release_server.wait(30.0)
+                self.wfile.write(body)
+                self.wfile.flush()
+
+        srv_ctx = self._tls_cached[0] if (tls and self._tls_cached) else None
+        server, thread, port = self._start_server(Handler, srv_ctx=srv_ctx)
         try:
-            with mock.patch.object(velox, "_win_ws2_32", return_value=binding):
-                velox._interrupt_blocked_socket(FakeSocket())
+            self._endpoint(transport, port, tls=tls)
+            cancel = threading.Event()
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}],
+                                       stream=True, cancel_event=cancel)
+            collected: list[velox.LLMChunk] = []
+            async def consume() -> None:
+                stream = self._stream_method(transport, request)
+                try:
+                    async for chunk in stream:
+                        collected.append(chunk)
+                        if chunk.done:
+                            break
+                finally:
+                    try:
+                        await stream.aclose()
+                    except Exception:
+                        pass
+            real_urlopen = urllib.request.urlopen
+            if tls:
+                cli_ctx = self._tls_cached[1] if self._tls_cached else None
+                def patched_urlopen(req: Any, *args: Any, **kwargs: Any):
+                    kwargs["context"] = cli_ctx
+                    return real_urlopen(req, *args, **kwargs)
+                urlopen_patch = mock.patch.object(urllib.request, "urlopen", side_effect=patched_urlopen)
+            else:
+                urlopen_patch = contextlib.nullcontext()
+            with urlopen_patch, self._signals_reads(read_wait):
+                task = asyncio.create_task(consume())
+                self.assertTrue(await asyncio.to_thread(headers_received.wait, 8), "headers never received")
+                self.assertTrue(await asyncio.to_thread(read_wait.wait, 8), "read boundary never entered")
+                start = time.perf_counter()
+                cancel.set()
+                await asyncio.wait_for(asyncio.shield(task), 8)
+                elapsed = time.perf_counter() - start
+            self.assertTrue(collected and collected[-1].done, "no terminal chunk")
+            self.assertIn("LLMRequestCancelledError", collected[-1].error or "", collected)
             self.assertTrue(
-                any("closesocket failed" in message for message in velox._TRANSPORT_CLOSE_DIAGNOSTICS),
-                velox._TRANSPORT_CLOSE_DIAGNOSTICS,
+                await asyncio.to_thread(self._wait_threads_gone,
+                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 4),
+                "worker/close threads did not end before the stalled server was released",
+            )
+            self.assertLess(elapsed, 3.0, f"cancellation took {elapsed:.3f}s")
+            self.assertFalse(release_server.is_set())
+        finally:
+            release_server.set()
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
+
+    async def test_stream_chat_cancel_stalled_body(self) -> None:
+        await self._stream_cancel("chat_completions")
+    async def test_stream_responses_cancel_stalled_body(self) -> None:
+        await self._stream_cancel("responses")
+    async def test_stream_https_cancel_stalled_body(self) -> None:
+        if self._tls_cached is None:
+            self.skipTest("openssl could not provision a local TLS fixture")
+        await self._stream_cancel("chat_completions", tls=True)
+    async def test_stream_https_responses_cancel_stalled_body(self) -> None:
+        if self._tls_cached is None:
+            self.skipTest("openssl could not provision a local TLS fixture")
+        await self._stream_cancel("responses", tls=True)
+
+    async def _nonstream_cancel(self, transport: str, *, tls: bool = False) -> None:
+        headers_received = threading.Event()
+        read_wait = threading.Event()
+        release_server = threading.Event()
+        full = (
+            {"id": "r1", "object": "response", "status": "completed", "output": [
+                {"id": "m1", "type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "ROBUST"}]}]}
+            if transport == "responses"
+            else {"id": "c1", "object": "chat.completion", "choices": [{"index": 0,
+                  "message": {"role": "assistant", "content": "ROBUST"}, "finish_reason": "stop"}]}
+        )
+        body = json.dumps(full).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                headers_received.set()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.flush()
+                release_server.wait(30.0)
+                self.wfile.write(body)
+                self.wfile.flush()
+
+        srv_ctx = self._tls_cached[0] if (tls and self._tls_cached) else None
+        server, thread, port = self._start_server(Handler, srv_ctx=srv_ctx)
+        try:
+            self._endpoint(transport, port, tls=tls)
+            cancel = threading.Event()
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}],
+                                       stream=False, cancel_event=cancel)
+            async def call():
+                return await self._nonstream_method(transport, request)
+            real_urlopen = urllib.request.urlopen
+            if tls:
+                cli_ctx = self._tls_cached[1] if self._tls_cached else None
+                def patched_urlopen(req: Any, *args: Any, **kwargs: Any):
+                    kwargs["context"] = cli_ctx
+                    return real_urlopen(req, *args, **kwargs)
+                urlopen_patch = mock.patch.object(urllib.request, "urlopen", side_effect=patched_urlopen)
+            else:
+                urlopen_patch = contextlib.nullcontext()
+            with urlopen_patch, self._signals_reads(read_wait):
+                task = asyncio.create_task(call())
+                self.assertTrue(await asyncio.to_thread(headers_received.wait, 8), "headers never received")
+                self.assertTrue(await asyncio.to_thread(read_wait.wait, 8), "read boundary never entered")
+                start = time.perf_counter()
+                cancel.set()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), 8)
+                    self.fail("non-streaming cancellation unexpectedly completed")
+                except (asyncio.CancelledError, velox.LLMRequestCancelledError):
+                    pass
+                elapsed = time.perf_counter() - start
+            self.assertLess(elapsed, 3.0, f"cancellation took {elapsed:.3f}s")
+            self.assertTrue(
+                await asyncio.to_thread(self._wait_threads_gone,
+                                        {"velox-llm-response", "velox-llm-response-close"}, 4),
+                "worker/close threads did not end before the stalled server was released",
+            )
+            self.assertFalse(release_server.is_set())
+        finally:
+            release_server.set()
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
+
+    async def test_nonstream_chat_cancel_stalled_body(self) -> None:
+        await self._nonstream_cancel("chat_completions")
+    async def test_nonstream_responses_cancel_stalled_body(self) -> None:
+        await self._nonstream_cancel("responses")
+    async def test_nonstream_https_cancel_stalled_body(self) -> None:
+        if self._tls_cached is None:
+            self.skipTest("openssl could not provision a local TLS fixture")
+        await self._nonstream_cancel("chat_completions", tls=True)
+    async def test_nonstream_https_responses_cancel_stalled_body(self) -> None:
+        if self._tls_cached is None:
+            self.skipTest("openssl could not provision a local TLS fixture")
+        await self._nonstream_cancel("responses", tls=True)
+
+    async def _stream_error_body_cancel(self, transport: str, *, tls: bool = False) -> None:
+        read_wait = threading.Event()
+        release_server = threading.Event()
+        event_body = b'{"error": {"message": "stalled provider failure"}}'
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(event_body)))
+                self.end_headers()
+                self.wfile.flush()
+                release_server.wait(30.0)
+                self.wfile.write(event_body)
+                self.wfile.flush()
+        srv_ctx = self._tls_cached[0] if (tls and self._tls_cached) else None
+        server, thread, port = self._start_server(Handler, srv_ctx=srv_ctx)
+        try:
+            self._endpoint(transport, port, tls=tls)
+            cancel = threading.Event()
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}],
+                                       stream=True, cancel_event=cancel)
+            collected: list[velox.LLMChunk] = []
+            async def consume() -> None:
+                stream = self._stream_method(transport, request)
+                try:
+                    async for chunk in stream:
+                        collected.append(chunk)
+                        if chunk.done:
+                            break
+                finally:
+                    try:
+                        await stream.aclose()
+                    except Exception:
+                        pass
+            real_urlopen = urllib.request.urlopen
+            if tls:
+                cli_ctx = self._tls_cached[1] if self._tls_cached else None
+                def patched_urlopen(req: Any, *args: Any, **kwargs: Any):
+                    kwargs["context"] = cli_ctx
+                    return real_urlopen(req, *args, **kwargs)
+                urlopen_patch = mock.patch.object(urllib.request, "urlopen", side_effect=patched_urlopen)
+            else:
+                urlopen_patch = contextlib.nullcontext()
+            with urlopen_patch, self._signals_reads(read_wait):
+                task = asyncio.create_task(consume())
+                self.assertTrue(await asyncio.to_thread(read_wait.wait, 8), "read boundary never entered")
+                cancel.set()
+                await asyncio.wait_for(asyncio.shield(task), 8)
+            self.assertTrue(collected and collected[-1].done, "no terminal chunk")
+            self.assertIn("LLMRequestCancelledError", collected[-1].error or "", collected)
+            self.assertTrue(
+                await asyncio.to_thread(self._wait_threads_gone,
+                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 4),
+                "worker/close threads did not end before releasing the stalled server",
             )
         finally:
-            velox._TRANSPORT_CLOSE_DIAGNOSTICS[:] = snapshot
+            release_server.set()
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
 
+    async def _nonstream_error_body_cancel(self, transport: str, *, tls: bool = False) -> None:
+        read_wait = threading.Event()
+        release_server = threading.Event()
+        event_body = b'{"error": {"message": "stalled provider failure"}}'
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(event_body)))
+                self.end_headers()
+                self.wfile.flush()
+                release_server.wait(30.0)
+                self.wfile.write(event_body)
+                self.wfile.flush()
+        srv_ctx = self._tls_cached[0] if (tls and self._tls_cached) else None
+        server, thread, port = self._start_server(Handler, srv_ctx=srv_ctx)
+        try:
+            self._endpoint(transport, port, tls=tls)
+            cancel = threading.Event()
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}],
+                                       stream=False, cancel_event=cancel)
+            async def call():
+                return await self._nonstream_method(transport, request)
+            real_urlopen = urllib.request.urlopen
+            if tls:
+                cli_ctx = self._tls_cached[1] if self._tls_cached else None
+                def patched_urlopen(req: Any, *args: Any, **kwargs: Any):
+                    kwargs["context"] = cli_ctx
+                    return real_urlopen(req, *args, **kwargs)
+                urlopen_patch = mock.patch.object(urllib.request, "urlopen", side_effect=patched_urlopen)
+            else:
+                urlopen_patch = contextlib.nullcontext()
+            with urlopen_patch, self._signals_reads(read_wait):
+                task = asyncio.create_task(call())
+                self.assertTrue(await asyncio.to_thread(read_wait.wait, 8), "read boundary never entered")
+                cancel.set()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), 8)
+                    self.fail("error-body cancellation unexpectedly completed")
+                except (asyncio.CancelledError, velox.LLMRequestCancelledError):
+                    pass
+            self.assertTrue(
+                await asyncio.to_thread(self._wait_threads_gone,
+                                        {"velox-llm-response", "velox-llm-response-close"}, 4),
+                "worker/close threads did not end before releasing the stalled server",
+            )
+        finally:
+            release_server.set()
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
+
+    async def test_stream_https_error_body_cancel(self) -> None:
+        if self._tls_cached is None:
+            self.skipTest("openssl could not provision a local TLS fixture")
+        await self._stream_error_body_cancel("chat_completions", tls=True)
+    async def test_nonstream_https_error_body_cancel(self) -> None:
+        if self._tls_cached is None:
+            self.skipTest("openssl could not provision a local TLS fixture")
+        await self._nonstream_error_body_cancel("chat_completions", tls=True)
+
+    # NDJSON raw-body completion through the real parser.
+    async def test_read_ahead_ndjson(self) -> None:
+        full = {"id": "c1", "object": "chat.completion", "choices": [{"index": 0,
+                "message": {"role": "assistant", "content": "ROBUST"}, "finish_reason": "stop"}]}
+        body = json.dumps(full).encode()
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+        server, thread, port = self._start_server(Handler)
+        try:
+            self._endpoint("chat_completions", port)
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}], stream=True)
+            collected: list[velox.LLMChunk] = []
+            async for chunk in self._stream_method("chat_completions", request):
+                collected.append(chunk)
+                if chunk.done:
+                    break
+            self.assertTrue(collected and collected[-1].done, "no terminal done chunk")
+            self.assertIsNone(collected[-1].error, collected)
+            self.assertEqual("ROBUST", "".join(c.text for c in collected).strip())
+        finally:
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
+    def test_repeated_cancellation_is_harmless(self) -> None:
+        # A prepared transport ignores repeated cancellation requests and leaves
+        # the reader owning final closure.
+        client, peer = socket.socketpair()
+        reader = client.makefile("rb")
+        response = SimpleNamespace(fp=reader, close=reader.close)
+        velox._prepare_response_transport(response, lambda: False)
+        velox.LLMClient._close_response_transport(response)
+        velox.LLMClient._close_response_transport(response)
+        peer.close()
+        client.close()
+        reader.close()
+
+    def test_unrelated_live_connection_still_works(self) -> None:
+        # Cancelling one prepared transport must not disturb a separate socket.
+        client_a, peer_a = socket.socketpair()
+        client_b, peer_b = socket.socketpair()
+        reader_a = client_a.makefile("rb")
+        response_a = SimpleNamespace(fp=reader_a, close=reader_a.close)
+        velox._prepare_response_transport(response_a, lambda: False)
+        velox.LLMClient._close_response_transport(response_a)
+        # The unrelated live socket remains usable.
+        peer_b.sendall(b"hello\n")
+        with client_b.makefile("rb") as rb:
+            self.assertEqual(rb.readline(), b"hello\n")
+        peer_a.close(); client_a.close(); reader_a.close()
+        peer_b.close(); client_b.close()
+    # ------------------------------------------------------------------ #
+    # Non-streaming/streaming error-body cancellation
+    async def test_stream_chat_error_body_cancel(self) -> None:
+        await self._stream_error_body_cancel("chat_completions")
+    async def test_stream_responses_error_body_cancel(self) -> None:
+        await self._stream_error_body_cancel("responses")
+    async def test_nonstream_chat_error_body_cancel(self) -> None:
+        await self._nonstream_error_body_cancel("chat_completions")
+    async def test_nonstream_responses_error_body_cancel(self) -> None:
+        await self._nonstream_error_body_cancel("responses")
+
+    # Read-ahead integrity through the real parsers
+    async def _assert_normal_completion(self, transport: str, *, chunked: bool = False, delay: float = 0.0) -> None:
+        if transport == "responses":
+            full = {"id": "r1", "object": "response", "status": "completed", "output": [
+                {"id": "m1", "type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "ROBUST"}]}]}
+            event = {"type": "response.completed", "response": full}
+        else:
+            event = {"id": "c1", "choices": [{"index": 0, "delta": {"content": "ROBUST"}, "finish_reason": "stop"}]}
+        frame = b"data: " + json.dumps(event).encode() + b"\n\n"
+        done = b"data: [DONE]\n\n"
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                if chunked:
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    def chunk(data: bytes) -> None:
+                        self.wfile.write(("%x\r\n" % len(data)).encode() + data + b"\r\n")
+                    chunk(frame)
+                    self.wfile.flush()
+                    if delay:
+                        time.sleep(delay)
+                    chunk(done)
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                else:
+                    body = frame + done
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+        server, thread, port = self._start_server(Handler)
+        try:
+            self._endpoint(transport, port)
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}], stream=True)
+            collected: list[velox.LLMChunk] = []
+            async for chunk in self._stream_method(transport, request):
+                collected.append(chunk)
+                if chunk.done:
+                    break
+            self.assertTrue(collected and collected[-1].done, "no terminal done chunk")
+            self.assertIsNone(collected[-1].error, collected)
+            self.assertEqual("ROBUST", "".join(c.text for c in collected).strip())
+        finally:
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
+
+    async def test_read_ahead_normal_completion(self) -> None:
+        await self._assert_normal_completion("chat_completions")
+    async def test_read_ahead_responses_completion(self) -> None:
+        await self._assert_normal_completion("responses")
+    async def test_read_ahead_chunked_http(self) -> None:
+        await self._assert_normal_completion("chat_completions", chunked=True)
+    async def test_read_ahead_fragmented_sse(self) -> None:
+        # Two SSE frames separated by more than the 0.1s adapter poll interval.
+        await self._assert_normal_completion("chat_completions", delay=0.3)
+
+    # ------------------------------------------------------------------ #
+    # TLS readiness boundary (mocked narrow boundary + real HTTPS above)
+    def _fake_tls_socket(self, *, want: str) -> Any:
+        class FakeSocket:
+            def __init__(self):
+                self._state = want
+            def gettimeout(self) -> float:
+                return 30.0
+            def setblocking(self, flag: bool) -> None:
+                pass
+            def fileno(self) -> int:
+                return 11
+            def _decref_socketios(self) -> None:
+                pass
+            def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+                if self._state == "want_write":
+                    self._state = "data"
+                    raise ssl.SSLWantWriteError()
+                if self._state == "want_read":
+                    self._state = "data"
+                    raise ssl.SSLWantReadError()
+                if self._state == "blocking":
+                    self._state = "again"
+                    raise BlockingIOError()
+                buffer[:5] = b"hello"
+                return 5
+        return FakeSocket()
+
+    def test_tls_want_write_readiness(self) -> None:
+        sock = self._fake_tls_socket(want="want_write")
+        adapter = velox._CancellableSocketRead(sock)
+        with mock.patch.object(velox.select, "select", return_value=([], [sock], [])):
+            buf = bytearray(8)
+            self.assertEqual(adapter.recv_into(buf), 5)
+            self.assertEqual(bytes(buf[:5]), b"hello")
+
+    def test_tls_want_read_readiness(self) -> None:
+        sock = self._fake_tls_socket(want="want_read")
+        adapter = velox._CancellableSocketRead(sock)
+        with mock.patch.object(velox.select, "select", return_value=([sock], [], [])):
+            buf = bytearray(8)
+            self.assertEqual(adapter.recv_into(buf), 5)
+            self.assertEqual(bytes(buf[:5]), b"hello")
+
+    def test_tls_blocking_io_readiness(self) -> None:
+        sock = self._fake_tls_socket(want="blocking")
+        adapter = velox._CancellableSocketRead(sock)
+        with mock.patch.object(velox.select, "select", return_value=([sock], [], [])):
+            buf = bytearray(8)
+            self.assertEqual(adapter.recv_into(buf), 5)
+            self.assertEqual(bytes(buf[:5]), b"hello")
+
+    def test_tls_data_already_available(self) -> None:
+        sock = self._fake_tls_socket(want="data")
+        adapter = velox._CancellableSocketRead(sock)
+        buf = bytearray(8)
+        self.assertEqual(adapter.recv_into(buf), 5)
+        self.assertEqual(bytes(buf[:5]), b"hello")
+
+    # ------------------------------------------------------------------ #
+    # Cancellation ownership: a read/readiness failure propagates and the
+    # reader's own finally still closes the response.
+    async def test_cancellation_ownership_inject_read_failure(self) -> None:
+        client, peer = socket.socketpair()
+        reader = client.makefile("rb")
+        response = SimpleNamespace(fp=reader, close=reader.close)
+        velox._prepare_response_transport(response, lambda: False)
+        completed = threading.Event()
+        errors: list[BaseException] = []
+        def reading() -> None:
+            try:
+                reader.read()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                reader.close()
+                completed.set()
+        with mock.patch.object(velox.select, "select", side_effect=OSError("readiness failure")):
+            thread = threading.Thread(target=reading, daemon=True)
+            thread.start()
+            self.assertTrue(await asyncio.to_thread(completed.wait, 4), "read failed to unblock")
+            thread.join(2)
+        self.assertTrue(errors, "expected a propagated readiness failure")
+        self.assertTrue(reader.closed, "reader must own final closure in its finally block")
+        peer.close()
+        client.close()
+
+    # ------------------------------------------------------------------ #
+    # Concurrent cancellation is harmless and closes once.
+    def test_concurrent_cancel_is_harmless(self) -> None:
+        client, peer = socket.socketpair()
+        reader = client.makefile("rb")
+        response = SimpleNamespace(fp=reader, close=reader.close)
+        velox._prepare_response_transport(response, lambda: False)
+        errors: list[BaseException] = []
+        results: list[bool] = []
+        def closer() -> None:
+            try:
+                velox.LLMClient._close_response_transport(response)
+                results.append(True)
+            except Exception as exc:
+                errors.append(exc)
+        a = threading.Thread(target=closer); b = threading.Thread(target=closer)
+        a.start(); b.start(); a.join(3); b.join(3)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        peer.close(); client.close(); reader.close()
+
+    # ------------------------------------------------------------------ #
+    # Completion/cancellation race with gates.
+    async def _stream_race(self, transport: str, *, cancel_first: bool) -> None:
+        read_wait = threading.Event()
+        release_server = threading.Event()
+        if transport == "responses":
+            full = {"id": "r1", "object": "response", "status": "completed", "output": [
+                {"id": "m1", "type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "ROBUST"}]}]}
+            event = {"type": "response.completed", "response": full}
+        else:
+            event = {"id": "c1", "choices": [{"index": 0, "delta": {"content": "ROBUST"}, "finish_reason": "stop"}]}
+        body = b"data: " + json.dumps(event).encode() + b"\n\ndata: [DONE]\n\n"
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.flush()
+                release_server.wait(30.0)
+                self.wfile.write(body)
+                self.wfile.flush()
+        server, thread, port = self._start_server(Handler)
+        try:
+            self._endpoint(transport, port)
+            cancel = threading.Event()
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}],
+                                       stream=True, cancel_event=cancel)
+            collected: list[velox.LLMChunk] = []
+            async def consume() -> None:
+                stream = self._stream_method(transport, request)
+                try:
+                    async for chunk in stream:
+                        collected.append(chunk)
+                        if chunk.done:
+                            break
+                finally:
+                    try:
+                        await stream.aclose()
+                    except Exception:
+                        pass
+            with self._signals_reads(read_wait):
+                task = asyncio.create_task(consume())
+                self.assertTrue(await asyncio.to_thread(read_wait.wait, 8), "read boundary never entered")
+                if cancel_first:
+                    cancel.set()
+                    release_server.set()
+                else:
+                    release_server.set()
+                await asyncio.wait_for(asyncio.shield(task), 8)
+            self.assertEqual(len(collected), 1, "exactly one terminal outcome expected")
+            terminal = collected[0]
+            self.assertTrue(terminal.done)
+            if cancel_first:
+                self.assertIn("LLMRequestCancelledError", terminal.error or "", collected)
+            else:
+                self.assertIsNone(terminal.error, collected)
+                self.assertEqual("ROBUST", terminal.text.strip())
+            self.assertTrue(
+                await asyncio.to_thread(self._wait_threads_gone,
+                                        {"velox-llm-responses-worker", "velox-llm-chat-worker", "velox-llm-response-close"}, 4),
+            )
+        finally:
+            release_server.set()
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
+
+    async def test_completion_race_returns_one_terminal_result(self) -> None:
+        await self._stream_race("chat_completions", cancel_first=False)
+    async def test_cancellation_first_race_returns_one_terminal_result(self) -> None:
+        await self._stream_race("chat_completions", cancel_first=True)
+    async def test_simultaneous_race_allows_one_valid_outcome(self) -> None:
+        await self._stream_race("responses", cancel_first=True)
+
+    # ------------------------------------------------------------------ #
+    # Long partial read: cancel during a partial tool-call body; no executable
+    # truncated tool result may be surfaced.
+    async def test_long_partial_read_no_executable_tool_result(self) -> None:
+        read_wait = threading.Event()
+        release_server = threading.Event()
+        partial = b'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fs_write","arguments":"{\\"path\\":\\"x\\""}}]}}]}\n'
+        event = b"data: " + json.dumps({"id": "c1", "choices": [{"index": 0, "delta": {"content": "ROBUST"}, "finish_reason": "stop"}]}).encode() + b"\n\n"
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(partial) + len(event)))
+                self.end_headers()
+                self.wfile.write(partial)
+                self.wfile.flush()
+                release_server.wait(30.0)
+                self.wfile.write(event)
+                self.wfile.flush()
+        server, thread, port = self._start_server(Handler)
+        try:
+            self._endpoint("chat_completions", port)
+            cancel = threading.Event()
+            request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "hi"}],
+                                       stream=True, cancel_event=cancel)
+            collected: list[velox.LLMChunk] = []
+            async def consume() -> None:
+                stream = self._stream_method("chat_completions", request)
+                try:
+                    async for chunk in stream:
+                        collected.append(chunk)
+                        if chunk.done:
+                            break
+                finally:
+                    try:
+                        await stream.aclose()
+                    except Exception:
+                        pass
+            with self._signals_reads(read_wait):
+                task = asyncio.create_task(consume())
+                self.assertTrue(await asyncio.to_thread(read_wait.wait, 8))
+                # Let the partial line be consumed then cancel before the rest.
+                await asyncio.sleep(0.2)
+                cancel.set()
+                await asyncio.wait_for(asyncio.shield(task), 8)
+            self.assertTrue(collected and collected[-1].done)
+            self.assertIn("LLMRequestCancelledError", collected[-1].error or "", collected)
+            # No partial/truncated native tool batch may be executable.
+            self.assertIsNone(collected[-1].native_tool_calls, collected)
+        finally:
+            release_server.set()
+            server.shutdown()
+            server.server_close()
+            await asyncio.to_thread(thread.join, 2)
+
+    # ------------------------------------------------------------------ #
+    # Negative control is rejected by the acceptance helper before the
+    # ordinary socket timeout.
+    def test_negative_control_is_rejected(self) -> None:
+        # A child that deliberately ignores cancellation (the old weak behavior)
+        # must not be accepted: it stays blocked until the ordinary timeout, so
+        # the parent kills it before that timer and observes the expected failure.
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent)
+        env["VELOX_NEGATIVE_CONTROL"] = "1"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import test_velox as t; t._run_negative_control_child()"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
+        )
+        try:
+            proc.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=4)
+            # The child was still blocked reading, so the negation is confirmed.
+            self.assertTrue(True)
+            return
+        stdout, stderr = proc.communicate(timeout=4)
+        self.fail(
+            "negative control child completed with returncode %s; it should have "
+            "been rejected before the ordinary socket timeout\nstdout=%s\nstderr=%s"
+            % (proc.returncode, stdout, stderr)
+        )
+
+    # ------------------------------------------------------------------ #
+    # Raw-socket ownership: cross-platform, no native-close retry list.
+    def test_ownership_no_descriptor_detach_after_cancel(self) -> None:
+        # After cooperative cancellation is requested, the original socket
+        # remains owned by its reader and is closed by normal Python ownership,
+        # not by detaching a descriptor or native closesocket.
+        client, peer = socket.socketpair()
+        reader = client.makefile("rb")
+        response = SimpleNamespace(fp=reader, close=reader.close)
+        velox._prepare_response_transport(response, lambda: False)
+        completed = threading.Event()
+        def reading() -> None:
+            try:
+                reader.read()
+            except Exception:
+                pass
+            finally:
+                reader.close()
+                completed.set()
+        thread = threading.Thread(target=reading, daemon=True)
+        thread.start()
+        # Request cancellation and verify the read unblocks promptly.
+        started = time.perf_counter()
+        velox.LLMClient._close_response_transport(response)
+        self.assertTrue(completed.wait(3), "read did not unblock after cancellation")
+        self.assertLess(time.perf_counter() - started, 3.0)
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        # The original socket object must still reference its descriptor (owned),
+        # never detached to a bare integer.
+        self.assertNotEqual(client.fileno(), -1)
+        peer.close()
+        client.close()
 class DashboardAndSleepTests(_AsyncRuntimeFixture):
     def setUp(self) -> None:
         super().setUp()
@@ -41597,6 +42250,56 @@ class TestRunnerIntegrityTests(unittest.TestCase):
                 writer.write('OK')
             self.assertFalse(marker.exists(), 'Only a completed successful TestResult may publish the marker')
 
+    def test_build_groups_packs_ordinary_classes_within_bounds(self) -> None:
+        rows = [("ClassA", 30), ("ClassB", 30), ("ClassC", 30), ("ClassD", 30), ("ClassE", 30)]
+        groups = _build_test_groups(rows)
+        # Every ordinary class is packed; no single batch exceeds 100 tests or 8 classes.
+        self.assertEqual(len(groups), 2)
+        for group in groups:
+            self.assertLessEqual(group["count"], 100)
+            self.assertLessEqual(len(group["argument"].split(",")), 8)
+            self.assertEqual(group["label"], group["argument"])
+        self.assertEqual(sum(g["count"] for g in groups), 150)
+
+    def test_build_groups_isolates_process_boundary_and_large_classes(self) -> None:
+        rows = [
+            ("TestRunnerIntegrityTests", 1),
+            ("RealLoopbackCancellationTests", 33),
+            ("HugeClass", 120),
+            ("Ordinary", 10),
+        ]
+        groups = _build_test_groups(rows)
+        labels = [g["label"] for g in groups]
+        self.assertIn("TestRunnerIntegrityTests", labels)
+        self.assertIn("RealLoopbackCancellationTests", labels)
+        self.assertIn("HugeClass", labels)
+        # Large/native/process-boundary classes run alone in one-row batches.
+        for name in ("TestRunnerIntegrityTests", "RealLoopbackCancellationTests", "HugeClass"):
+            self.assertEqual(groups[labels.index(name)]["argument"], name)
+        # Packed Ordinary shares a batch with no isolated class.
+        ordinary = next(g for g in groups if "Ordinary" in g["argument"])
+        self.assertEqual(ordinary["argument"], "Ordinary")
+
+    def test_build_groups_selects_every_identity_exactly_once(self) -> None:
+        rows = [("A", 12), ("B", 34), ("C", 56), ("D", 99), ("E", 1)]
+        groups = _build_test_groups(rows)
+        chosen = [name for g in groups for name in g["argument"].split(",")]
+        self.assertEqual(sorted(chosen), sorted(name for name, _ in rows))
+        self.assertEqual(len(chosen), len(rows))
+        self.assertEqual(sum(g["count"] for g in groups), sum(count for _, count in rows))
+
+    def test_build_groups_isolated_mode_keeps_every_class_alone(self) -> None:
+        rows = [("A", 5), ("B", 5), ("C", 5)]
+        groups = _build_test_groups(rows, isolated=True)
+        self.assertEqual([g["argument"] for g in groups], ["A", "B", "C"])
+        self.assertEqual([g["count"] for g in groups], [5, 5, 5])
+
+    def test_build_groups_rejects_empty_class(self) -> None:
+        with self.assertRaises(ValueError):
+            _build_test_groups([("Empty", 0)])
+        with self.assertRaises(ValueError):
+            _build_test_groups([("Empty", 0), ("Good", 1)])
+
 
 class ReportQueueRecoveryTests(_AsyncRuntimeFixture):
     def setUp(self) -> None:
@@ -42863,10 +43566,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Velox regression suite.")
     parser.add_argument("--test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--test-class", default="", metavar="CLASS", help="run a test class or comma-separated classes")
+    parser.add_argument("--isolated", action="store_true", help="run every test class in its own disposable process (no batching)")
     args = parser.parse_args()
     if args.test_class:
         run_test_class(args.test_class)
-    exit_after_tests(run_test_suite())
+    exit_after_tests(run_test_suite(isolated=bool(args.isolated)))
 
 
 if __name__ == "__main__":

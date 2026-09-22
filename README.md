@@ -73,7 +73,7 @@ The application is in [velox.py](velox.py), with tests in [test_velox.py](test_v
 
 ## Tests
 
-The suite contains **2,035 regression tests** covering model transports, tools, persistence, agents, checklists, UI behavior and cancellation.
+The suite contains **2,067 regression tests** covering model transports, tools, persistence, agents, checklists, UI behavior and cancellation.
 
 From the repository root, using your environment's Python:
 
@@ -81,7 +81,7 @@ From the repository root, using your environment's Python:
 python test_velox.py
 ```
 
-Headless tests need Pillow and `tzdata`. They use temporary data and local provider fixtures. Test classes run in isolated child processes with timeouts. To run one class:
+Headless tests need Pillow and `tzdata`. They use temporary data and local provider fixtures. Test classes run in disposable child processes with timeouts; ordinary classes are batched into shared children, and `--isolated` runs each class in its own process. Set `VELOX_TEST_RUNNER_TRACE=1` to print per-shard startup/body/cleanup timing. To run one class:
 
 ```bash
 python test_velox.py --test-class TransportDeadlineTests

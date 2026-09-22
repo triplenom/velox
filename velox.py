@@ -56,6 +56,7 @@ import io
 import ipaddress
 import ssl
 import secrets
+import select
 import signal
 import unicodedata
 import json
@@ -9015,14 +9016,16 @@ def create_default_skills_for_new_install(root_dir: Path) -> None:
             )
 
 
-def refresh_machine_generated_skills_for_startup(root_dir: Path) -> None:
+def refresh_machine_generated_skills_for_startup(
+    root_dir: Path, environment: dict[str, Any] | None = None,
+) -> None:
     """Regenerate machine-specific programming guidance from the live host on every startup."""
     skills_dir = Path(root_dir).expanduser().resolve() / "skills"
     cpp_dir = skills_dir / DEFAULT_CPP_PROGRAMMING_SKILL_NAME
     cpp_dir.mkdir(parents=True, exist_ok=True)
     _plain_atomic_write_bytes(
         cpp_dir / SKILL_FILE_NAME,
-        build_cpp_programming_skill_markdown().encode("utf-8"),
+        build_cpp_programming_skill_markdown(environment=environment).encode("utf-8"),
     )
 
 
@@ -13295,7 +13298,7 @@ class Storage:
         self._config_view_sig: tuple[int, int, int, int] | None = None
         self._config_view_checked_at: float = 0.0
 
-    def ensure_first_run_files(self) -> None:
+    def ensure_first_run_files(self, environment: dict[str, Any] | None = None) -> None:
         """Create or validate the application data root and its local stores."""
         # This method sits beneath several read-only view helpers used by the
         # immediate-mode UI. Once initialization succeeds, avoid repeating
@@ -13319,7 +13322,7 @@ class Storage:
             self.paths.pa_reports_dir().mkdir(parents=True, exist_ok=True)
             # The native C/C++ Skill is machine-generated from live Visual Studio, MSVC, and CMake discovery on every startup.
             self.paths.skills_dir().mkdir(parents=True, exist_ok=True)
-            refresh_machine_generated_skills_for_startup(self.paths.root_dir)
+            refresh_machine_generated_skills_for_startup(self.paths.root_dir, environment)
             credentials = CredentialStore(self.paths)
             credentials.ensure_directory()
             credentials.validate_all()
@@ -27246,61 +27249,111 @@ def should_send_vision_inputs(endpoint: dict[str, Any] | None, *, has_image_atta
     return endpoint_supports_vision(endpoint)
 
 
-_TRANSPORT_CLOSE_DIAGNOSTICS: list[str] = []
-_WS2_32: Any = None
+class _CancellableSocketRead:
+    """Keep a SocketIO read cancellable without closing a live descriptor."""
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        self._socket = sock
+        self._cancelled = cancelled
+        self._stop = threading.Event()
+        self._read_timeout = sock.gettimeout()
+        if self._read_timeout is not None and self._read_timeout <= 0:
+            raise ValueError("Expected a blocking or timeout-mode response socket")
+        # Install on the reading worker before its first response-body read.
+        sock.setblocking(False)
+
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def _check_cancelled(self) -> None:
+        if self._stop.is_set() or (self._cancelled and self._cancelled()):
+            raise LLMRequestCancelledError("Endpoint request cancelled")
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        timeout = self._read_timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            self._check_cancelled()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise socket.timeout("timed out")
+            try:
+                # Try first: TLS may already hold decrypted input even when
+                # the underlying socket is not reported readable by select.
+                return self._socket.recv_into(buffer, nbytes, flags)
+            except ssl.SSLWantWriteError:
+                write_ready = True
+            except (ssl.SSLWantReadError, BlockingIOError):
+                write_ready = False
+            except InterruptedError:
+                continue
+            wait = 0.1
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("timed out")
+                wait = min(wait, remaining)
+            self._check_cancelled()
+            try:
+                select.select(
+                    [] if write_ready else [self._socket],
+                    [self._socket] if write_ready else [],
+                    [],
+                    wait,
+                )
+            except InterruptedError:
+                continue
+
+    def fileno(self) -> int:
+        return self._socket.fileno()
+
+    def _decref_socketios(self) -> None:
+        # SocketIO still owns exactly the reference acquired by makefile().
+        self._socket._decref_socketios()
 
 
-def _win_ws2_32() -> Any:
-    """Lazy pointer-width ws2_32 binding with Winsock last-error capture."""
-    global _WS2_32
-    if _WS2_32 is None:
-        binding = ctypes.WinDLL("ws2_32", use_last_error=True)
-        binding.closesocket.restype = ctypes.c_int
-        binding.closesocket.argtypes = [ctypes.c_void_p]
-        binding.WSAGetLastError.restype = ctypes.c_int
-        binding.WSAGetLastError.argtypes = []
-        _WS2_32 = binding
-    return _WS2_32
+def _response_socket_io(response: Any) -> socket.SocketIO | None:
+    current = response
+    for _ in range(3):
+        fp = getattr(current, "fp", None)
+        raw = getattr(fp, "raw", None)
+        if isinstance(raw, socket.SocketIO):
+            return raw
+        if fp is None or fp is current:
+            return None
+        current = fp
+    return None
 
 
-def _record_transport_diagnostic(message: str) -> None:
-    """Record a non-fatal transport close failure for later diagnostics."""
-    _TRANSPORT_CLOSE_DIAGNOSTICS.append(message)
-    if str(os.environ.get("VELOX_TRANSPORT_TRACE") or "").strip():
-        try:
-            sys.stderr.write(f"[transport-close] {message}\n")
-        except Exception:
-            pass
-
-
-def _interrupt_blocked_socket(sock: socket.socket) -> None:
-    """Interrupt a blocked Windows socket read by closing its descriptor.
-
-    The descriptor is detached exactly once and closed immediately with the
-    pointer-width Winsock binding. If the socket is already detached or closed
-    the call is a no-op, so a descriptor that has since been reused is never
-    closed and an error cannot leave a detached handle with no cleanup owner.
-    """
-    if os.name != "nt":
+def _prepare_response_transport(
+    response: Any, cancelled: Callable[[], bool] | None = None,
+) -> None:
+    """Install before publishing the response to its cancellation watcher."""
+    raw = _response_socket_io(response)
+    if raw is None or isinstance(raw._sock, _CancellableSocketRead):
         return
+    if not isinstance(raw._sock, socket.socket):
+        return
+    original_socket = raw._sock
+    original_timeout = original_socket.gettimeout()
+    adapter = _CancellableSocketRead(original_socket, cancelled)
     try:
-        if sock.fileno() < 0:
-            return
-        fd = sock.detach()
-    except (OSError, ValueError):
-        return
-    if fd < 0:
-        return
-    ws2_32 = _win_ws2_32()
-    try:
-        result = int(ws2_32.closesocket(fd))
-        if result == ctypes.c_int(-1).value:
-            wsa_error = int(ws2_32.WSAGetLastError())
-            _record_transport_diagnostic(f"Winsock closesocket failed with error {wsa_error} (fd={fd})")
-    except Exception as exc:
-        _record_transport_diagnostic(
-            f"Winsock closesocket raised {type(exc).__name__}: {exc} (fd={fd})"
-        )
+        raw._sock = adapter
+    except BaseException:
+        original_socket.settimeout(original_timeout)
+        raise
+
+
+def _request_response_cancel(response: Any) -> bool:
+    raw = _response_socket_io(response)
+    adapter = getattr(raw, "_sock", None)
+    if isinstance(adapter, _CancellableSocketRead):
+        adapter.cancel()
+        return True
+    return False
 
 
 class LLMClient:
@@ -28379,34 +28432,29 @@ class LLMClient:
 
     @staticmethod
     def _close_response_transport(response: Any) -> None:
-        """Run off-loop; interrupt an owned urllib read before buffered close.
+        """Signal a cooperative cancellation; the reading worker owns final close.
 
-        HTTPResponse owns fp.raw._sock; HTTPError wraps that response in fp.
-        Opaque adapters retain best-effort close without assuming a socket API.
+        HTTPResponse owns fp.raw._sock; HTTPError wraps that response in fp. If
+        the response transport was prepared with ``_prepare_response_transport``,
+        requesting cancellation here only sets an event on the read adapter. The
+        adapter raises ``LLMRequestCancelledError`` inside the reading worker and
+        the worker's own ``with response`` / ``finally`` block closes the
+        response. This method never detaches a descriptor or calls a native
+        close from another thread, which previously raced the reader and could
+        close a descriptor that had since been reused by another connection.
 
-        On Windows a ``shutdown(SHUT_RDWR)`` does not wake a blocked ``recv``
-        when the socket is wrapped by a ``makefile`` BufferedReader: the reader
-        holds the reader lock while blocked, so ``response.close()`` would wait
-        on that lock.  The owned socket descriptor is detached exactly once and
-        closed with the pointer-width Winsock binding; the blocked read is
-        interrupted and the descriptor is reclaimed without risking closing a
-        descriptor that has since been reused by another connection.
+        A response already closed by its owner requires no action. Best-effort
+        ``close()`` is kept only for existing opaque adapters that do not
+        represent a live stdlib socket; it is never used to bypass a failed or
+        missing installation on a real ``HTTPResponse``.
         """
-        current = response
-        for _ in range(2):
-            try:
-                fp = getattr(current, "fp", None)
-                sock = getattr(getattr(fp, "raw", None), "_sock", None)
-                if isinstance(sock, socket.socket):
-                    try:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass  # Already closed, reset, or concurrently completed.
-                    _interrupt_blocked_socket(sock)
-                    break
-                current = fp
-            except Exception:
-                break
+        if _request_response_cancel(response):
+            return
+        # A real stdlib response socket that was not prepared must be left to
+        # its reader; closing it here would block on the reader lock or race a
+        # descriptor that may already have been released.
+        if _response_socket_io(response) is not None:
+            return
         try:
             response.close()
         except Exception:
@@ -28718,7 +28766,15 @@ class LLMClient:
                 if request_cancelled():
                     raise LLMRequestCancelledError("Endpoint request cancelled before connection")
                 req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                try:
+                    opened = urllib.request.urlopen(req, timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    _prepare_response_transport(exc, request_cancelled)
+                    with response_lock:
+                        response_holder["response"] = exc
+                    raise
+                with opened as resp:
+                    _prepare_response_transport(resp, request_cancelled)
                     with response_lock:
                         response_holder["response"] = resp
                     if request_cancelled():
@@ -28821,6 +28877,15 @@ class LLMClient:
                         payload=payload, stream=True, response_headers=response_headers,
                         final_url=response_url,
                     )
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
+                if request_cancelled():
+                    error = LLMRequestCancelledError(
+                        f"Endpoint profile '{request.endpoint_profile_id}' request was cancelled"
+                    )
                 put(LLMChunk(
                     error=f"{type(error).__name__}: {error}", done=True, usage=usage,
                     endpoint_failure=endpoint_failure_metadata(error),
@@ -28848,7 +28913,7 @@ class LLMClient:
                         return
             threading.Thread(target=cancellation_watcher, daemon=True).start()
         deadline = LLMRequestDeadline(request.endpoint_profile_id, timeout)
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, name="velox-llm-responses-worker", daemon=True).start()
         try:
             while True:
                 try:
@@ -29126,7 +29191,15 @@ class LLMClient:
                 if request_cancelled():
                     raise LLMRequestCancelledError("Endpoint request cancelled before connection")
                 req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                try:
+                    opened = urllib.request.urlopen(req, timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    _prepare_response_transport(exc, request_cancelled)
+                    with response_lock:
+                        response_holder["response"] = exc
+                    raise
+                with opened as resp:
+                    _prepare_response_transport(resp, request_cancelled)
                     with response_lock:
                         response_holder["response"] = resp
                     if request_cancelled():
@@ -29242,6 +29315,15 @@ class LLMClient:
                         response_headers=response_headers,
                         final_url=response_url,
                     )
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
+                if request_cancelled():
+                    error = LLMRequestCancelledError(
+                        f"Endpoint profile '{request.endpoint_profile_id}' request was cancelled"
+                    )
                 put(LLMChunk(
                     error=f"{type(error).__name__}: {error}", done=True, usage=usage,
                     endpoint_failure=endpoint_failure_metadata(error),
@@ -29270,7 +29352,7 @@ class LLMClient:
                         return
             threading.Thread(target=cancellation_watcher, daemon=True).start()
         deadline = LLMRequestDeadline(request.endpoint_profile_id, timeout)
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, name="velox-llm-chat-worker", daemon=True).start()
         try:
             while True:
                 try:
@@ -29428,6 +29510,7 @@ class LLMClient:
             return stopped.is_set() or bool(request.cancel_event and request.cancel_event.is_set())
 
         def register_response(response: Any) -> None:
+            _prepare_response_transport(response, cancelled)
             with response_lock:
                 response_holder[0] = response
             # A cancellation during connect must also close the late response,
@@ -29505,9 +29588,18 @@ class LLMClient:
             except urllib.error.HTTPError as exc:
                 try:
                     register_response(exc)
+                    error_body = None
+                    try:
+                        error_body = exc.read(self.error_body_max_bytes() + 1)
+                    except LLMRequestCancelledError:
+                        raise
+                    except Exception as body_exc:
+                        error_body = (
+                            f"[could not read error response body: {type(body_exc).__name__}: {body_exc}]"
+                        ).encode("utf-8", errors="replace")
                     raise self._endpoint_error(
                         exc, endpoint=endpoint, url=url, headers=headers, timeout=timeout,
-                        payload=payload, stream=False,
+                        payload=payload, stream=False, response_body_bytes=error_body,
                     ) from exc
                 finally:
                     exc.close()
@@ -29582,6 +29674,8 @@ class LLMClient:
         except LLMEndpointError:
             raise
         except Exception as exc:
+            if isinstance(exc, LLMRequestCancelledError):
+                raise
             if is_timeout_exception(exc):
                 raise LLMRequestTimeoutError(
                     str(endpoint.get("profile_id") or request.endpoint_profile_id), timeout,
@@ -29651,9 +29745,18 @@ class LLMClient:
             except urllib.error.HTTPError as exc:
                 try:
                     register_response(exc)
+                    error_body = None
+                    try:
+                        error_body = exc.read(self.error_body_max_bytes() + 1)
+                    except LLMRequestCancelledError:
+                        raise
+                    except Exception as body_exc:
+                        error_body = (
+                            f"[could not read error response body: {type(body_exc).__name__}: {body_exc}]"
+                        ).encode("utf-8", errors="replace")
                     raise self._endpoint_error(
                         exc, endpoint=endpoint, url=url, headers=headers, timeout=timeout,
-                        payload=payload, stream=False,
+                        payload=payload, stream=False, response_body_bytes=error_body,
                     ) from exc
                 finally:
                     exc.close()
@@ -29781,6 +29884,8 @@ class LLMClient:
         except LLMEndpointError:
             raise
         except Exception as exc:
+            if isinstance(exc, LLMRequestCancelledError):
+                raise
             if is_timeout_exception(exc):
                 raise LLMRequestTimeoutError(
                     str(endpoint.get("profile_id") or request.endpoint_profile_id),
