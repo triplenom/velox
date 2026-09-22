@@ -76,6 +76,23 @@ import velox
 def _project_documentation(filename: str) -> str:
     return Path(__file__).with_name(filename).read_text(encoding="utf-8")
 
+
+def _paths_equivalent(a: Path, b: Path) -> bool:
+    """True when a and b name the same filesystem location.
+
+    Tolerates Windows 8.3 short-name aliases (RUNNER~1 vs runneradmin) and
+    incidental path spelling by comparing filesystem identity for existing
+    targets, and canonicalizing the existing parent for non-existent targets.
+    """
+    pa, pb = Path(a), Path(b)
+    try:
+        return os.path.samefile(pa, pb)
+    except OSError:
+        try:
+            return os.path.realpath(pa) == os.path.realpath(pb)
+        except OSError:
+            return os.path.normcase(str(pa)) == os.path.normcase(str(pb))
+
 class _TestDummyFont:
     """Deterministic font metrics for layout tests."""
 
@@ -127,6 +144,24 @@ def _make_test_storage(root: Path) -> velox.Storage:
     storage = velox.Storage(velox.AppPaths(root))
     storage.ensure_first_run_files()
     return storage
+
+
+def _drain_storage_log_writer(storage: velox.Storage) -> None:
+    """Flush and release the app-log writer for this storage's log path.
+
+    Run before a data-root TemporaryDirectory is removed on Windows so an open
+    log.jsonl handle cannot make rmtree fail with WinError 32. Then clear the
+    data-root registrations so a later test does not see a stale root.
+    """
+    try:
+        log_path = Path(storage.log_path())
+    except Exception:
+        log_path = None
+    if log_path is not None:
+        drained = velox.APP_LOG_WRITER.flush((log_path,), timeout=3.0)
+        if not drained:
+            velox.APP_LOG_WRITER.flush(timeout=3.0)
+    velox.DATA_ROOTS.clear_for_tests()
 
 
 def _make_test_chat_stack(root: Path) -> tuple[velox.AppPaths, velox.Storage, velox.ChatStore]:
@@ -922,14 +957,17 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_disabled_first_message_history_is_not_appended(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            history_chat = chats.create_chat("History")
-            self._write_chat_summary(paths, history_chat["chat_id"], "- Should stay hidden")
-            current = chats.create_chat("Current")
-            first = velox.make_turn(current["chat_id"], "user", "Start")
-            first["chat_history_context_enabled"] = False
-            chats.append_turn(velox.APP_SCOPE_ID, current["chat_id"], first)
-            runtime = velox.ChatRuntime(storage, chats, velox.ContextAssembler(paths), velox.LLMClient(storage), velox.ToolRegistry(storage))
-            self.assertEqual(runtime._first_message_history_context(velox.APP_SCOPE_ID, current["chat_id"], chats.load_turns(velox.APP_SCOPE_ID, current["chat_id"])), "")
+            try:
+                history_chat = chats.create_chat("History")
+                self._write_chat_summary(paths, history_chat["chat_id"], "- Should stay hidden")
+                current = chats.create_chat("Current")
+                first = velox.make_turn(current["chat_id"], "user", "Start")
+                first["chat_history_context_enabled"] = False
+                chats.append_turn(velox.APP_SCOPE_ID, current["chat_id"], first)
+                runtime = velox.ChatRuntime(storage, chats, velox.ContextAssembler(paths), velox.LLMClient(storage), velox.ToolRegistry(storage))
+                self.assertEqual(runtime._first_message_history_context(velox.APP_SCOPE_ID, current["chat_id"], chats.load_turns(velox.APP_SCOPE_ID, current["chat_id"])), "")
+            finally:
+                _drain_storage_log_writer(storage)
 
     def test_first_send_snapshots_history_and_locks_endpoint_and_tool_categories(self) -> None:
         async def scenario(root: Path) -> None:
@@ -1002,7 +1040,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 paths.root_dir, paths.chat_workspace_dir(chat["chat_id"]), paths.chat_temp_dir(chat["chat_id"]),
                 paths.chat_attachments_dir(chat["chat_id"]), paths.skills_dir(),
             ):
-                self.assertIn(str(expected), content)
+                self.assertIn(str(expected).replace("\\", "/"), content)
             self.assertIn('Relative file paths resolve from the Velox application root', content)
             self.assertIn('Use supplied absolute paths', content)
             self.assertIn("Work outside this Chat directory requires the user's explicit authorization", content)
@@ -1036,12 +1074,13 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=chat["chat_id"])
 
             relative = await tools.write_file(ctx, {"path": "deliverable.txt", "content": "app root"})
-            self.assertEqual(Path(relative["path"]), root / "deliverable.txt")
+            self.assertTrue(_paths_equivalent(Path(relative["path"]), root / "deliverable.txt"))
+            self.assertFalse(_paths_equivalent(Path(relative["path"]), root / "not-the-written-file.txt"))
             self.assertEqual((root / "deliverable.txt").read_text(encoding="utf-8"), "app root")
 
             workspace_target = paths.chat_workspace_dir(chat["chat_id"]) / "deliverable.txt"
             inside = await tools.write_file(ctx, {"path": str(workspace_target), "content": "inside"})
-            self.assertEqual(Path(inside["path"]), workspace_target)
+            self.assertTrue(_paths_equivalent(Path(inside["path"]), workspace_target))
             self.assertEqual(workspace_target.read_text(encoding="utf-8"), "inside")
 
             external = root.parent / f"velox-explicit-{velox.uuid_v4()}.txt"
@@ -2024,26 +2063,29 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_agent_statistics_cover_outcomes_tokens_and_average_duration(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, _chats, chat = self._chat(Path(td))
-            store = velox.AgentStore(storage)
-            succeeded = store.create_agent(chat["chat_id"], "one", title="Success")
-            failed = store.create_agent(chat["chat_id"], "two", title="Failure")
-            cancelled = store.create_agent(chat["chat_id"], "three", title="Cancelled")
-            store.update_agent(succeeded["agent_id"], {"status": "succeeded", "active_seconds": 60, "input_tokens": 100, "output_tokens": 50})
-            store.update_agent(failed["agent_id"], {"status": "failed", "active_seconds": 120, "input_tokens": 200, "output_tokens": 100})
-            store.update_agent(cancelled["agent_id"], {"status": "cancelled", "active_seconds": 30})
-            stats = store.statistics()
-            self.assertEqual(stats["total_tasks"], 3)
-            self.assertEqual(stats["terminal_tasks"], 3)
-            self.assertEqual(stats["input_tokens"], 300)
-            self.assertEqual(stats["output_tokens"], 150)
-            self.assertAlmostEqual(stats["average_task_seconds"], 70.0)
+            try:
+                store = velox.AgentStore(storage)
+                succeeded = store.create_agent(chat["chat_id"], "one", title="Success")
+                failed = store.create_agent(chat["chat_id"], "two", title="Failure")
+                cancelled = store.create_agent(chat["chat_id"], "three", title="Cancelled")
+                store.update_agent(succeeded["agent_id"], {"status": "succeeded", "active_seconds": 60, "input_tokens": 100, "output_tokens": 50})
+                store.update_agent(failed["agent_id"], {"status": "failed", "active_seconds": 120, "input_tokens": 200, "output_tokens": 100})
+                store.update_agent(cancelled["agent_id"], {"status": "cancelled", "active_seconds": 30})
+                stats = store.statistics()
+                self.assertEqual(stats["total_tasks"], 3)
+                self.assertEqual(stats["terminal_tasks"], 3)
+                self.assertEqual(stats["input_tokens"], 300)
+                self.assertEqual(stats["output_tokens"], 150)
+                self.assertAlmostEqual(stats["average_task_seconds"], 70.0)
 
-            panel_source = self._method_source(velox.Panels, "_draw_agent_summary_cards")
-            for label in ("Task status", "Token usage", "Task outcomes", "Top tools", "Checklist statistics"):
-                self.assertIn(label, panel_source)
-            self.assertIn("Chat, Agent, Image, and System Tasks", panel_source)
-            self.assertNotIn("Tool call success", panel_source)
-            self.assertEqual(velox.Panels._format_agent_metric_value(1250), "1.2K")
+                panel_source = self._method_source(velox.Panels, "_draw_agent_summary_cards")
+                for label in ("Task status", "Token usage", "Task outcomes", "Top tools", "Checklist statistics"):
+                    self.assertIn(label, panel_source)
+                self.assertIn("Chat, Agent, Image, and System Tasks", panel_source)
+                self.assertNotIn("Tool call success", panel_source)
+                self.assertEqual(velox.Panels._format_agent_metric_value(1250), "1.2K")
+            finally:
+                _drain_storage_log_writer(storage)
 
     def test_settings_timeout_minutes_widths_and_endpoint_editor_validation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3963,7 +4005,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             chat_id = chat["chat_id"]
             source = root / "large-source.txt"
             body = "0123456789abcdef\n" * 8192
-            source.write_text(body, encoding="utf-8")
+            source.write_bytes(body.encode("utf-8"))
             ctx = velox.ToolContext(scope_id=velox.APP_SCOPE_ID, chat_id=chat_id)
             file_tools = velox.FileTools(storage)
 
@@ -4251,7 +4293,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             app_relative_directory = root / "workspace"
             app_relative_directory.mkdir(parents=True)
             listed = await file_tools.list_files(ctx, {"path": "workspace"})
-            self.assertEqual(Path(listed["path"]), app_relative_directory.resolve())
+            self.assertTrue(_paths_equivalent(Path(listed["path"]), app_relative_directory.resolve()))
             await file_tools.write_file(ctx, {"path": "workspace/report.txt", "content": "app relative"})
             workspace_target = paths.chat_workspace_dir(chat_id) / "final-report.txt"
             await file_tools.write_file(ctx, {"path": str(workspace_target), "content": "durable output"})
@@ -4260,9 +4302,10 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             agent_store = velox.AgentStore(storage)
             agent = agent_store.create_agent(chat_id, "Path guidance")
             agent_prompt = velox.AgentRuntime(storage, agent_store, velox.ChatStore(storage), velox.ContextAssembler(paths), object(), velox.ToolRegistry(storage)).build_standard_system_prompt(agent)
-            for prompt in (context_prompt, agent_prompt):
-                self.assertIn(str(root), prompt)
-                self.assertIn(str(paths.chat_workspace_dir(chat_id)), prompt)
+            self.assertIn(str(paths.root_dir).replace("\\", "/"), context_prompt)
+            self.assertIn(str(paths.chat_workspace_dir(chat_id)).replace("\\", "/"), context_prompt)
+            self.assertIn(str(paths.root_dir), agent_prompt)
+            self.assertIn(str(paths.chat_workspace_dir(chat_id)), agent_prompt)
             self.assertIn('Relative file paths resolve from the Velox application root', context_prompt)
             self.assertIn('Store final work in workspace', context_prompt)
             self.assertIn("Use the exact absolute workspace path above", agent_prompt)
@@ -11414,55 +11457,68 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             chrome = program_files / "Google" / "Chrome" / "Application" / "chrome.exe"
             chrome.parent.mkdir(parents=True, exist_ok=True)
             chrome.write_bytes(b"browser")
-            detected = velox.detect_chrome_executable(
-                "win32",
-                {"PROGRAMFILES": str(program_files), "localappdata": str(local_app_data)},
-            )
-            self.assertEqual(detected, os.path.abspath(str(chrome)))
+            # Isolate every external discovery input: the system drive/install roots, App
+            # Paths registry, PATH/where.exe/PowerShell output, vswhere discovery, and the
+            # Visual Studio registry so the runner's real Chrome/Edge/VS/CMake are never used.
+            with (
+                mock.patch.object(velox, "_windows_system_drive_root", lambda environment: root),
+                mock.patch.object(velox, "_windows_app_path_registry_candidates", lambda names: []),
+                mock.patch.object(velox, "_windows_command_output_paths", lambda command, **kwargs: []),
+                mock.patch.object(velox, "_find_vswhere_executable", lambda environment: ""),
+                mock.patch.object(velox, "_run_vswhere_records", lambda vswhere_path: []),
+                mock.patch.object(velox, "_windows_visual_studio_registry_records", lambda: []),
+                mock.patch.object(velox, "_cmake_candidate_paths", lambda *args, **kwargs: []),
+                mock.patch.object(shutil, "which", return_value=None),
+            ):
+                detected = velox.detect_chrome_executable(
+                    "win32",
+                    {"PROGRAMFILES": str(program_files), "localappdata": str(local_app_data)},
+                )
+                self.assertEqual(detected, os.path.abspath(str(chrome)))
 
-            chrome.unlink()
-            edge = local_app_data / "Microsoft" / "Edge" / "Application" / "msedge.exe"
-            edge.parent.mkdir(parents=True, exist_ok=True)
-            edge.write_bytes(b"edge")
-            detected_edge = velox.detect_chrome_executable(
-                "win32",
-                {"PROGRAMFILES": str(program_files), "LOCALAPPDATA": str(local_app_data)},
-            )
-            self.assertEqual(detected_edge, os.path.abspath(str(edge)))
+                chrome.unlink()
+                edge = local_app_data / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+                edge.parent.mkdir(parents=True, exist_ok=True)
+                edge.write_bytes(b"edge")
+                detected_edge = velox.detect_chrome_executable(
+                    "win32",
+                    {"PROGRAMFILES": str(program_files), "LOCALAPPDATA": str(local_app_data)},
+                )
+                self.assertEqual(detected_edge, os.path.abspath(str(edge)))
 
-            vs_base = program_files / "Microsoft Visual Studio"
+                vs_base = program_files / "Microsoft Visual Studio"
 
-            def create_install(year: str, edition: str, toolset: str) -> Path:
-                install = vs_base / year / edition
-                (install / "Common7" / "Tools").mkdir(parents=True, exist_ok=True)
-                (install / "Common7" / "Tools" / "VsDevCmd.bat").write_text("", encoding="utf-8")
-                (install / "Common7" / "IDE").mkdir(parents=True, exist_ok=True)
-                (install / "Common7" / "IDE" / "devenv.com").write_text("", encoding="utf-8")
-                auxiliary = install / "VC" / "Auxiliary" / "Build"
-                auxiliary.mkdir(parents=True, exist_ok=True)
-                (auxiliary / "vcvars64.bat").write_text("", encoding="utf-8")
-                (auxiliary / "Microsoft.VCToolsVersion.default.txt").write_text(toolset, encoding="utf-8")
-                bin_dir = install / "VC" / "Tools" / "MSVC" / toolset / "bin" / "Hostx64" / "x64"
-                bin_dir.mkdir(parents=True, exist_ok=True)
-                (bin_dir / "cl.exe").write_text("", encoding="utf-8")
-                (bin_dir / "link.exe").write_text("", encoding="utf-8")
-                msbuild = install / "MSBuild" / "Current" / "Bin" / "amd64"
-                msbuild.mkdir(parents=True, exist_ok=True)
-                (msbuild / "MSBuild.exe").write_text("", encoding="utf-8")
-                return install
+                def create_install(year: str, edition: str, toolset: str) -> Path:
+                    install = vs_base / year / edition
+                    (install / "Common7" / "Tools").mkdir(parents=True, exist_ok=True)
+                    (install / "Common7" / "Tools" / "VsDevCmd.bat").write_text("", encoding="utf-8")
+                    (install / "Common7" / "IDE").mkdir(parents=True, exist_ok=True)
+                    (install / "Common7" / "IDE" / "devenv.com").write_text("", encoding="utf-8")
+                    auxiliary = install / "VC" / "Auxiliary" / "Build"
+                    auxiliary.mkdir(parents=True, exist_ok=True)
+                    (auxiliary / "vcvars64.bat").write_text("", encoding="utf-8")
+                    (auxiliary / "Microsoft.VCToolsVersion.default.txt").write_text(toolset, encoding="utf-8")
+                    bin_dir = install / "VC" / "Tools" / "MSVC" / toolset / "bin" / "Hostx64" / "x64"
+                    bin_dir.mkdir(parents=True, exist_ok=True)
+                    (bin_dir / "cl.exe").write_text("", encoding="utf-8")
+                    (bin_dir / "link.exe").write_text("", encoding="utf-8")
+                    msbuild = install / "MSBuild" / "Current" / "Bin" / "amd64"
+                    msbuild.mkdir(parents=True, exist_ok=True)
+                    (msbuild / "MSBuild.exe").write_text("", encoding="utf-8")
+                    return install
 
-            install_2019 = create_install("2019", "Community", "14.29.30133")
-            install_2022 = create_install("2022", "Community", "14.44.35207")
-            self.assertTrue(install_2019.is_dir())
-            detected_vs = velox.detect_visual_studio_environment(
-                "win32", {"PROGRAMFILES": str(program_files)}
-            )
-            self.assertEqual(detected_vs["installationPath"], os.path.abspath(str(install_2022)))
-            self.assertTrue(detected_vs["cl"].endswith("cl.exe"))
-            self.assertTrue(detected_vs["link"].endswith("link.exe"))
-            self.assertTrue(detected_vs["msbuild"].endswith("MSBuild.exe"))
-            self.assertTrue(detected_vs["vsDevCmd"].endswith("VsDevCmd.bat"))
-            self.assertEqual(detected_vs["toolsetVersion"], "14.44.35207")
+                install_2019 = create_install("2019", "Community", "14.29.30133")
+                install_2022 = create_install("2022", "Community", "14.44.35207")
+                self.assertTrue(install_2019.is_dir())
+                detected_vs = velox.detect_visual_studio_environment(
+                    "win32", {"PROGRAMFILES": str(program_files)}
+                )
+                self.assertEqual(detected_vs["installationPath"], os.path.abspath(str(install_2022)))
+                self.assertTrue(detected_vs["cl"].endswith("cl.exe"))
+                self.assertTrue(detected_vs["link"].endswith("link.exe"))
+                self.assertTrue(detected_vs["msbuild"].endswith("MSBuild.exe"))
+                self.assertTrue(detected_vs["vsDevCmd"].endswith("VsDevCmd.bat"))
+                self.assertEqual(detected_vs["toolsetVersion"], "14.44.35207")
 
     def test_image_tool_execution_uses_separate_context_on_current_endpoint(self) -> None:
         async def scenario(root: Path) -> None:
@@ -16952,6 +17008,8 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             ), mock.patch.object(
                 module, "_windows_visual_studio_registry_records", return_value=[],
             ), mock.patch.object(module, "_run_vswhere_records", return_value=[]), mock.patch.object(
+                module, "_windows_system_drive_root", return_value=root,
+            ), mock.patch.object(
                 module, "_probe_cmake_executable", side_effect=fake_probe,
             ):
                 detected = velox.detect_visual_studio_environment(
@@ -17842,39 +17900,42 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
     def test_cancelled_release_preserves_terminal_metadata_until_slot_cleanup(self) -> None:
         async def scenario(root: Path) -> None:
             storage = _make_test_storage(root)
-            monitor = velox.LLMTaskMonitor(storage)
-            profile = velox.default_endpoint_profile(
-                "shared", "Shared endpoint", timeout_seconds=60,
-                provider=velox.ENDPOINT_PROVIDER_VLLM, max_concurrent_requests=1,
-            )
-            scheduler = velox.EndpointInferenceScheduler(storage, lambda _pid: profile, monitor)
-            first_id = monitor.start(velox.APP_SCOPE_ID, "first", task_kind="chat")
-            monitor.register_cancel_callback(first_id, lambda: True)
-            first = await scheduler.acquire(velox.LLMRequest(
-                velox.APP_SCOPE_ID, "shared", [], monitor_task_id=first_id,
-                task_kind="chat", task_title="first",
-            ))
-            self.assertTrue(monitor.cancel_task(first_id))
-            self.assertEqual(monitor.record_state(first_id), "cancelled")
-            self.assertEqual(monitor.record_metadata(first_id)["queue_state"], "cancelled")
+            try:
+                monitor = velox.LLMTaskMonitor(storage)
+                profile = velox.default_endpoint_profile(
+                    "shared", "Shared endpoint", timeout_seconds=60,
+                    provider=velox.ENDPOINT_PROVIDER_VLLM, max_concurrent_requests=1,
+                )
+                scheduler = velox.EndpointInferenceScheduler(storage, lambda _pid: profile, monitor)
+                first_id = monitor.start(velox.APP_SCOPE_ID, "first", task_kind="chat")
+                monitor.register_cancel_callback(first_id, lambda: True)
+                first = await scheduler.acquire(velox.LLMRequest(
+                    velox.APP_SCOPE_ID, "shared", [], monitor_task_id=first_id,
+                    task_kind="chat", task_title="first",
+                ))
+                self.assertTrue(monitor.cancel_task(first_id))
+                self.assertEqual(monitor.record_state(first_id), "cancelled")
+                self.assertEqual(monitor.record_metadata(first_id)["queue_state"], "cancelled")
 
-            second_id = monitor.start(velox.APP_SCOPE_ID, "second", task_kind="chat")
-            second_task = asyncio.create_task(scheduler.acquire(velox.LLMRequest(
-                velox.APP_SCOPE_ID, "shared", [], monitor_task_id=second_id,
-                task_kind="chat", task_title="second",
-            )))
-            await asyncio.sleep(0.03)
-            self.assertFalse(second_task.done())
-            # Priority refreshes while the cancelled provider still owns its lease
-            # must not resurrect its terminal row as inference/queued.
-            self.assertEqual(monitor.record_metadata(first_id)["queue_state"], "cancelled")
-            await first.release()
-            self.assertEqual(monitor.record_state(first_id), "cancelled")
-            self.assertEqual(monitor.record_metadata(first_id)["queue_state"], "cancelled")
-            second = await asyncio.wait_for(second_task, timeout=1.0)
-            await second.release()
-            monitor.complete(second_id)
-            await scheduler.close()
+                second_id = monitor.start(velox.APP_SCOPE_ID, "second", task_kind="chat")
+                second_task = asyncio.create_task(scheduler.acquire(velox.LLMRequest(
+                    velox.APP_SCOPE_ID, "shared", [], monitor_task_id=second_id,
+                    task_kind="chat", task_title="second",
+                )))
+                await asyncio.sleep(0.03)
+                self.assertFalse(second_task.done())
+                # Priority refreshes while the cancelled provider still owns its lease
+                # must not resurrect its terminal row as inference/queued.
+                self.assertEqual(monitor.record_metadata(first_id)["queue_state"], "cancelled")
+                await first.release()
+                self.assertEqual(monitor.record_state(first_id), "cancelled")
+                self.assertEqual(monitor.record_metadata(first_id)["queue_state"], "cancelled")
+                second = await asyncio.wait_for(second_task, timeout=1.0)
+                await second.release()
+                monitor.complete(second_id)
+                await scheduler.close()
+            finally:
+                _drain_storage_log_writer(storage)
 
         with tempfile.TemporaryDirectory() as td:
             asyncio.run(scenario(Path(td)))
@@ -26294,22 +26355,28 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_irreversible_store_deletes_ignore_best_effort_log_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Delete log")
-            chat_id = str(chat["chat_id"])
-            with mock.patch.object(storage, "append_app_log", side_effect=OSError("log locked")):
-                chats.delete_chat(velox.APP_SCOPE_ID, chat_id)
-            self.assertFalse(paths.chat_dir(chat_id).exists())
+            try:
+                chat = chats.create_chat("Delete log")
+                chat_id = str(chat["chat_id"])
+                with mock.patch.object(storage, "append_app_log", side_effect=OSError("log locked")):
+                    chats.delete_chat(velox.APP_SCOPE_ID, chat_id)
+                self.assertFalse(paths.chat_dir(chat_id).exists())
+            finally:
+                _drain_storage_log_writer(storage)
 
         with tempfile.TemporaryDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Agent owner")
-            agents = velox.AgentStore(storage)
-            agent = agents.create_agent(str(chat["chat_id"]), "done", title="Done")
-            agent = agents.update_agent(str(agent["agent_id"]), {"status": "succeeded"})
-            agent_id = str(agent["agent_id"])
-            with mock.patch.object(storage, "append_app_log", side_effect=OSError("log locked")):
-                agents.delete_agent(agent_id)
-            self.assertFalse(paths.agent_dir(agent_id).exists())
+            try:
+                chat = chats.create_chat("Agent owner")
+                agents = velox.AgentStore(storage)
+                agent = agents.create_agent(str(chat["chat_id"]), "done", title="Done")
+                agent = agents.update_agent(str(agent["agent_id"]), {"status": "succeeded"})
+                agent_id = str(agent["agent_id"])
+                with mock.patch.object(storage, "append_app_log", side_effect=OSError("log locked")):
+                    agents.delete_agent(agent_id)
+                self.assertFalse(paths.agent_dir(agent_id).exists())
+            finally:
+                _drain_storage_log_writer(storage)
 
     def test_committed_agent_delete_clears_all_selected_agent_references(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -30190,17 +30257,19 @@ class FilePickerCacheTests(unittest.TestCase):
             finally: release.set(); cache.discard()
 
     def test_navigation_discards_stale_folder_results(self) -> None:
-        cache=velox.FilePickerDirectoryCache(); entered=threading.Event(); release=threading.Event(); calls=[]
-        def scan(key: str) -> Any:
-            calls.append(key)
-            if key=='/old': entered.set(); release.wait(2)
-            return [{'name':key}],''
-        with mock.patch.object(cache,'_scan',side_effect=scan):
-            try:
-                cache.request(Path('/old')); self.assertTrue(entered.wait(2)); cache.request(Path('/new'))
-                worker=cache._thread; release.set(); worker.join(2)
-                self.assertEqual(cache.request(Path('/new'))[0],[{'name':'/new'}]); self.assertEqual(calls,['/old','/new'])
-            finally: release.set(); cache.discard()
+        with tempfile.TemporaryDirectory() as old_dir, tempfile.TemporaryDirectory() as new_dir:
+            cache=velox.FilePickerDirectoryCache(); entered=threading.Event(); release=threading.Event(); calls=[]
+            old_key=str(Path(old_dir)); new_key=str(Path(new_dir))
+            def scan(key: str) -> Any:
+                calls.append(key)
+                if key==old_key: entered.set(); release.wait(2)
+                return [{'name':key}],''
+            with mock.patch.object(cache,'_scan',side_effect=scan):
+                try:
+                    cache.request(Path(old_dir)); self.assertTrue(entered.wait(2),'old scan did not enter'); cache.request(Path(new_dir))
+                    worker=cache._thread; release.set(); worker.join(2)
+                    self.assertEqual(cache.request(Path(new_dir))[0],[{'name':new_key}]); self.assertEqual(calls,[old_key,new_key])
+                finally: release.set(); cache.discard()
 
     def test_picker_scan_bounds_rows_and_reports_omitted_entries(self) -> None:
         cache=velox.FilePickerDirectoryCache(); cache._wanted='/folder'
@@ -30229,7 +30298,7 @@ class FilePickerCacheTests(unittest.TestCase):
 
 class RangeAndCacheTests(_AsyncRuntimeFixture):
     async def test_line_range_never_uses_whole_file_reader(self) -> None:
-        path=Path(self.temp.name)/'large.txt'; path.write_text('first\n'+'middle\n'*20000+'last')
+        path=Path(self.temp.name)/'large.txt'; path.write_bytes(('first\n'+'middle\n'*20000+'last').encode())
         with mock.patch(f'{velox.__name__}.file_read_text',side_effect=AssertionError('whole file read for tiny line range')):
             result=await velox.FileTools(self.storage).read_lines(velox.ToolContext(velox.APP_SCOPE_ID,chat_id=self.cid),{'filepath':str(path),'startLine':20000,'numLines':2})
         self.assertEqual(result['text'],'middle\nlast'); self.assertEqual(result['totalLines'],20002)
@@ -31291,6 +31360,61 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             await asyncio.to_thread(thread.join, 1)
             reader.close()
 
+
+
+    async def test_transport_close_interrupts_only_its_own_transport(self) -> None:
+        # Closing one response transport must interrupt its own blocked read
+        # without disturbing an unrelated transport's socket.
+        client_a, peer_a = socket.socketpair()
+        client_b, peer_b = socket.socketpair()
+        reader_a = client_a.makefile('rb')
+        reader_b = client_b.makefile('rb')
+        entered_a, completed_a = threading.Event(), threading.Event()
+        output_a = []
+        response_a = SimpleNamespace(fp=reader_a, close=reader_a.close)
+        def reading_a() -> None:
+            entered_a.set()
+            try:
+                output_a.append(reader_a.readline())
+            except (OSError, ValueError):
+                pass
+            finally:
+                completed_a.set()
+        thread_a = threading.Thread(target=reading_a, daemon=True)
+        thread_a.start()
+        try:
+            self.assertTrue(await asyncio.to_thread(entered_a.wait, 1))
+            await asyncio.sleep(.02)
+            self.assertFalse(completed_a.is_set())
+            await asyncio.wait_for(asyncio.to_thread(self.llm._close_response_transport, response_a), 1)
+            self.assertTrue(completed_a.is_set())
+            self.assertFalse(output_a and output_a[0])
+            # transport_b must remain usable: send data on its peer and read it back.
+            output_b = []
+            completed_b = threading.Event()
+            def reading_b() -> None:
+                try:
+                    output_b.append(reader_b.readline())
+                except (OSError, ValueError):
+                    output_b.append(None)
+                finally:
+                    completed_b.set()
+            thread_b = threading.Thread(target=reading_b, daemon=True)
+            thread_b.start()
+            try:
+                peer_b.sendall(b"hello\n")
+                self.assertTrue(await asyncio.to_thread(completed_b.wait, 1))
+                self.assertEqual(output_b, [b"hello\n"])
+            finally:
+                peer_b.close()
+                client_b.close()
+                await asyncio.to_thread(thread_b.join, 1)
+                reader_b.close()
+        finally:
+            peer_a.close()
+            client_a.close()
+            await asyncio.to_thread(thread_a.join, 1)
+            reader_a.close()
 
 class DashboardAndSleepTests(_AsyncRuntimeFixture):
     def setUp(self) -> None:
@@ -39591,7 +39715,7 @@ class DebugExportUITests(_AsyncRuntimeFixture):
         with mock.patch.object(widgets, 'button', side_effect=lambda key, *args, **kwargs: key == 'fp.up'):
             widgets.file_picker_modal(velox.Rect(0, 0, 1000, 760), velox.APP_SCOPE_ID)
         self.assertEqual(widgets.state.file_picker_manual, 'chosen.txt')
-        self.assertEqual(widgets.state.file_picker_dir, self.temp.name)
+        self.assertTrue(_paths_equivalent(Path(widgets.state.file_picker_dir), Path(self.temp.name)))
 
     def test_selected_owner_is_retained_across_active_chat_switch(self) -> None:
         panel = self.panel(); panel._request_chat_debug_export()
@@ -39617,7 +39741,7 @@ class DebugExportUITests(_AsyncRuntimeFixture):
             calls.append((key, label)); return key == 'fp.select'
         with mock.patch.object(widgets, 'button', side_effect=button):
             result = widgets.file_picker_modal(velox.Rect(0, 0, 1000, 760), velox.APP_SCOPE_ID)
-        self.assertEqual(result, [str(path)]); self.assertIn(('fp.select', 'Attach'), calls)
+        self.assertEqual(len(result), 1); self.assertTrue(_paths_equivalent(Path(result[0]), path)); self.assertIn(('fp.select', 'Attach'), calls)
 
     async def test_generation_runs_on_worker_and_duplicate_click_is_single_flight(self) -> None:
         panel = self.panel(); path = Path(self.temp.name) / 'worker.txt'
@@ -41295,7 +41419,7 @@ class MultiAttachmentPickerTests(_AttachmentUiFixture, unittest.TestCase):
         self.picker()
         self.row_click(self.files[0], checkbox=True); self.row_click(self.files[2], checkbox=True)
         self.click(self.buttons['fp.select']); chosen = self.draw_picker()
-        self.assertEqual(chosen, [str(self.files[0]), str(self.files[2])])
+        self.assertEqual(len(chosen), 2); self.assertTrue(_paths_equivalent(Path(chosen[0]), self.files[0])); self.assertTrue(_paths_equivalent(Path(chosen[1]), self.files[2]))
         self.assertFalse(self.state.file_picker_open)
         self.panel.handle_file_picker_paths(chosen)
         self.assertEqual([m['source_path'] for m in self.state.queued_attachments], chosen)
@@ -41329,7 +41453,7 @@ class MultiAttachmentPickerTests(_AttachmentUiFixture, unittest.TestCase):
         self.picker(); self.row_click(self.files[0], checkbox=True); self.row_click(self.files[1], checkbox=True)
         self.files[0].unlink()
         self.click(self.buttons['fp.select'])
-        self.assertEqual(self.draw_picker(), [str(self.files[1])])
+        result = self.draw_picker(); self.assertEqual(len(result), 1); self.assertTrue(_paths_equivalent(Path(result[0]), self.files[1]))
         self.assertTrue(any('missing or unreadable' in str(t) for t in self.state.toasts))
 
     def test_all_missing_keeps_picker_open_for_correction(self) -> None:
@@ -41341,7 +41465,7 @@ class MultiAttachmentPickerTests(_AttachmentUiFixture, unittest.TestCase):
     def test_manual_relative_path_resolves_in_browsed_directory(self) -> None:
         self.picker(); self.state.file_picker_manual = self.files[2].name
         self.reset_input(); self.draw_picker(); self.click(self.buttons['fp.select'])
-        self.assertEqual(self.draw_picker(), [str(self.files[2])])
+        result = self.draw_picker(); self.assertEqual(len(result), 1); self.assertTrue(_paths_equivalent(Path(result[0]), self.files[2]))
 
     def test_selection_gesture_performs_no_stat_or_resolve(self) -> None:
         self.picker()

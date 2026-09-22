@@ -6829,6 +6829,55 @@ def read_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+def _open_jsonl_append_handle(path: "Path") -> Any:
+    """Open a JSONL file for binary append, allowing the file to be deleted
+    concurrently on Windows.
+
+    On Windows the default open() shares only read/write, not delete. A test
+    (or a root reset) that removes the containing data root while a background
+    batch is mid-write then fails with WinError 32 because the handle holds the
+    file. Opening with FILE_SHARE_DELETE lets the directory entry be unlinked
+    immediately; the writer's handle stays valid until it closes, so an in-flight
+    batch never corrupts the file it was already writing.
+    """
+    if os.name != "nt":
+        return path.open("r+b")
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    handle = kernel32.CreateFileW(
+        str(path),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        error = ctypes.get_last_error()
+        raise OSError(error, os.strerror(error), str(path))
+    import msvcrt
+
+    fd = msvcrt.open_osfhandle(int(handle), os.O_RDWR | os.O_BINARY)
+    return os.fdopen(fd, "r+b")
+
+
 def _prepare_jsonl_for_append(handle: Any) -> None:
     """Repair only a crash-torn final JSONL fragment before appending.
 
@@ -6956,7 +7005,9 @@ class BatchedJSONLWriter(_RegisteredBackgroundWriter):
             # a removed root while shutdown, cleanup, or a reset is deleting it.
             if not path.is_file():
                 return
-            with path.open("r+b") as handle:
+            # Open with FILE_SHARE_DELETE on Windows so a data-root removal
+            # (test teardown or a reset) can proceed while this batch is live.
+            with _open_jsonl_append_handle(path) as handle:
                 _prepare_jsonl_for_append(handle)
                 handle.seek(0, os.SEEK_END)
                 handle.write(encoded)
@@ -28237,6 +28288,13 @@ class LLMClient:
 
         HTTPResponse owns fp.raw._sock; HTTPError wraps that response in fp.
         Opaque adapters retain best-effort close without assuming a socket API.
+
+        On Windows a ``shutdown(SHUT_RDWR)`` does not wake a blocked ``recv``
+        when the socket is wrapped by a ``makefile`` BufferedReader: the reader
+        holds the reader lock while blocked, and the socket close is deferred
+        while the ``SocketIO`` keeps an io reference, so ``response.close()``
+        would wait on that lock forever.  Detach the owned handle and Winsock
+        close it so the blocked read is interrupted and the fd is reclaimed once.
         """
         current = response
         for _ in range(2):
@@ -28248,6 +28306,13 @@ class LLMClient:
                         sock.shutdown(socket.SHUT_RDWR)
                     except OSError:
                         pass  # Already closed, reset, or concurrently completed.
+                    if os.name == "nt":
+                        try:
+                            fd = sock.detach()
+                            if fd >= 0:
+                                ctypes.windll.ws2_32.closesocket(fd)
+                        except Exception:
+                            pass
                     break
                 current = fp
             except Exception:
