@@ -191,6 +191,241 @@ def _make_test_provider_call(
     }
 
 
+class PlainAtomicWriteBytesTests(unittest.TestCase):
+    """Regression coverage for the preservative atomic byte-write helper."""
+
+    def _assert_no_temp_files(self, target: Path) -> None:
+        leftovers = list(Path(target).parent.glob(Path(target).name + ".tmp.*"))
+        self.assertEqual(leftovers, [])
+
+    def test_successful_replace_and_first_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+            velox._plain_atomic_write_bytes(target, b"after")
+            self.assertEqual(target.read_bytes(), b"after")
+            self._assert_no_temp_files(target)
+
+            fresh = root / "fresh.json"
+            velox._plain_atomic_write_bytes(fresh, b"seed")
+            self.assertEqual(fresh.read_bytes(), b"seed")
+            self._assert_no_temp_files(fresh)
+
+    def test_partial_temp_write_then_exception_keeps_prior_target(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+
+            def partial_write(handle: Any, data: bytes) -> int:
+                handle.write(data[:3])
+                raise OSError("write failed mid-stream")
+
+            with mock.patch.object(velox, "_write_all_bytes", side_effect=partial_write):
+                with self.assertRaises(OSError):
+                    velox._plain_atomic_write_bytes(target, b"abcdefgh")
+            self.assertEqual(target.read_bytes(), b"before")
+            self._assert_no_temp_files(target)
+
+            fresh = root / "fresh.json"
+            with mock.patch.object(velox, "_write_all_bytes", side_effect=partial_write):
+                with self.assertRaises(OSError):
+                    velox._plain_atomic_write_bytes(fresh, b"abcdefgh")
+            self.assertFalse(fresh.exists())
+            self._assert_no_temp_files(fresh)
+
+    def test_short_write_without_exception_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+
+            def short_write(handle: Any, data: bytes) -> int:
+                handle.write(data[:4])
+                return 4
+
+            with mock.patch.object(velox, "_write_all_bytes", side_effect=short_write):
+                with self.assertRaises(OSError):
+                    velox._plain_atomic_write_bytes(target, b"abcdefgh")
+            self.assertEqual(target.read_bytes(), b"before")
+            self._assert_no_temp_files(target)
+
+            fresh = root / "fresh.json"
+            with mock.patch.object(velox, "_write_all_bytes", side_effect=short_write):
+                with self.assertRaises(OSError):
+                    velox._plain_atomic_write_bytes(fresh, b"abcdefgh")
+            self.assertFalse(fresh.exists())
+            self._assert_no_temp_files(fresh)
+
+    def test_write_all_bytes_loops_over_short_underlying_writes(self) -> None:
+        class ShortHandle:
+            def __init__(self) -> None:
+                self.collected = bytearray()
+
+            def write(self, chunk: bytes) -> int:
+                part = bytes(chunk[:2])
+                self.collected += part
+                return len(part)
+
+        handle = ShortHandle()
+        payload = b"0123456789abcdef"
+        written = velox._write_all_bytes(handle, payload)
+        self.assertEqual(written, len(payload))
+        self.assertEqual(bytes(handle.collected), payload)
+
+    def test_flush_failure_aborts_before_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+            real_open = Path.open
+
+            class FlushFailHandle:
+                def __init__(self, raw: Any) -> None:
+                    self._raw = raw
+
+                def __enter__(self) -> "FlushFailHandle":
+                    return self
+
+                def __exit__(self, *exc: Any) -> None:
+                    self._raw.close()
+
+                def write(self, chunk: bytes) -> int:
+                    return self._raw.write(chunk)
+
+                def fileno(self) -> int:
+                    return self._raw.fileno()
+
+                def flush(self) -> None:
+                    self._raw.flush()
+                    raise OSError("flush failed")
+
+            def flush_fail_open(self, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+                raw = real_open(self, mode, *args, **kwargs)
+                if mode == "wb":
+                    return FlushFailHandle(raw)
+                return raw
+
+            with mock.patch.object(Path, "open", flush_fail_open):
+                with self.assertRaises(OSError):
+                    velox._plain_atomic_write_bytes(target, b"after")
+            self.assertEqual(target.read_bytes(), b"before")
+            self._assert_no_temp_files(target)
+
+    def test_fsync_failure_aborts_before_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+            with mock.patch("os.fsync", side_effect=OSError("fsync failed")):
+                with self.assertRaises(OSError):
+                    velox._plain_atomic_write_bytes(target, b"after")
+            self.assertEqual(target.read_bytes(), b"before")
+            self._assert_no_temp_files(target)
+
+    def test_permanent_replace_failure_propagates_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+
+            def permanent_failure(src: Any, dst: Any) -> None:
+                raise OSError("permanent failure")
+
+            opened: list[tuple[str, str]] = []
+            real_open = Path.open
+
+            def recording_open(self, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+                opened.append((str(self), mode))
+                return real_open(self, mode, *args, **kwargs)
+
+            with mock.patch("os.replace", side_effect=permanent_failure), \
+                 mock.patch.object(Path, "open", recording_open):
+                with self.assertRaises(OSError) as cm:
+                    velox._plain_atomic_write_bytes(target, b"after")
+            self.assertEqual(target.read_bytes(), b"before")
+            self.assertIn("permanent failure", str(cm.exception))
+            self.assertFalse(any(p == str(target) and m == "wb" for p, m in opened))
+            self.assertTrue(any(".tmp." in p and m == "wb" for p, m in opened))
+            self._assert_no_temp_files(target)
+
+    def test_transient_replace_failures_then_success(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+            real_replace = os.replace
+            calls = {"count": 0}
+
+            def transient_until_success(src: Any, dst: Any) -> None:
+                calls["count"] += 1
+                if calls["count"] <= 2:
+                    error = OSError("sharing violation")
+                    error.winerror = 32
+                    raise error
+                real_replace(src, dst)
+
+            with mock.patch("os.replace", side_effect=transient_until_success), \
+                 mock.patch("time.sleep", lambda *a, **k: None):
+                velox._plain_atomic_write_bytes(target, b"after")
+            self.assertEqual(target.read_bytes(), b"after")
+            self.assertEqual(calls["count"], 3)
+            self._assert_no_temp_files(target)
+
+    def test_exhausted_transient_retries_leave_prior_target_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+
+            def always_transient(src: Any, dst: Any) -> None:
+                error = OSError("sharing violation")
+                error.winerror = 32
+                raise error
+
+            opened: list[tuple[str, str]] = []
+            real_open = Path.open
+
+            def recording_open(self, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+                opened.append((str(self), mode))
+                return real_open(self, mode, *args, **kwargs)
+
+            with mock.patch("os.replace", side_effect=always_transient), \
+                 mock.patch("time.sleep", lambda *a, **k: None), \
+                 mock.patch.object(Path, "open", recording_open):
+                with self.assertRaises(OSError):
+                    velox._plain_atomic_write_bytes(target, b"after", retries=3)
+            self.assertEqual(target.read_bytes(), b"before")
+            self.assertFalse(any(p == str(target) and m == "wb" for p, m in opened))
+            self.assertTrue(any(".tmp." in p and m == "wb" for p, m in opened))
+            self._assert_no_temp_files(target)
+
+    def test_secondary_temp_cleanup_failure_preserves_primary_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "state.json"
+            target.write_bytes(b"before")
+
+            def permanent_failure(src: Any, dst: Any) -> None:
+                raise OSError("primary replace failure")
+
+            real_unlink = Path.unlink
+
+            def failing_unlink(self, *args: Any, **kwargs: Any) -> None:
+                if Path(self).name.startswith(Path(target).name + ".tmp."):
+                    raise OSError("cleanup failure")
+                real_unlink(self, *args, **kwargs)
+
+            with mock.patch("os.replace", side_effect=permanent_failure), \
+                 mock.patch.object(Path, "unlink", failing_unlink):
+                with self.assertRaises(OSError) as cm:
+                    velox._plain_atomic_write_bytes(target, b"after")
+            self.assertEqual(target.read_bytes(), b"before")
+            self.assertIn("primary replace failure", str(cm.exception))
+            self.assertNotIn("cleanup failure", str(cm.exception))
+
+
 class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     """Chat, endpoint, Skill, terminal, agent, tool and UI contracts."""
 

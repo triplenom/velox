@@ -8890,48 +8890,63 @@ def _plain_open_with_retry(
     raise FileNotFoundError(str(target))
 
 
+def _write_all_bytes(handle: Any, data: bytes) -> int:
+    """Write every byte to ``handle``, raising on a short or stalled write."""
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        written = handle.write(view[offset:])
+        if written is None:
+            written = 0
+        if written <= 0:
+            raise OSError(f"short write: wrote {offset} of {len(data)} bytes")
+        offset += written
+    return offset
+
+
 def _plain_atomic_write_bytes(path: Path, data: bytes, *, retries: int = 30) -> None:
-    """Atomic byte write with Windows-friendly retry semantics."""
+    """Publish ``data`` at ``path`` atomically, never overwriting in place.
+
+    The complete replacement is written, flushed and fsynced to a same-directory
+    temporary file which is then renamed onto ``path``. Any write, flush, fsync,
+    close or replacement failure leaves the previous destination bytes unchanged
+    and propagates the failure. The destination is never opened for an in-place
+    overwrite by this helper.
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp.{uuid_v4()}")
-    last_error: BaseException | None = None
+    max_attempts = max(1, int(retries))
     try:
-        with tmp.open("wb") as f:
-            f.write(data)
-            try:
-                f.flush()
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        for attempt in range(max(1, retries)):
+        with tmp.open("wb") as handle:
+            written = _write_all_bytes(handle, data)
+            if written != len(data):
+                raise OSError(f"short write: wrote {written} of {len(data)} bytes to {path}")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # The temporary file is closed before publication; a failure above
+        # (write, flush, fsync or close) prevents os.replace from running.
+        last_error: BaseException | None = None
+        for attempt in range(max_attempts):
             try:
                 os.replace(tmp, path)
                 return
-            except PermissionError as e:
-                last_error = e
+            except PermissionError as exc:
+                last_error = exc
+            except OSError as exc:
+                winerror = getattr(exc, "winerror", None)
+                if winerror not in (5, 32, 33):
+                    raise
+                last_error = exc
+            if attempt + 1 < max_attempts:
                 time.sleep(min(0.5, 0.015 * (attempt + 1)))
-            except OSError as e:
-                last_error = e
-                time.sleep(min(0.5, 0.01 * (attempt + 1)))
-        try:
-            with _plain_open_with_retry(path, "wb", retries=max(8, retries)) as f:
-                f.write(data)
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return
-        except Exception as e:
-            last_error = e
-            raise
+        raise last_error if last_error is not None else OSError(f"could not replace {path}")
     finally:
         if tmp.exists() and tmp != path:
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
-    if last_error:
-        raise last_error
 
 
 def create_default_skills_for_new_install(root_dir: Path) -> None:
