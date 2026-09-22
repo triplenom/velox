@@ -22062,8 +22062,8 @@ def _publish_test_result(result: unittest.TestResult, expected_count: int) -> No
             handle.flush()
         os.replace(temporary, destination)
     except OSError:
-        # The normal process exit remains authoritative when this optional
-        # finalizer-stall recovery signal could not be published.
+        # Publication is the only evidence the parent accepts. If it fails, the
+        # parent rejects the missing acknowledgement and fails the group.
         pass
     finally:
         try:
@@ -22083,11 +22083,53 @@ def _test_result_matches(path: Path, pid: int, expected_count: int) -> bool:
                 and value.get("schema") == f"velox_test_result.v{velox.SOURCE_REVISION}"
                 and type(value.get("pid")) is int and value["pid"] == pid
                 and type(value.get("tests")) is int and value["tests"] == expected_count
-                and value.get("failures") == 0 and value.get("errors") == 0
+                and type(value.get("failures")) is int and value["failures"] == 0
+                and type(value.get("errors")) is int and value["errors"] == 0
                 and type(value.get("skipped")) is int and 0 <= value["skipped"] <= expected_count
                 and value.get("successful") is True)
     except (OSError, ValueError, TypeError):
         return False
+
+
+def _child_identity_path(marker: Path) -> Path:
+    """Path where the launched test interpreter records its real PID."""
+    return Path(marker).with_name(Path(marker).name + ".identity")
+
+
+def _write_child_identity(token: str, count: int) -> None:
+    """Bind the running test interpreter to this launch before tests execute."""
+    marker = str(os.environ.get("VELOX_TEST_SUCCESS_MARKER") or "").strip()
+    if not marker or not token:
+        return
+    payload = {"token": token, "pid": os.getpid(), "count": count}
+    path = _child_identity_path(Path(marker))
+    try:
+        with open(path, "wb") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+            handle.flush()
+    except OSError:
+        pass
+
+
+def _read_child_identity(marker: Path, token: str) -> int:
+    """Return the launched interpreter PID, or -1 when not yet/badly bound."""
+    path = _child_identity_path(marker)
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(4097)
+        if len(raw) > 4096:
+            return -1
+        value = json.loads(raw)
+        if (
+            isinstance(value, dict)
+            and value.get("token") == token
+            and type(value.get("pid")) is int
+            and value["pid"] > 0
+        ):
+            return int(value["pid"])
+    except (OSError, ValueError, TypeError):
+        pass
+    return -1
 
 
 def run_test_class(class_name: str) -> NoReturn:
@@ -22130,6 +22172,10 @@ def run_test_class(class_name: str) -> NoReturn:
             _fail_test_selection(f"Test shard selected no tests: {resolved_spec}")
         suite.addTests(test_class(name) for name in selected_names)
     _count = suite.countTestCases()
+    # Bind this launched interpreter (which may differ from the launcher PID on
+    # a Windows virtual-environment redirector) before the suite runs so the
+    # parent can validate the completed result against the real interpreter.
+    _write_child_identity(str(os.environ.get("VELOX_TEST_RUN_TOKEN") or "").strip(), _count)
     result = unittest.TextTestRunner(stream=_RawFDTestStream(2), verbosity=2).run(suite)
     _publish_test_result(result, _count)
     # This command runs in a disposable shard process. Exit at the exact point
@@ -22202,7 +22248,8 @@ def run_test_suite() -> int:
 
     started = time.monotonic()
     total_count = 0
-    failed: list[str] = []
+    total_confirmed = 0
+    failed: list[tuple[str, int, str]] = []
     source_path = str(Path(__file__).resolve())
     trace_runner = bool(str(os.environ.get("VELOX_TEST_RUNNER_TRACE") or "").strip())
     if trace_runner and hasattr(signal, "SIGUSR1"):
@@ -22227,6 +22274,8 @@ def run_test_suite() -> int:
         )
         child_env = os.environ.copy()
         child_env["VELOX_TEST_SUCCESS_MARKER"] = str(success_marker)
+        child_token = uuid.uuid4().hex
+        child_env["VELOX_TEST_RUN_TOKEN"] = child_token
         process = subprocess.Popen(
             [sys.executable, source_path, "--test-class", argument],
             stdout=None,
@@ -22238,17 +22287,33 @@ def run_test_suite() -> int:
             _raw_test_status_write(f"[runner] started {label} pid={process.pid} marker={success_marker}", fd=2)
         timed_out = False
         success_marked = False
+        finalizer_stall = False
         return_code = 1
+        child_pid = process.pid
+        identity_bound = False
         deadline = time.monotonic() + 1800.0
         while True:
+            if not identity_bound:
+                resolved_pid = _read_child_identity(success_marker, child_token)
+                if resolved_pid > 0:
+                    child_pid = resolved_pid
+                    identity_bound = True
             polled = process.poll()
             if polled is not None:
+                # A fast virtual-environment child may have completed and written
+                # its identity before this loop observed the exit; bind it now so
+                # the result is validated against the real interpreter.
+                if not identity_bound:
+                    resolved_pid = _read_child_identity(success_marker, child_token)
+                    if resolved_pid > 0:
+                        child_pid = resolved_pid
+                        identity_bound = True
                 return_code = int(polled or 0)
-                success_marked = _test_result_matches(success_marker, process.pid, count)
+                success_marked = _test_result_matches(success_marker, child_pid, count)
                 if trace_runner:
                     _raw_test_status_write(f"[runner] exited {label} rc={return_code} marker={success_marked}", fd=2)
                 break
-            if _test_result_matches(success_marker, process.pid, count):
+            if _test_result_matches(success_marker, child_pid, count):
                 # Only this exact child's completed successful TestResult can
                 # authorize bounded cleanup of a post-result finalizer stall.
                 # Nested subprocess output cannot acknowledge this group.
@@ -22258,12 +22323,16 @@ def run_test_suite() -> int:
                 try:
                     return_code = int(process.wait(timeout=5.0) or 0)
                 except subprocess.TimeoutExpired:
+                    finalizer_stall = True
                     terminate_process_tree(process)
                     try:
                         process.wait(timeout=10)
                     except Exception:
                         pass
-                    return_code = 0  # This termination followed the validated result.
+                    # This deliberate post-result finalizer cleanup followed a
+                    # validated completed success and is distinct from normal
+                    # termination; the validated outcome is preserved.
+                    return_code = 0
                 break
             if time.monotonic() >= deadline:
                 timed_out = True
@@ -22280,15 +22349,30 @@ def run_test_suite() -> int:
             pass
         if timed_out:
             _raw_test_status_write(f"[error] {label} exceeded the 1800-second process timeout.")
-        if timed_out or return_code != 0:
-            failed.append(label)
+        elif finalizer_stall:
+            _raw_test_status_write(f"[runner] {label} validated result; bounded finalizer cleanup ran.")
+        if timed_out:
+            failed.append((label, count, "timeout"))
+        elif return_code != 0:
+            failed.append((label, count, f"nonzero exit {return_code}"))
+        elif not success_marked:
+            failed.append((label, count, "no validated completed-result record"))
+        else:
+            total_confirmed += count
 
     elapsed = time.monotonic() - started
     _raw_test_status_write("\n" + "=" * 72)
-    _raw_test_status_write(f"Ran {total_count} tests in {elapsed:.3f}s")
     if failed:
-        _raw_test_status_write(f"FAILED (groups: {', '.join(failed)})")
+        _raw_test_status_write(f"Ran {total_confirmed} confirmed tests in {elapsed:.3f}s")
+        _raw_test_status_write(
+            "FAILED (groups: " + ", ".join(f"{name} [{reason}]" for name, _count, reason in failed) + ")"
+        )
+        _raw_test_status_write(
+            "Unconfirmed expected counts: "
+            + ", ".join(f"{name}={int(count)}" for name, count, _reason in failed)
+        )
         return 1
+    _raw_test_status_write(f"Ran {total_confirmed} tests in {elapsed:.3f}s")
     _raw_test_status_write("OK")
     return 0
 
@@ -41412,12 +41496,18 @@ class TestResultMarkerTests(unittest.TestCase):
     def test_real_child_marker_cannot_acknowledge_its_parent_process(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'child-result.json'
-            env = dict(os.environ, VELOX_TEST_SUCCESS_MARKER=str(path))
+            token = uuid.uuid4().hex
+            env = dict(os.environ, VELOX_TEST_SUCCESS_MARKER=str(path), VELOX_TEST_RUN_TOKEN=token)
             child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--test-class',
                                       'ChatScrollTests@0:1'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
             output, error = child.communicate(timeout=30)
             self.assertEqual(child.returncode, 0, (output+error).decode(errors='replace'))
-            self.assertTrue(_test_result_matches(path, child.pid, 1))
+            # The completed result is bound to the actual interpreter that ran it,
+            # not a Windows virtual-environment launcher pid.
+            child_pid = _read_child_identity(path, token)
+            self.assertGreater(child_pid, 0, (output + error).decode(errors='replace'))
+            self.assertTrue(_test_result_matches(path, child_pid, 1))
+            # It never acknowledges the parent or any other process.
             self.assertFalse(_test_result_matches(path, os.getpid(), 1))
 
     def test_nonzero_process_exit_is_failure_even_with_matching_marker(self) -> None:
@@ -41437,6 +41527,169 @@ class TestResultMarkerTests(unittest.TestCase):
             code = run_test_suite()
         self.assertEqual(code, 1)
         self.assertTrue(any('FAILED' in str(call) for call in status.call_args_list))
+    class _FakeChild:
+        def __init__(
+            self,
+            *,
+            pid: int = 999999999,
+            poll_seq: tuple[int, ...] = (0,),
+            wait_result: int | None = None,
+            wait_raises: BaseException | None = None,
+        ) -> None:
+            self.pid = pid
+            self._poll_seq = list(poll_seq)
+            self._wait_result = wait_result
+            self._wait_raises = wait_raises
+            self.terminated = False
+            self.killed = False
+
+        def poll(self) -> int | None:
+            if self._poll_seq:
+                return self._poll_seq.pop(0)
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self._wait_raises is not None:
+                raise self._wait_raises
+            return int(self._wait_result if self._wait_result is not None else 0)
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    @staticmethod
+    def _suite(count: int = 1) -> unittest.TestSuite:
+        sentinel = unittest.FunctionTestCase(lambda: None)
+        return unittest.TestSuite([unittest.TestSuite([sentinel] * count)])
+
+    @staticmethod
+    def _valid_marker(pid: int, count: int, **overrides: Any) -> str:
+        payload: dict[str, Any] = {
+            "schema": f"velox_test_result.v{velox.SOURCE_REVISION}",
+            "pid": pid, "tests": count, "failures": 0, "errors": 0,
+            "skipped": 0, "successful": True,
+        }
+        payload.update(overrides)
+        return json.dumps(payload)
+
+    def test_parent_rejects_zero_exit_without_acknowledgement(self) -> None:
+        inventory = self._suite()
+        fake = self._FakeChild(poll_seq=(0,), wait_result=0)
+
+        def launch(*_args: Any, **_kwargs: Any) -> Any:
+            return fake
+
+        with mock.patch.object(unittest.defaultTestLoader, 'loadTestsFromModule', return_value=inventory), \
+             mock.patch.object(subprocess, 'Popen', side_effect=launch), \
+             mock.patch(f'{__name__}._raw_test_status_write') as status:
+            code = run_test_suite()
+        self.assertEqual(code, 1)
+        text = " ".join(str(call) for call in status.call_args_list)
+        self.assertIn("no validated completed-result record", text)
+
+    def test_parent_rejects_zero_exit_with_invalid_record_cases(self) -> None:
+        pid = 999999999
+        cases: dict[str, bytes | None] = {
+            "missing": None,
+            "corrupt": b"{",
+            "oversized": b" " * 5000,
+            "wrong_schema": self._valid_marker(pid, 1, schema="wrong").encode("utf-8"),
+            "wrong_count": self._valid_marker(pid, 2).encode("utf-8"),
+            "wrong_identity": self._valid_marker(pid + 1, 1).encode("utf-8"),
+            "bool_tests": self._valid_marker(pid, 1, tests=True).encode("utf-8"),
+            "bool_skipped": self._valid_marker(pid, 1, skipped=True).encode("utf-8"),
+            "failures_bool": self._valid_marker(pid, 1, failures=False).encode("utf-8"),
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                inventory = self._suite()
+
+                def launch(*_args: Any, **kwargs: Any) -> Any:
+                    marker = Path(kwargs['env']['VELOX_TEST_SUCCESS_MARKER'])
+                    if raw is not None:
+                        marker.write_bytes(raw)
+                    return self._FakeChild(pid=pid, poll_seq=(0,), wait_result=0)
+
+                with mock.patch.object(unittest.defaultTestLoader, 'loadTestsFromModule', return_value=inventory), \
+                     mock.patch.object(subprocess, 'Popen', side_effect=launch), \
+                     mock.patch(f'{__name__}._raw_test_status_write') as status:
+                    code = run_test_suite()
+                self.assertEqual(code, 1, name)
+
+    def test_parent_accepts_zero_exit_with_valid_record(self) -> None:
+        pid = 999999999
+        inventory = self._suite()
+
+        def launch(*_args: Any, **kwargs: Any) -> Any:
+            marker = Path(kwargs['env']['VELOX_TEST_SUCCESS_MARKER'])
+            marker.write_text(self._valid_marker(pid, 1))
+            return self._FakeChild(pid=pid, poll_seq=(0,), wait_result=0)
+
+        with mock.patch.object(unittest.defaultTestLoader, 'loadTestsFromModule', return_value=inventory), \
+             mock.patch.object(subprocess, 'Popen', side_effect=launch), \
+             mock.patch(f'{__name__}._raw_test_status_write') as status:
+            code = run_test_suite()
+        self.assertEqual(code, 0)
+        text = " ".join(str(call) for call in status.call_args_list)
+        self.assertIn("Ran 1 tests in", text)
+        self.assertIn("OK", text)
+
+    def test_parent_accepts_valid_marker_then_finalizer_cleanup_is_distinct(self) -> None:
+        pid = 999999999
+        inventory = self._suite()
+
+        def launch(*_args: Any, **kwargs: Any) -> Any:
+            marker = Path(kwargs['env']['VELOX_TEST_SUCCESS_MARKER'])
+            marker.write_text(self._valid_marker(pid, 1))
+            return self._FakeChild(
+                pid=pid, poll_seq=(), wait_result=0,
+                wait_raises=subprocess.TimeoutExpired('child', 5),
+            )
+
+        with mock.patch.object(unittest.defaultTestLoader, 'loadTestsFromModule', return_value=inventory), \
+             mock.patch.object(subprocess, 'Popen', side_effect=launch), \
+             mock.patch(f'{__name__}._raw_test_status_write') as status:
+            code = run_test_suite()
+        self.assertEqual(code, 0)
+        text = " ".join(str(call) for call in status.call_args_list)
+        self.assertIn("finalizer cleanup ran", text)
+
+    def test_parent_times_out_before_completed_result_and_reaps(self) -> None:
+        pid = 999999999
+        inventory = self._suite()
+        clock = [0.0]
+
+        def fake_monotonic() -> float:
+            clock[0] += 1.0
+            return clock[0]
+
+        def launch(*_args: Any, **_kwargs: Any) -> Any:
+            return self._FakeChild(pid=pid, poll_seq=(), wait_result=1)
+
+        with mock.patch.object(unittest.defaultTestLoader, 'loadTestsFromModule', return_value=inventory), \
+             mock.patch.object(subprocess, 'Popen', side_effect=launch), \
+             mock.patch(f'{__name__}._raw_test_status_write') as status, \
+             mock.patch('time.monotonic', side_effect=fake_monotonic), \
+             mock.patch('time.sleep', side_effect=lambda *a, **k: None):
+            code = run_test_suite()
+        self.assertEqual(code, 1)
+        text = " ".join(str(call) for call in status.call_args_list)
+        self.assertIn("exceeded the 1800-second process timeout", text)
+
+    def test_marker_publication_failure_leaves_no_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'result.json'
+            result = unittest.TestResult()
+            result.testsRun = 3
+            with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(path)}), \
+                 mock.patch('os.replace', side_effect=OSError('no publication')):
+                _publish_test_result(result, 3)
+            self.assertFalse(path.exists())
+            self.assertFalse(_test_result_matches(path, os.getpid(), 3))
+
+
 
 
 class ReleaseSchemaTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
