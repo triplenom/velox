@@ -73,7 +73,7 @@ The application is in [velox.py](velox.py), with tests in [test_velox.py](test_v
 
 ## Tests
 
-The suite contains **2,000 regression tests** covering model transports, tools, persistence, agents, checklists, UI behavior and cancellation.
+The suite contains **2,035 regression tests** covering model transports, tools, persistence, agents, checklists, UI behavior and cancellation.
 
 From the repository root, using your environment's Python:
 
