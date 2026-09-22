@@ -27246,6 +27246,63 @@ def should_send_vision_inputs(endpoint: dict[str, Any] | None, *, has_image_atta
     return endpoint_supports_vision(endpoint)
 
 
+_TRANSPORT_CLOSE_DIAGNOSTICS: list[str] = []
+_WS2_32: Any = None
+
+
+def _win_ws2_32() -> Any:
+    """Lazy pointer-width ws2_32 binding with Winsock last-error capture."""
+    global _WS2_32
+    if _WS2_32 is None:
+        binding = ctypes.WinDLL("ws2_32", use_last_error=True)
+        binding.closesocket.restype = ctypes.c_int
+        binding.closesocket.argtypes = [ctypes.c_void_p]
+        binding.WSAGetLastError.restype = ctypes.c_int
+        binding.WSAGetLastError.argtypes = []
+        _WS2_32 = binding
+    return _WS2_32
+
+
+def _record_transport_diagnostic(message: str) -> None:
+    """Record a non-fatal transport close failure for later diagnostics."""
+    _TRANSPORT_CLOSE_DIAGNOSTICS.append(message)
+    if str(os.environ.get("VELOX_TRANSPORT_TRACE") or "").strip():
+        try:
+            sys.stderr.write(f"[transport-close] {message}\n")
+        except Exception:
+            pass
+
+
+def _interrupt_blocked_socket(sock: socket.socket) -> None:
+    """Interrupt a blocked Windows socket read by closing its descriptor.
+
+    The descriptor is detached exactly once and closed immediately with the
+    pointer-width Winsock binding. If the socket is already detached or closed
+    the call is a no-op, so a descriptor that has since been reused is never
+    closed and an error cannot leave a detached handle with no cleanup owner.
+    """
+    if os.name != "nt":
+        return
+    try:
+        if sock.fileno() < 0:
+            return
+        fd = sock.detach()
+    except (OSError, ValueError):
+        return
+    if fd < 0:
+        return
+    ws2_32 = _win_ws2_32()
+    try:
+        result = int(ws2_32.closesocket(fd))
+        if result == ctypes.c_int(-1).value:
+            wsa_error = int(ws2_32.WSAGetLastError())
+            _record_transport_diagnostic(f"Winsock closesocket failed with error {wsa_error} (fd={fd})")
+    except Exception as exc:
+        _record_transport_diagnostic(
+            f"Winsock closesocket raised {type(exc).__name__}: {exc} (fd={fd})"
+        )
+
+
 class LLMClient:
     def __init__(self, storage: Storage):
         self.storage = storage
@@ -28322,17 +28379,18 @@ class LLMClient:
 
     @staticmethod
     def _close_response_transport(response: Any) -> None:
-        """Run off-loop; unblock an owned urllib read before buffered close.
+        """Run off-loop; interrupt an owned urllib read before buffered close.
 
         HTTPResponse owns fp.raw._sock; HTTPError wraps that response in fp.
         Opaque adapters retain best-effort close without assuming a socket API.
 
         On Windows a ``shutdown(SHUT_RDWR)`` does not wake a blocked ``recv``
         when the socket is wrapped by a ``makefile`` BufferedReader: the reader
-        holds the reader lock while blocked, and the socket close is deferred
-        while the ``SocketIO`` keeps an io reference, so ``response.close()``
-        would wait on that lock forever.  Detach the owned handle and Winsock
-        close it so the blocked read is interrupted and the fd is reclaimed once.
+        holds the reader lock while blocked, so ``response.close()`` would wait
+        on that lock.  The owned socket descriptor is detached exactly once and
+        closed with the pointer-width Winsock binding; the blocked read is
+        interrupted and the descriptor is reclaimed without risking closing a
+        descriptor that has since been reused by another connection.
         """
         current = response
         for _ in range(2):
@@ -28344,13 +28402,7 @@ class LLMClient:
                         sock.shutdown(socket.SHUT_RDWR)
                     except OSError:
                         pass  # Already closed, reset, or concurrently completed.
-                    if os.name == "nt":
-                        try:
-                            fd = sock.detach()
-                            if fd >= 0:
-                                ctypes.windll.ws2_32.closesocket(fd)
-                        except Exception:
-                            pass
+                    _interrupt_blocked_socket(sock)
                     break
                 current = fp
             except Exception:

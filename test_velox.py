@@ -31739,6 +31739,70 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             await asyncio.to_thread(thread_a.join, 1)
             reader_a.close()
 
+class RealLoopbackCancellationTests(unittest.TestCase):
+    """Real loopback HTTP cancellation through the production transport close."""
+
+    def test_stalled_http_body_read_is_interrupted_by_transport_close(self) -> None:
+        stall = threading.Event()
+
+        class StalledHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                try:
+                    self.wfile.write(b"partial\n")
+                    self.wfile.flush()
+                    stall.wait(20.0)
+                    self.wfile.write(b"done\n")
+                except Exception:
+                    pass
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StalledHandler)
+        port = int(server.server_address[1])
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        entered = threading.Event()
+        completed = threading.Event()
+        output: list[Any] = []
+        response_holder: dict[str, Any] = {}
+
+        def request() -> None:
+            try:
+                response = urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{port}/", data=b"x", method="POST"
+                    ),
+                    timeout=10,
+                )
+                response_holder["response"] = response
+                entered.set()
+                output.append(response.read(4096))
+            except Exception as exc:  # Cancellation may interrupt, not complete.
+                output.append(exc)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=request, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5), "client never reached the stalled body")
+            time.sleep(0.2)
+            self.assertFalse(completed.is_set(), "read completed before close")
+            velox.LLMClient._close_response_transport(response_holder["response"])
+            self.assertTrue(completed.wait(5), "blocked read was not interrupted")
+            # The read is interrupted (no 'done' body), not completed normally.
+            self.assertNotIn(b"done\n", output[0] if isinstance(output[0], bytes) else b"")
+        finally:
+            stall.set()
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+
+
 class DashboardAndSleepTests(_AsyncRuntimeFixture):
     def setUp(self) -> None:
         super().setUp()
