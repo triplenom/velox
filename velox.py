@@ -292,8 +292,8 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 310
-BACKWARD_COMPATIBLE_VERSION = 310
+CURRENT_VERSION = 311
+BACKWARD_COMPATIBLE_VERSION = 311
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
 WINDOW_TITLE_SUFFIX = f"[V{SOURCE_REVISION}]"
@@ -4371,6 +4371,212 @@ ENDPOINT_RATE_LIMIT_REQUESTS_PER_MINUTE_MAX = 100000
 ENDPOINT_ERROR_RECOVERY_ATTEMPTS_MAX = 100
 ENDPOINT_ERROR_RECOVERY_DELAY_SECONDS_MAX = 24 * 60 * 60
 ENDPOINT_RATE_LIMIT_WINDOW_SECONDS = 60.0
+# Standard USD / million-token list prices checked 2026-09-27. Editable per endpoint.
+# https://developers.openai.com/api/docs/pricing
+# https://novita.ai/pricing and the corresponding live model-detail pages.
+ENDPOINT_PRICE_FIELDS = (
+    "input_price_usd_per_million", "cached_input_price_usd_per_million",
+    "output_price_usd_per_million",
+)
+TOKEN_COST_SUM_FIELDS = (
+    "input_usd", "cached_input_usd", "output_usd", "cache_write_premium_usd",
+    "total_usd", "unpriced_requests", "estimated_requests", "unknown_cache_requests",
+    "theoretical_requests", "requests", "input_tokens", "cached_input_tokens", "output_tokens",
+)
+
+
+def endpoint_default_token_prices(model_type: str, provider: str) -> dict[str, float | None]:
+    rates = {
+        (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_LUNA): (0.10, 0.01, 0.50),
+        (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_SOL): (2.0, 0.20, 10.0),
+        (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_ASTRA): (10.0, 1.0, 50.0),
+        (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_KIMI_K3): (3.0, 0.30, 15.0),
+        (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH): (0.15, 0.03, 0.50),
+        (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT): (0.15, 0.016, 0.47),
+        (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP): (0.44, 0.028, 1.32),
+        # Local inference has no token invoice. This is a clearly marked Novita proxy.
+        (ENDPOINT_PROVIDER_VLLM, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP): (0.44, 0.028, 1.32),
+    }.get((provider, model_type), (None, None, None))
+    return dict(zip(ENDPOINT_PRICE_FIELDS, rates))
+
+
+def endpoint_cost_pricing_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
+    """Freeze only public accounting fields, never credentials or prompt content."""
+    provider = endpoint_provider(profile)
+    family = normalize_endpoint_model_type(profile.get("model_type"))
+    model = str(profile.get("model") or family)
+    rates: dict[str, float | None] = {}
+    for key in ENDPOINT_PRICE_FIELDS:
+        value = profile.get(key)
+        try:
+            rate = None if value is None or value == "" or isinstance(value, bool) else float(value)
+        except (TypeError, ValueError, OverflowError):
+            rate = None
+        rates[key] = rate if rate is not None and math.isfinite(rate) and rate >= 0 else None
+    label = ENDPOINT_MODEL_TYPE_LABELS.get(family, model) if family != ENDPOINT_MODEL_TYPE_CUSTOM else model
+    theoretical = provider == ENDPOINT_PROVIDER_VLLM and family == ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP
+    tier = "default"
+    try:
+        extra = parse_endpoint_extra_body(str(profile.get("extra_body_json") or ""))
+        tier = str(extra.get("service_tier") or "default")
+    except (TypeError, ValueError):
+        pass
+    return {
+        **rates, "provider": provider, "model_type": family, "model": model,
+        "endpoint_profile_id": str(profile.get("profile_id") or profile.get("id") or ""),
+        "endpoint_label": str(profile.get("profile_label") or profile.get("label") or model),
+        "endpoint_type": provider + ":" + (model if family == ENDPOINT_MODEL_TYPE_CUSTOM else family),
+        "type_label": ENDPOINT_PROVIDER_LABELS.get(provider, provider) + " / " + label,
+        "theoretical": theoretical, "service_tier": tier,
+        "gpt6_rules": provider == ENDPOINT_PROVIDER_OPENAI and family in ENDPOINT_GPT_6_MODEL_TYPES,
+    }
+
+
+def estimate_token_cost(
+    pricing: dict[str, Any], input_tokens: int, output_tokens: int,
+    cached_input_tokens: int | None = None, *, cache_write_tokens: int | None = None,
+    estimated: bool = False,
+) -> dict[str, Any]:
+    """Token-only estimate. Missing cache counts cost full input, never assumed free."""
+    inp, out = max(0, int(input_tokens or 0)), max(0, int(output_tokens or 0))
+    cache = _cache_token_value(cached_input_tokens)
+    cache_known = cache is not None and cache <= inp
+    cache = cache if cache_known else 0
+    writes = min(inp - cache, _cache_token_value(cache_write_tokens) or 0)
+    gpt6 = bool(pricing.get("gpt6_rules"))
+    long_context = gpt6 and inp > 272_000
+    tier = str(pricing.get("service_tier") or "default")
+    tier_multiplier = ({"flex": 0.5, "priority": 2.0, "fast": 2.0}.get(tier, 1.0) if gpt6 else 1.0)
+    input_multiplier = (2.0 if long_context else 1.0) * tier_multiplier
+    output_multiplier = (1.5 if long_context else 1.0) * tier_multiplier
+    counts = (inp - cache, cache, out)
+    multipliers = (input_multiplier, input_multiplier, output_multiplier)
+    amounts, unpriced = [], False
+    for count, field_name, multiplier in zip(counts, ENDPOINT_PRICE_FIELDS, multipliers):
+        rate = pricing.get(field_name)
+        if rate is None:
+            unpriced = unpriced or count > 0
+            amounts.append(0.0)
+        else:
+            amounts.append(count * float(rate) * multiplier / 1_000_000.0)
+    premium = (writes * float(pricing.get(ENDPOINT_PRICE_FIELDS[0]) or 0.0) * input_multiplier * 0.25 / 1_000_000.0 if gpt6 else 0.0)
+    return {
+        "input_usd": amounts[0], "cached_input_usd": amounts[1], "output_usd": amounts[2],
+        "cache_write_premium_usd": premium, "total_usd": sum(amounts) + premium,
+        "unpriced_requests": int(unpriced), "estimated_requests": int(estimated),
+        "unknown_cache_requests": int(inp > 0 and not cache_known),
+        "theoretical_requests": int(bool(pricing.get("theoretical"))), "requests": 1,
+        "input_tokens": inp, "cached_input_tokens": cache, "output_tokens": out,
+        "long_context": long_context, "service_tier": tier, "cache_write_tokens": writes,
+    }
+
+
+def token_cost_label(cost: dict[str, Any] | None) -> str:
+    cost = cost or {}
+    amount = max(0.0, float(cost.get("total_usd") or 0.0))
+    missing = bool(cost.get("unpriced_requests"))
+    if missing and not amount:
+        return "Unpriced"
+    text = ("<$0.00000001" if 0 < amount < 0.000000005 else
+            f"${amount:,.4f}" if amount >= 0.0001 or not amount else f"${amount:.8f}".rstrip("0"))
+    return text + (" + ?" if missing else "")
+
+
+def token_cost_tooltip(cost: dict[str, Any] | None) -> str:
+    cost = cost or {}
+    flags = []
+    for key, label in (("unpriced_requests", "unpriced"), ("unknown_cache_requests", "cache unknown (full input rate)"),
+                       ("estimated_requests", "estimated usage")):
+        if cost.get(key):
+            flags.append(f"{int(cost[key])} {label}")
+    qualifier = " (includes theoretical DSV4F/Novita proxy)" if cost.get("theoretical_requests") else ""
+    return "\n".join([
+        "Estimated token cost (USD): " + token_cost_label(cost) + qualifier,
+        f"Input ${float(cost.get('input_usd') or 0):.6f} | Cache read ${float(cost.get('cached_input_usd') or 0):.6f} | Output ${float(cost.get('output_usd') or 0):.6f}",
+        f"Reported cache-write premium +${float(cost.get('cache_write_premium_usd') or 0):.6f}; own requests only, excludes child rows.",
+        ("; ".join(flags) + ". ") if flags else "Provider usage; output includes billed reasoning.",
+        "Frozen per-request rates. Excludes tool fees, taxes, regional premiums, unreported cache writes and discounts.",
+    ])
+
+
+class TokenCostLedger:
+    """Small, append-only daily usage ledger. Repeated final events replace, not add.
+
+    Only the rolling two UTC day files are loaded. Prices and usage are frozen per
+    physical request; deleting Dashboard rows never deletes recorded usage. No
+    prompts, URLs, credentials, or prior-format migration are involved.
+    """
+    def __init__(self, root: Path):
+        self.directory = Path(root) / "usage_costs"
+        self._lock = threading.RLock()
+        self._days: tuple[str, ...] = ()
+        self._events: dict[str, dict[str, Any]] = {}
+        self.error = ""
+
+    def _load_days(self, epoch: float) -> None:
+        today = datetime.fromtimestamp(epoch, timezone.utc).date()
+        days = tuple((today - timedelta(days=n)).isoformat() for n in (1, 0))
+        if days == self._days:
+            return
+        self._days = days
+        retained = {k: v for k, v in self._events.items() if float(v.get("epoch") or 0) >= epoch - 86400}
+        for day in days:
+            path = self.directory / (day + ".jsonl")
+            if not path.exists():
+                continue
+            try:
+                for event in iter_jsonl(path):
+                    if (not isinstance(event, dict) or event.get("schema") != data_schema("token_cost")
+                            or set(event) != {"schema", "event_id", "epoch", "pricing", "cost"}
+                            or not isinstance(event.get("event_id"), str)
+                            or not isinstance(event.get("pricing"), dict) or not isinstance(event.get("cost"), dict)
+                            or not isinstance(event.get("epoch"), (int, float)) or not math.isfinite(event["epoch"])
+                            or any(not isinstance(event["cost"].get(key), (int, float))
+                                   or not math.isfinite(event["cost"][key]) or event["cost"][key] < 0 for key in TOKEN_COST_SUM_FIELDS)):
+                        self.error = "Some cost ledger records are invalid or unsupported; totals may be incomplete."
+                        continue
+                    retained[event["event_id"]] = event
+            except (OSError, ValueError) as exc:
+                self.error = "Cannot read cost ledger; totals may be incomplete: " + type(exc).__name__
+        self._events = retained
+
+    def record(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            self._load_days(time.time())
+            key = event["event_id"]
+            old = self._events.get(key)
+            if old == event:
+                return
+            day = datetime.fromtimestamp(event["epoch"], timezone.utc).date().isoformat()
+            try:
+                append_jsonl(self.directory / (day + ".jsonl"), event)
+            except OSError as exc:
+                self.error = "Cost ledger could not be saved; totals are not durable: " + type(exc).__name__
+            self._events[key] = copy.deepcopy(event)
+
+    def summary(self, live: Iterable[dict[str, Any]] = (), *, now: float | None = None) -> dict[str, Any]:
+        epoch = time.time() if now is None else float(now)
+        with self._lock:
+            self._load_days(epoch)
+            events = dict(self._events)
+            for event in live:
+                events[event["event_id"]] = event
+            grouped: dict[str, dict[str, Any]] = {}
+            total = {key: 0 for key in TOKEN_COST_SUM_FIELDS}
+            for event in events.values():
+                if not epoch - 86400 < float(event["epoch"]) <= epoch:
+                    continue
+                prices, cost = event["pricing"], event["cost"]
+                key = str(prices.get("endpoint_type") or "unpriced")
+                bucket = grouped.setdefault(key, {"endpoint_type": key, "label": str(prices.get("type_label") or key),
+                                                 **{field: 0 for field in TOKEN_COST_SUM_FIELDS}})
+                for field in TOKEN_COST_SUM_FIELDS:
+                    bucket[field] += cost.get(field, 0)
+                    total[field] += cost.get(field, 0)
+            ranked = sorted(grouped.values(), key=lambda row: (-row["total_usd"], row["label"]))
+            return {**total, "top_endpoints": ranked[:5], "endpoint_count": len(ranked), "error": self.error}
+
+
 ENDPOINT_PROFILE_USER_FIELDS = (
     "id", "label", "provider", "max_concurrent_requests", "model_type", "api_transport",
     "base_url", "api_key", "model", "timeout_seconds",
@@ -4382,7 +4588,7 @@ ENDPOINT_PROFILE_USER_FIELDS = (
     "user_agent_mode", "custom_user_agent", "temperature", "top_p", "min_p",
     "top_k", "presence_penalty", "frequency_penalty", "repetition_penalty",
     "seed", "stop_sequences", "reasoning_effort", "extra_body_json",
-    "system_prompt_addon",
+    "system_prompt_addon", *ENDPOINT_PRICE_FIELDS,
 )
 ENDPOINT_PROFILE_OPTIONAL_FLOAT_FIELDS = (
     "temperature", "top_p", "min_p", "presence_penalty",
@@ -5123,6 +5329,7 @@ def default_endpoint_profile(
         "custom_user_agent": "",
     }
     profile.update(endpoint_model_type_defaults(model_type))
+    profile.update(endpoint_default_token_prices(model_type, provider_key))
     profile["image_analysis_context"] = endpoint_default_image_analysis_context(provider_key)
     if model is not None:
         profile["model"] = str(model)
@@ -5443,6 +5650,10 @@ def normalize_endpoint_profile(profile: Any, *, location: str = "endpoint profil
     out["extra_body_json"] = str(out.get("extra_body_json") or "").strip()
     parse_endpoint_extra_body(out["extra_body_json"])
     out["system_prompt_addon"] = str(out.get("system_prompt_addon") or "").strip()
+    for field_name in ENDPOINT_PRICE_FIELDS:
+        if isinstance(out.get(field_name), bool):
+            raise ValueError(f"{field_name} must be a nonnegative finite USD price or blank")
+        out[field_name] = _optional_finite_float(out.get(field_name), field_name, minimum=0.0)
     return out
 
 
@@ -5466,7 +5677,7 @@ def validate_endpoint_profiles_config(llm: Any, *, location: str = "settings.llm
     if not isinstance(selected, str) or selected not in ids:
         raise UnsupportedDataVersionError(f"{location}.default_profile_id does not name a saved endpoint profile")
     subagent = llm.get("default_chat_subagent_profile_id")
-    if "default_chat_subagent_profile_id" in llm and (not isinstance(subagent, str) or subagent not in ids):
+    if not isinstance(subagent, str) or subagent not in ids:
         raise UnsupportedDataVersionError(f"{location}.default_chat_subagent_profile_id does not name a saved endpoint profile")
 
 
@@ -5494,13 +5705,9 @@ def chat_subagent_endpoint_profile_id_from_config(config: dict[str, Any] | None)
     llm = (config or {}).get("llm", {})
     selected = llm.get("default_chat_subagent_profile_id") if isinstance(llm, dict) else None
     ids = {str(row.get("id") or "") for row in endpoint_profiles_from_config(config)}
-    if selected is not None:
-        if not isinstance(selected, str) or selected not in ids:
-            raise ValueError("Unknown default Chat subagent endpoint profile")
-        return selected
-    if DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID in ids:
-        return DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID
-    return endpoint_profile_id_from_config(config)
+    if not isinstance(selected, str) or selected not in ids:
+        raise ValueError("Unknown or missing default Chat subagent endpoint profile")
+    return selected
 
 
 def endpoint_profile_for_id(config: dict[str, Any] | None, profile_id: str) -> dict[str, Any]:
@@ -12216,9 +12423,6 @@ def validate_chat_record(obj: Any, *, expected_chat_id: str | None = None, locat
     if not isinstance(obj, dict) or obj.get("schema") != CHAT_SCHEMA or obj.get("data_version") != DATA_FILE_VERSION:
         raise UnsupportedDataVersionError(f"Unsupported chat JSON model in {location}")
     expected_fields = set(default_chat())
-    # Prior records omit only this additive field and keep their original routing.
-    if "subagent_endpoint_profile_id" not in obj:
-        expected_fields.remove("subagent_endpoint_profile_id")
     if set(obj) != expected_fields:
         raise UnsupportedDataVersionError(f"Chat fields do not match the current data model in {location}")
     chat_id = str(obj.get("chat_id") or "")
@@ -12232,7 +12436,7 @@ def validate_chat_record(obj: Any, *, expected_chat_id: str | None = None, locat
         raise ValueError(f"Invalid Agent report suspension in {location}")
     if not isinstance(obj.get("endpoint_profile_id"), str) or not str(obj.get("endpoint_profile_id") or "").strip():
         raise ValueError(f"Invalid locked chat endpoint in {location}")
-    if "subagent_endpoint_profile_id" in obj and (
+    if (
         not isinstance(obj["subagent_endpoint_profile_id"], str) or not obj["subagent_endpoint_profile_id"].strip()
     ):
         raise ValueError(f"Invalid Chat subagent endpoint in {location}")
@@ -15321,8 +15525,8 @@ class ChatStore:
 
     def get_chat_subagent_endpoint_profile_id(self, chat_id: str) -> str:
         chat = self.load_chat_view(chat_id)
-        # An old Chat must not change providers when an unrelated default changes.
-        return str(chat.get("subagent_endpoint_profile_id") or chat["endpoint_profile_id"]).strip()
+        # Saved routing is explicit; never synthesize it from another endpoint.
+        return str(chat["subagent_endpoint_profile_id"]).strip()
 
     def set_chat_subagent_endpoint_profile_id(self, chat_id: str, profile_id: str) -> dict[str, Any]:
         cid = self._cid(chat_id)
@@ -25054,6 +25258,18 @@ def cached_input_tokens_from_usage(value: dict[str, Any] | None) -> int | None:
     return None
 
 
+def cache_write_tokens_from_usage(value: Any) -> int | None:
+    for usage in llm_usage_sources(value):
+        for detail in (usage, usage.get("input_tokens_details"), usage.get("prompt_tokens_details")):
+            if not isinstance(detail, dict):
+                continue
+            for key in ("created_cache_tokens", "cache_creation_tokens", "cache_creation_input_tokens", "cache_write_tokens"):
+                count = _cache_token_value(detail.get(key))
+                if count is not None:
+                    return count
+    return None
+
+
 def llm_cache_usage_summary(value: dict[str, Any] | None) -> dict[str, int]:
     """Project one request, a merged turn, or durable counters without inventing hits."""
     for source in llm_usage_sources(value):
@@ -30155,6 +30371,7 @@ class LLMClient:
         estimated: bool,
         final: bool = False,
         cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
     ) -> None:
         monitor = self.request_monitor
         if monitor is None or not request_id or not round_id:
@@ -30163,6 +30380,7 @@ class LLMClient:
             monitor.set_inference_round_metrics(
                 request_id, round_id,
                 input_tokens=input_tokens, cached_input_tokens=cached_input_tokens,
+                cache_write_tokens=cache_write_tokens,
                 output_tokens=output_tokens,
                 prefill_seconds=prefill_seconds, generation_seconds=generation_seconds,
                 estimated=estimated, final=final,
@@ -30536,6 +30754,7 @@ class LLMClient:
                 request_id, metric_round_id,
                 input_tokens=int(input_tokens or 0),
                 cached_input_tokens=cached_input_tokens_from_usage(last_usage),
+                cache_write_tokens=cache_write_tokens_from_usage(last_usage),
                 output_tokens=int(output_tokens or 0),
                 prefill_seconds=prefill_seconds, generation_seconds=generation_seconds,
                 estimated=estimated, final=final,
@@ -30818,6 +31037,7 @@ class LLMClient:
                 request_id, metric_round_id,
                 input_tokens=int(input_tokens),
                 cached_input_tokens=cached_input_tokens_from_usage(result),
+                cache_write_tokens=cache_write_tokens_from_usage(result),
                 output_tokens=int(output_tokens),
                 prefill_seconds=float(prefill_seconds), generation_seconds=float(generation_seconds),
                 estimated=bool(token_counts_estimated), final=True,
@@ -44985,6 +45205,9 @@ class AgentRuntime:
         current = self.running.get(agent_id)
         if current and not current.done():
             return current
+        inherit = getattr(getattr(self, "chat_runtime", None), "_inherit_child_agent_control", None)
+        if callable(inherit):
+            inherit(agent_id)
         agent = self.agents.load_agent(agent_id)
         status = str(agent.get("status") or "")
         if not self.storage.paths.chat_json(str(agent.get("source_chat_id") or "")).is_file():
@@ -45152,6 +45375,11 @@ class AgentRuntime:
             agent = self.agents.load_agent(agent_id)
         except Exception:
             return False
+        owner = getattr(self, "chat_runtime", None)
+        chat_id = str(agent.get("source_chat_id") or "")
+        if owner is not None and (owner.is_pause_requested(chat_id) or owner.is_paused(chat_id)):
+            if any(str(row.get("agent_id")) == agent_id for row in owner._child_agents_for_chat(chat_id)):
+                return False
         status = str(agent.get("status") or "")
         was_actual_pause = status == "paused"
         if status in AGENT_TERMINAL_STATUSES:
@@ -47750,9 +47978,10 @@ class LLMTaskRecord:
 class LLMTaskMonitor:
     """Track every logical Chat, Agent, Image, and System LLM Task for the Dashboard.
 
-    Records distinguish lifecycle state from the current execution phase. Active
-    duration accrues only during inference or tool execution; queue wait, user
-    pause, and idle time never inflate Task duration or throughput.
+    Records distinguish lifecycle state from execution phase. Dashboard duration
+    is elapsed wall time for each run, including queue/tool/child waits and pauses.
+    Finished-to-next-user-turn idle gaps are excluded. Active inference/tool time
+    remains separate for throughput and execution-budget accounting.
     """
 
     TERMINAL_STATES = {"completed", "cancelled", "failed"}
@@ -47775,6 +48004,9 @@ class LLMTaskMonitor:
         self._inference_metric_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
         # Exactly one live Chat/Agent/Image Task may own the user-pinned first
         # priority slot. The pointer is process-local like the live Task records.
+        self._cost_prices: dict[tuple[str, str], dict[str, Any]] = {}
+        self._cost_events: dict[tuple[str, str], dict[str, Any]] = {}
+        self.cost_ledger = TokenCostLedger(storage.paths.root_dir)
         self._priority_task_id: str | None = None
         self._lock = threading.RLock()
         self._revision = 0
@@ -47848,6 +48080,21 @@ class LLMTaskMonitor:
             meta["active_seconds"] = max(0.0, float(meta.get("active_seconds") or 0.0)) + elapsed
         meta["phase_started_monotonic"] = None
 
+    @staticmethod
+    def _close_wall_span_locked(rec: LLMTaskRecord, now_mono: float) -> None:
+        started = rec.metadata.get("wall_started_monotonic")
+        if started is not None:
+            rec.metadata["wall_seconds"] = max(0.0, float(rec.metadata.get("wall_seconds") or 0.0)) + max(0.0, now_mono - float(started))
+        rec.metadata["wall_started_monotonic"] = None
+
+    @staticmethod
+    def _wall_duration_locked(rec: LLMTaskRecord, now_mono: float) -> float:
+        total = max(0.0, float(rec.metadata.get("wall_seconds") or 0.0))
+        started = rec.metadata.get("wall_started_monotonic")
+        if rec.state == "running" and started is not None:
+            total += max(0.0, now_mono - float(started))
+        return total
+
     def start(
         self,
         scope_id: str | None,
@@ -47885,10 +48132,11 @@ class LLMTaskMonitor:
                 # Reopen the same record while retaining cumulative token/timing
                 # totals and every captured provider round for the inspectors.
                 self._close_active_span_locked(rec, now_mono)
+                self._close_wall_span_locked(rec, now_mono)
                 cumulative = {
                     key: rec.metadata.get(key)
                     for key in (
-                        "active_seconds", "created_monotonic", "input_tokens", "output_tokens",
+                        "active_seconds", "wall_seconds", "created_monotonic", "input_tokens", "output_tokens",
                         "prefill_seconds", "generation_seconds",
                         "prefill_measured_input_tokens", "generation_measured_output_tokens",
                         "inference_count", "session_count", "tool_calls_by_type",
@@ -47904,6 +48152,7 @@ class LLMTaskMonitor:
                 rec.metadata.update(incoming)
                 rec.metadata.update({key: value for key, value in cumulative.items() if value is not None})
                 rec.metadata["session_count"] = max(0, int(cumulative.get("session_count") or 0)) + 1
+                rec.metadata["wall_started_monotonic"] = now_mono
                 rec.metadata["phase"] = "ready"
                 rec.metadata["phase_started_monotonic"] = None
                 rec.metadata["activity"] = "inactive"
@@ -47932,6 +48181,8 @@ class LLMTaskMonitor:
                 meta = incoming
                 meta.setdefault("phase", "ready")
                 meta.setdefault("active_seconds", 0.0)
+                meta["wall_seconds"] = 0.0
+                meta["wall_started_monotonic"] = now_mono
                 meta.setdefault("phase_started_monotonic", None)
                 meta.setdefault("activity", "inactive")
                 meta.setdefault("activity_started_monotonic", None)
@@ -48051,6 +48302,7 @@ class LLMTaskMonitor:
         with self._lock:
             if rid not in self._records:
                 return None
+            self._cost_prices[(rid, round_id)] = endpoint_cost_pricing_snapshot(endpoint_row)
             self._records[rid].metadata["endpoint_provider"] = endpoint_provider(endpoint_row)
             state = self._task_view_state.setdefault(rid, {"revision": 0, "rounds": []})
             rounds = state.setdefault("rounds", [])
@@ -48575,6 +48827,7 @@ class LLMTaskMonitor:
         input_tokens: int = 0,
         output_tokens: int = 0,
         cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
         prefill_seconds: float = 0.0,
         generation_seconds: float = 0.0,
         estimated: bool = False,
@@ -48652,6 +48905,25 @@ class LLMTaskMonitor:
                 meta["inference_count"] = max(0, int(meta.get("inference_count") or 0)) + 1
             meta["current_inference_tokens_estimated"] = bool(estimated and not final)
             meta["last_inference_tokens_estimated"] = bool(estimated)
+            pricing = self._cost_prices.get(key, endpoint_cost_pricing_snapshot({}))
+            write_count = _cache_token_value(cache_write_tokens)
+            if write_count is None:
+                write_count = previous.get("cache_write_tokens")
+            current["cache_write_tokens"] = write_count
+            cost = estimate_token_cost(pricing, current["input_tokens"], current["output_tokens"],
+                int(cached) if reported else None, cache_write_tokens=write_count, estimated=estimated)
+            old_cost = previous.get("cost") or {}
+            totals = meta.setdefault("token_cost", {field: 0 for field in TOKEN_COST_SUM_FIELDS})
+            for field in TOKEN_COST_SUM_FIELDS:
+                totals[field] = max(0, totals.get(field, 0) + cost[field] - old_cost.get(field, 0))
+            current["cost"] = cost
+            previous_event = self._cost_events.get(key)
+            event = {"schema": data_schema("token_cost"), "event_id": rid + ":" + str(round_id),
+                     "epoch": previous_event["epoch"] if previous.get("final") and previous_event else time.time(),
+                     "pricing": pricing, "cost": cost}
+            self._cost_events[key] = event
+            if final:
+                self.cost_ledger.record(event)
             self._inference_metric_snapshots[key] = current
             rec.updated_at = now_iso()
             self._revision += 1
@@ -48721,6 +48993,7 @@ class LLMTaskMonitor:
             if requested_state:
                 if requested_state in self.TERMINAL_STATES and rec.state not in self.TERMINAL_STATES:
                     self._close_active_span_locked(rec, now_mono)
+                    self._close_wall_span_locked(rec, now_mono)
                     rec.metadata["phase"] = requested_state
                     rec.metadata["phase_started_monotonic"] = None
                     rec.metadata["queue_priority"] = 0
@@ -48796,6 +49069,8 @@ class LLMTaskMonitor:
             stale_metric_keys = [key for key in self._inference_metric_snapshots if key[0] == rid]
             for key in stale_metric_keys:
                 self._inference_metric_snapshots.pop(key, None)
+                self._cost_prices.pop(key, None)
+                self._cost_events.pop(key, None)
             if self._priority_task_id == rid:
                 self._priority_task_id = None
             stale_identities = [
@@ -49000,8 +49275,10 @@ class LLMTaskMonitor:
             "display_status": display_status,
             "activity_stalled": activity_stalled,
             "activity_stalled_seconds": stalled_seconds if activity_stalled else 0.0,
-            "duration_seconds": active_seconds,
+            "duration_seconds": self._wall_duration_locked(rec, now_mono),
+            "active_seconds": active_seconds,
             "endpoint_wait_seconds": max(0.0, float(meta.get("endpoint_wait_seconds") or 0.0)),
+            "token_cost": copy.deepcopy(meta.get("token_cost") or {}),
             "input_tokens": input_tokens,
             **{field: int(meta.get(field) or 0) for field in CACHE_USAGE_FIELDS},
             "output_tokens": output_tokens,
@@ -49053,6 +49330,9 @@ class LLMTaskMonitor:
         now_mono = time.monotonic()
         with self._lock:
             rows = [self._row_from_record(rec, now_mono) for rec in self._records.values()]
+            live_costs = [copy.deepcopy(event) for key, event in self._cost_events.items()
+                          if not self._inference_metric_snapshots.get(key, {}).get("final")]
+        costs_24h = self.cost_ledger.summary(live_costs)
         counts = collections.Counter(str(row.get("display_status") or row.get("state") or "unknown") for row in rows)
         terminal_rows = [row for row in rows if str(row.get("state") or "") in self.TERMINAL_STATES]
         input_tokens = sum(max(0, int(row.get("input_tokens") or 0)) for row in rows)
@@ -49061,7 +49341,7 @@ class LLMTaskMonitor:
         generation_seconds = sum(max(0.0, float((row.get("metadata") or {}).get("generation_seconds") or 0.0)) for row in rows)
         measured_input_tokens = sum(max(0, int((row.get("metadata") or {}).get("prefill_measured_input_tokens") or 0)) for row in rows)
         measured_output_tokens = sum(max(0, int((row.get("metadata") or {}).get("generation_measured_output_tokens") or 0)) for row in rows)
-        active_seconds = sum(max(0.0, float(row.get("duration_seconds") or 0.0)) for row in rows)
+        active_seconds = sum(max(0.0, float(row.get("active_seconds") or 0.0)) for row in rows)
         endpoint_wait_seconds = sum(
             max(0.0, float(row.get("endpoint_wait_seconds") or 0.0)) for row in rows
         )
@@ -49105,7 +49385,8 @@ class LLMTaskMonitor:
             "active_seconds": active_seconds,
             "endpoint_wait_seconds": endpoint_wait_seconds,
             "inference_count": inference_count,
-            "average_task_seconds": active_seconds / len(rows) if rows else 0.0,
+            "wall_seconds": sum(float(row.get("duration_seconds") or 0.0) for row in rows),
+            "average_task_seconds": sum(float(row.get("duration_seconds") or 0.0) for row in rows) / len(rows) if rows else 0.0,
             "average_input_tokens": input_tokens / len(rows) if rows else 0.0,
             "average_output_tokens": output_tokens / len(rows) if rows else 0.0,
             "outcome_percentages": {
@@ -49116,6 +49397,7 @@ class LLMTaskMonitor:
             "task_types": dict(collections.Counter(str(row.get("task_type") or "System") for row in rows)),
             "tool_calls_by_type": dict(tool_counts),
             "top_tools": top_tools,
+            "costs_24h": costs_24h,
         }
 
     def has_active_tasks(
@@ -49774,6 +50056,71 @@ class ChatRuntime:
         if not isinstance(getattr(self, "_pause_events", None), dict):
             self._pause_events = {}
 
+        if not isinstance(getattr(self, "_chat_paused_agent_ids", None), dict):
+            self._chat_paused_agent_ids = {}
+
+    def _child_agents_for_chat(self, chat_id: str) -> list[dict[str, Any]]:
+        """Chat-owned roots and descendants, not scheduled PA work sharing a Chat."""
+        runtime = getattr(getattr(self, "tools", None), "agent_runtime", None)
+        if runtime is None:
+            return []
+        rows = runtime.agents.list_agents(chat_id=chat_id)
+        owned = {str(row["agent_id"]) for row in rows
+                 if not row.get("parent_agent_id") and row.get("agent_kind") != AGENT_KIND_PERSONAL_ASSISTANT}
+        while True:
+            more = {str(row["agent_id"]) for row in rows if str(row.get("parent_agent_id") or "") in owned}
+            if more.issubset(owned):
+                break
+            owned.update(more)
+        return [row for row in rows if str(row.get("agent_id") or "") in owned]
+
+    def _control_child_agents(self, chat_id: str, action: str) -> int:
+        """Only resume workers actually paused by this Chat; never revive Stop."""
+        self._ensure_chat_pause_state()
+        runtime = getattr(getattr(self, "tools", None), "agent_runtime", None)
+        if runtime is None:
+            return 0
+        changed = 0
+        paused_ids = self._chat_paused_agent_ids.setdefault(chat_id, set())
+        for row in self._child_agents_for_chat(chat_id):
+            agent_id = str(row["agent_id"])
+            if row.get("status") in AGENT_TERMINAL_STATUSES:
+                paused_ids.discard(agent_id)
+                continue
+            if action == "resume" and agent_id not in paused_ids:
+                continue
+            try:
+                applied = bool(getattr(runtime, action)(agent_id))
+                changed += int(applied)
+                if action == "pause" and applied:
+                    paused_ids.add(agent_id)
+                elif action in {"resume", "cancel"}:
+                    paused_ids.discard(agent_id)
+            except Exception as exc:
+                _best_effort_lifecycle_log(self.storage, "chat.child_control_failed", {
+                    "chat_id": chat_id, "agent_id": agent_id, "action": action, "error": str(exc),
+                })
+        if not paused_ids:
+            self._chat_paused_agent_ids.pop(chat_id, None)
+        return changed
+
+    def _inherit_child_agent_control(self, agent_id: str) -> None:
+        """Close the late-spawn race at the sole Agent scheduling boundary."""
+        runtime = getattr(getattr(self, "tools", None), "agent_runtime", None)
+        if runtime is None:
+            return
+        agent = runtime.agents.load_agent(agent_id)
+        chat_id = str(agent.get("source_chat_id") or "")
+        if not any(str(row.get("agent_id")) == agent_id for row in self._child_agents_for_chat(chat_id)):
+            return
+        if chat_id in getattr(self, "_agent_report_stopped_chats", set()):
+            runtime.cancel(agent_id)
+            raise ValueError("Source Chat is stopped; a new user request is required before starting more subagents")
+        if self.is_pause_requested(chat_id) or self.is_paused(chat_id):
+            self._ensure_chat_pause_state()
+            if runtime.pause(agent_id):
+                self._chat_paused_agent_ids.setdefault(chat_id, set()).add(agent_id)
+
     def _chat_pause_event(self, chat_id: str) -> asyncio.Event:
         self._ensure_chat_pause_state()
         resolved = str(chat_id or "").strip()
@@ -49788,12 +50135,15 @@ class ChatRuntime:
         """Request a pause at the next safe Chat execution boundary."""
         self._ensure_chat_pause_state()
         resolved = str(chat_id or "").strip()
-        if not resolved or not self.is_running(resolved):
+        if not resolved or (not self.is_running(resolved) and not any(
+            row.get("status") not in AGENT_TERMINAL_STATUSES for row in self._child_agents_for_chat(resolved)
+        )):
             return False
         if resolved in self._pause_requests or resolved in self._paused_chats:
             return False
         self._pause_requests.add(resolved)
         self._chat_pause_event(resolved).clear()
+        self._control_child_agents(resolved, "pause")
         request_id = self._monitor_task_ids.get(resolved)
         if self.monitor and request_id:
             self.monitor.update_metadata(request_id, {"pause_requested": True})
@@ -49814,6 +50164,7 @@ class ChatRuntime:
         self._pause_requests.discard(resolved)
         self._paused_chats.discard(resolved)
         self._chat_pause_event(resolved).set()
+        self._control_child_agents(resolved, "resume")
         request_id = self._monitor_task_ids.get(resolved)
         if self.monitor and request_id:
             self.monitor.update_metadata(request_id, {"pause_requested": False})
@@ -49914,7 +50265,7 @@ class ChatRuntime:
 
         async def finish() -> None:
             reviewer_ids = await asyncio.to_thread(persist)
-            runtime = getattr(self.tools, "agent_runtime", None)
+            runtime = getattr(getattr(self, "tools", None), "agent_runtime", None)
             if isinstance(runtime, AgentRuntime):
                 for agent_id in reviewer_ids:
                     try:
@@ -49954,6 +50305,8 @@ class ChatRuntime:
         monitor = getattr(self, "monitor", None)
         if monitor is not None and request_id:
             monitor.cancel(request_id)
+        self._control_child_agents(resolved, "cancel")
+        self._chat_paused_agent_ids.pop(resolved, None)
         self._release_chat_pause(resolved)
         self._signal_chat_request_cancel(resolved)
         request_cancel = getattr(self.tools, "request_cancel_chat_tool_calls", None)
@@ -50335,6 +50688,9 @@ class ChatRuntime:
         if report_id not in self._pending_agent_report_ids:
             self._agent_report_queues.setdefault(chat_id, collections.deque()).append(payload)
             self._pending_agent_report_ids.add(report_id)
+        wake = getattr(self, "_chat_child_report_events", {}).get(chat_id)
+        if wake is not None:
+            wake.set()
         worker = self._agent_report_workers.get(chat_id)
         if worker is None or worker.done():
             worker = asyncio.create_task(self._drain_agent_report_queue(chat_id), name=f"velox-agent-report-{chat_id}")
@@ -50380,6 +50736,36 @@ class ChatRuntime:
 
     def _agent_reports_ready(self, chat_id: str) -> bool:
         return bool(getattr(self, "_agent_report_queues", {}).get(chat_id))
+
+    async def _await_chat_child_reports(self, chat_id: str, request_id: str | None) -> bool:
+        """Keep the Chat run (and its wall clock/controls) alive until delegated work returns.
+
+        No model calls, endpoint lease, or busy polling while waiting. Delivery
+        persists results independently; this owner consumes them at its next boundary.
+        """
+        wake = self.__dict__.setdefault("_chat_child_report_events", {}).setdefault(chat_id, asyncio.Event())
+        waited = False
+        try:
+            while True:
+                wake.clear()
+                await self._wait_if_chat_paused(chat_id, "waiting for subagents")
+                if chat_id in getattr(self, "_agent_report_stopped_chats", set()):
+                    raise asyncio.CancelledError()
+                if self._agent_reports_ready(chat_id):
+                    return True
+                children = await asyncio.to_thread(self._child_agents_for_chat, chat_id)
+                if not any(row.get("status") not in AGENT_TERMINAL_STATUSES for row in children):
+                    return self._agent_reports_ready(chat_id)
+                waited = True
+                if self.monitor and request_id:
+                    self.monitor.set_phase(request_id, "waiting", persist=False)
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass  # Covers explicit child deletion/failure without a report.
+        finally:
+            if waited and self.monitor and request_id and self.monitor.record_state(request_id) == "running":
+                self.monitor.set_phase(request_id, "ready", persist=False)
 
     def _agent_report_autorun_blocked(self, chat_id: str, turns: list[dict[str, Any]]) -> bool:
         if (chat_id in getattr(self, "_agent_report_stopped_chats", set())
@@ -52123,6 +52509,8 @@ class ChatRuntime:
                     expert_mode_prompt_pending = False
                     expert_mode_prompt_turn_id = ""
 
+                if not self._agent_reports_ready(chat_id):
+                    await self._await_chat_child_reports(chat_id, request_id)
                 if expert_active or self._agent_reports_ready(chat_id):
                     if model_round >= max_model_rounds:
                         final_terminal_error = (
@@ -61823,6 +62211,137 @@ class UIState:
         return time.time() - self.last_user_input_ts >= seconds
 
 
+class FilePickerTreeModel:
+    """Lazy directory-only navigation. One bounded worker, no recursive draw I/O."""
+    MAX_CHILDREN = 256
+    MAX_CACHED = 128
+    MAX_ROWS = 1500
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._pending: collections.OrderedDict[str, int] = collections.OrderedDict()
+        self._cache: collections.OrderedDict[str, tuple[float, list[dict[str, Any]], str]] = collections.OrderedDict()
+        self._inflight = ""
+        self._generation = 0
+        self.expanded: set[str] = set()
+        self.current = ""
+        home = Path.home()
+        self.roots = [{"path": str(home / sub) if sub else str(home), "name": label, "shortcut": True}
+                      for sub, label in (("", "Home"), ("Desktop", "Desktop"), ("Documents", "Documents"), ("Downloads", "Downloads"))]
+        if os.name == "nt":
+            try:
+                drives = int(ctypes.windll.kernel32.GetLogicalDrives())
+            except (AttributeError, OSError):
+                drives = 0
+            self.roots.extend({"path": f"{chr(65 + i)}:/", "name": f"{chr(65 + i)}:", "shortcut": False}
+                              for i in range(26) if drives & (1 << i))
+        else:
+            self.roots.append({"path": "/", "name": "File system", "shortcut": False})
+        for row in self.roots:
+            row["path"] = self.key(row["path"])
+
+    @staticmethod
+    def key(path: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+    def reveal(self, path: Path) -> None:
+        current = self.key(path)
+        if current == self.current:
+            return
+        self.current = current
+        ancestor = Path(current)
+        self.expanded.update(self.key(item) for item in ancestor.parents)
+        anchor = self.key(ancestor.anchor or os.sep)
+        if not any(not row["shortcut"] and row["path"] == anchor for row in self.roots):
+            self.roots.append({"path": anchor, "name": anchor, "shortcut": False})
+
+    def toggle(self, path: str) -> None:
+        key = self.key(path)
+        if key in self.expanded:
+            self.expanded.remove(key)
+        else:
+            self.expanded.add(key)
+
+    def request(self, path: str) -> tuple[list[dict[str, Any]], str]:
+        key = self.key(path)
+        now = time.monotonic()
+        with self._lock:
+            saved = self._cache.get(key)
+            if saved:
+                self._cache.move_to_end(key)
+            if not saved or now - saved[0] > 5.0:
+                if key != self._inflight and key not in self._pending and len(self._pending) < self.MAX_CACHED:
+                    self._pending[key] = self._generation
+                    if self._thread is None:
+                        self._thread = threading.Thread(target=self._run, name="VeloxFilePickerTree", daemon=True)
+                        self._thread.start()
+            return (saved[1], saved[2]) if saved else ([], "Loading...")
+
+    def _scan(self, path: str) -> tuple[list[dict[str, Any]], str]:
+        import heapq
+        total = 0
+        def directories() -> Iterable[dict[str, Any]]:
+            nonlocal total
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        # Never recursively follow directory symlinks or junction cycles.
+                        if entry.is_dir(follow_symlinks=False):
+                            total += 1
+                            yield {"path": self.key(entry.path), "name": entry.name, "shortcut": False}
+                    except OSError:
+                        continue
+        try:
+            rows = heapq.nsmallest(self.MAX_CHILDREN, directories(), key=lambda r: (r["name"].casefold(), r["name"]))
+            return rows, f"First {self.MAX_CHILDREN} folders; use path bar for others" if total > self.MAX_CHILDREN else ""
+        except OSError as exc:
+            return [], "Cannot open: " + type(exc).__name__
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._thread = None
+                    return
+                key, generation = self._pending.popitem(last=False)
+                self._inflight = key
+            try:
+                rows, error = self._scan(key)
+            except Exception as exc:
+                rows, error = [], "Cannot open: " + type(exc).__name__
+            with self._lock:
+                self._inflight = ""
+                if generation != self._generation:
+                    continue
+                self._cache[key] = (time.monotonic(), rows, error)
+                while len(self._cache) > self.MAX_CACHED:
+                    self._cache.popitem(last=False)
+
+    def rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        def visit(node: dict[str, Any], depth: int, ancestors: frozenset[str]) -> None:
+            key = str(node["path"])
+            if len(rows) >= self.MAX_ROWS or depth > 24 or key in ancestors:
+                return
+            rows.append({**node, "depth": depth, "expanded": key in self.expanded,
+                         "selected": key == self.current})
+            if not node.get("shortcut") and key in self.expanded:
+                children, error = self.request(key)
+                for child in children:
+                    visit(child, depth + 1, ancestors | {key})
+                if error and len(rows) < self.MAX_ROWS:
+                    rows.append({"name": error, "depth": depth + 1, "notice": True})
+        for node in self.roots:
+            visit(node, 0, frozenset())
+        return rows
+
+    def discard(self) -> None:
+        with self._lock:
+            self._generation += 1
+            self._pending.clear()
+
+
 class FilePickerDirectoryCache:
     """One coalescing daemon scan, bounded rows, and no filesystem work in draw()."""
     def __init__(self) -> None:
@@ -64630,6 +65149,57 @@ class Widgets:
         self.state.active_widget = "fp.list"
         return list(selected)
 
+    def _draw_file_picker_tree(self, area: Rect, current: Path) -> Path | None:
+        model = self._file_picker_tree
+        model.reveal(current)
+        rows = model.rows()
+        row_h = max(30, self.font.line_h + 10)
+        header_h = row_h + 6
+        self.renderer.draw_card(area, radius=12, fill=Palette.panel2)
+        self.clipped_text(Rect(area.x + 10, area.y + 4, max(1, area.w - 20), row_h),
+                          "Folders", Palette.muted2)
+        body = Rect(area.x + 4, area.y + header_h, max(1, area.w - 8), max(1, area.h - header_h - 4))
+        content_h = len(rows) * row_h
+        scroll = self.state.scroll.get("fp.tree", 0)
+        if point_in_rect(self.inp.mouse_x, self.inp.mouse_y, body) and self.inp.wheel_y and not self.inp.mouse_consumed:
+            scroll -= self.inp.wheel_y * row_h * 2
+            self.inp.mouse_consumed = True
+        scroll = int(clamp(scroll, 0, max(0, content_h - body.h)))
+        scroll = self._scrollbar_input("fp.tree", body, scroll, content_h)
+        self.state.scroll["fp.tree"] = scroll
+        self.renderer.push_clip(body)
+        chosen = None
+        for index in range(max(0, scroll // row_h), min(len(rows), (scroll + body.h) // row_h + 2)):
+            row = rows[index]
+            # Cap visual indentation rather than letting deep paths squeeze labels to zero.
+            indent = min(int(row["depth"]) * 14, max(14, body.w // 3))
+            rr = Rect(body.x + 3, body.y + index * row_h - scroll, max(1, body.w - 18), row_h)
+            if row.get("selected"):
+                self.renderer.draw_round_rect(rr, 6, Palette.selected)
+            if row.get("notice"):
+                self.clipped_text(Rect(rr.x + indent, rr.y, max(1, rr.w - indent), row_h), str(row["name"]), Palette.muted2)
+                continue
+            disclosure = Rect(rr.x + indent, rr.y, 22, row_h)
+            icon = Rect(disclosure.x + 22, rr.y + (row_h - 16) // 2, 16, 16)
+            if not row.get("shortcut"):
+                self.clipped_text(disclosure, "v" if row.get("expanded") else ">", Palette.muted2, align="center")
+            self._draw_shape("folder", icon, Palette.muted2)
+            label = Rect(icon.x + 22, rr.y, max(1, rr.x + rr.w - icon.x - 22), row_h)
+            self.clipped_text(label, str(row["name"]), Palette.text, tooltip=str(row["path"]))
+            if (not self.inp.mouse_consumed and self.inp.mouse_pressed
+                    and point_in_rect(self.inp.mouse_x, self.inp.mouse_y, body)
+                    and point_in_rect(self.inp.mouse_x, self.inp.mouse_y, rr)):
+                self.inp.mouse_consumed = True
+                self.state.active_widget = "fp.tree"
+                if not row.get("shortcut") and point_in_rect(self.inp.mouse_x, self.inp.mouse_y, disclosure):
+                    model.toggle(row["path"])
+                else:
+                    chosen = Path(row["path"])
+                break
+        self.renderer.pop_clip()
+        self._scrollbar_draw("fp.tree", body, scroll, content_h)
+        return chosen
+
     def file_picker_modal(self, rect: Rect, scope_id: str | None) -> list[str] | None:
         # Attachment mode exposes checkboxes, Ctrl/Cmd toggles and Shift ranges.
         # Save mode retains its single-destination contract.
@@ -64637,6 +65207,8 @@ class Widgets:
             return None
         if not hasattr(self, "_file_picker_cache"):
             self._file_picker_cache = FilePickerDirectoryCache()
+        if not hasattr(self, "_file_picker_tree"):
+            self._file_picker_tree = FilePickerTreeModel()
         _ = scope_id
         self.state.open_dropdown = None
         save_mode = bool(getattr(self.state, "file_picker_save", False))
@@ -64690,6 +65262,7 @@ class Widgets:
                 self.state.file_picker_last_dir = str(destination.parent)
                 self.state.file_picker_open = False
                 self._file_picker_cache.discard()
+                self._file_picker_tree.discard()
                 clear_selection()
                 self.state.active_widget = None
                 self.inp.mouse_consumed = True
@@ -64724,6 +65297,7 @@ class Widgets:
                 self.state.file_picker_last_dir = str(parent)
             self.state.file_picker_open = False
             self._file_picker_cache.discard()
+            self._file_picker_tree.discard()
             clear_selection()
             self.state.active_widget = None
             self.inp.mouse_consumed = True
@@ -64758,6 +65332,7 @@ class Widgets:
         if self.button("fp.close", close_r, "X") or self.inp.key_escape:
             self.state.file_picker_open = False
             self._file_picker_cache.discard()
+            self._file_picker_tree.discard()
             clear_selection()
             self.state.file_picker_save_context = None
             self.state.file_picker_save = False
@@ -64772,7 +65347,9 @@ class Widgets:
         body = Rect(mx + 22, body_top, mw - 44, max(1, footer.y - body_top - 12))
         path_bar = Rect(body.x, body.y, body.w, 44)
         list_top = path_bar.y + path_bar.h + 8
-        list_area = Rect(body.x, list_top, body.w, max(40, footer.y - list_top - 8))
+        tree_w = min(250, max(114, int(body.w * 0.28)))
+        tree_area = Rect(body.x, list_top, tree_w, max(40, footer.y - list_top - 8))
+        list_area = Rect(body.x + tree_w + 10, list_top, max(1, body.w - tree_w - 10), tree_area.h)
 
         current_dir = normalize_dir(self.state.file_picker_dir)
         self._draw_shape("folder", Rect(path_bar.x, path_bar.y + 8, 20, 20), Palette.muted2)
@@ -64796,6 +65373,10 @@ class Widgets:
             open_directory(pth.parent if pth.parent != pth else pth)
 
         current_dir = normalize_dir(self.state.file_picker_dir)
+        tree_choice = self._draw_file_picker_tree(tree_area, current_dir)
+        if tree_choice is not None:
+            open_directory(tree_choice)
+            return None
         rows, error = self._file_picker_cache.request(current_dir)
         file_paths = [str(row["path"]) for row in rows
                       if not row.get("_notice") and not row.get("is_dir") and row.get("path")]
@@ -64880,10 +65461,11 @@ class Widgets:
             prefix_w = 62 if allow_multi else 42
             icon_rect = Rect(rr.x + (36 if allow_multi else 12), rr.y + max(0, (rr.h - 18) // 2), 18, 18)
             self._draw_shape("folder" if is_dir else "page", icon_rect, Palette.accent if is_dir else Palette.muted2)
-            name_rect = Rect(rr.x + prefix_w, rr.y, max(20, rr.w - prefix_w - 152), rr.h)
+            size_w = 130 if rr.w >= 420 else (94 if rr.w >= 300 else 0)
+            name_rect = Rect(rr.x + prefix_w, rr.y, max(1, rr.w - prefix_w - size_w - 8), rr.h)
             self.clipped_text(name_rect, str(row.get("name", "")), Palette.white if is_dir else Palette.text)
-            if not is_dir:
-                meta_rect = Rect(rr.x + rr.w - 148, rr.y, 138, rr.h)
+            if not is_dir and size_w:
+                meta_rect = Rect(rr.x + rr.w - size_w, rr.y, size_w - 4, rr.h)
                 self.clipped_text(meta_rect, f"{int(row.get('size', 0))} bytes", Palette.muted2)
         self.renderer.pop_clip()
         self._scrollbar_draw("fp.list", list_area, scroll_y, total_h)
@@ -64904,6 +65486,7 @@ class Widgets:
         if self.button("fp.cancel", Rect(footer.x + footer.w - 222, footer.y, 100, 36), "Cancel"):
             self.state.file_picker_open = False
             self._file_picker_cache.discard()
+            self._file_picker_tree.discard()
             clear_selection()
             self.state.file_picker_save_context = None
             self.state.file_picker_save = False
@@ -69620,9 +70203,8 @@ class Panels:
         return [
             {"key": "expand", "title": "", "width": 28, "fixed_width": 28, "sortable": False},
             {"key": "status", "title": "", "width": 34, "fixed_width": 34, "sortable": False, "align": "center"},
-            {"key": "requirement_id", "title": "ID", "width": 100, "fixed_width": 100, "sortable": False},
+            {"key": "requirement_id", "title": "ID", "width": 132, "fixed_width": 132, "sortable": False},
             {"key": "requirement", "title": "Requirement / Step", "min_width": 170, "sortable": False},
-            {"key": "progress", "title": "Progress / Result", "min_width": 170, "sortable": False},
         ]
 
     @staticmethod
@@ -69661,9 +70243,9 @@ class Panels:
                            "action": "toggle_subitems", "tooltip": "Expand implementation steps" if item_id in collapsed else "Collapse implementation steps"} if children else "",
                 "status": {"type": "status_icon", "icon": "check" if item_state in (CHECKLIST_ITEM_DONE, CHECKLIST_ITEM_VERIFIED) else "dot" if item_state == CHECKLIST_ITEM_IN_PROGRESS else "",
                            "label": marker, "color": color, "tooltip": state_label},
-                "requirement_id": {"label": item_id, "color": Palette.muted2 if parent_id else Palette.text, "tooltip": kind},
-                "requirement": {"label": str(row.get("text") or ""), "indent": 18 if parent_id else 0,
-                                "tree_branch": bool(parent_id), "tooltip": tooltip},
+                "requirement_id": {"label": item_id, "color": Palette.muted2 if parent_id else Palette.text,
+                                   "indent": 18 if parent_id else 0, "tree_branch": bool(parent_id), "tooltip": tooltip},
+                "requirement": {"label": str(row.get("text") or ""), "tooltip": tooltip},
                 "progress": {"label": progress, "tooltip": tooltip},
                 "_tooltip": tooltip,
             })
@@ -70763,7 +71345,7 @@ class Panels:
             ),
             ENDPOINT_ERROR_RECOVERY_DELAY_SECONDS_DEFAULT,
         )
-        for field in ENDPOINT_PROFILE_OPTIONAL_FLOAT_FIELDS + ENDPOINT_PROFILE_OPTIONAL_INT_FIELDS:
+        for field in ENDPOINT_PROFILE_OPTIONAL_FLOAT_FIELDS + ENDPOINT_PROFILE_OPTIONAL_INT_FIELDS + ENDPOINT_PRICE_FIELDS:
             value = draft.get(field)
             draft[field] = "" if value is None else str(value)
         draft["_ui_stop_sequences"] = json.dumps(draft.get("stop_sequences") or [], ensure_ascii=False)
@@ -70782,7 +71364,8 @@ class Panels:
         if (preset["model_type"] == ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT
                 and endpoint_provider_name(str(draft.get("base_url") or ""), draft.get("provider")) == ENDPOINT_PROVIDER_NOVITA):
             preset["model"] = "qwen/qwen3.8-flash"
-        optional_fields = set(ENDPOINT_PROFILE_OPTIONAL_FLOAT_FIELDS + ENDPOINT_PROFILE_OPTIONAL_INT_FIELDS)
+        preset.update(endpoint_default_token_prices(preset["model_type"], endpoint_provider(draft)))
+        optional_fields = set(ENDPOINT_PROFILE_OPTIONAL_FLOAT_FIELDS + ENDPOINT_PROFILE_OPTIONAL_INT_FIELDS + ENDPOINT_PRICE_FIELDS)
         for key, value in preset.items():
             if key == "system_prompt_addon":
                 continue
@@ -71538,7 +72121,7 @@ class Panels:
                     "prefix": "modal.endpoint.footer.",
                 }]
                 body = Rect(inner.x, selector_y + SETTINGS_CONTROL_H + 14, inner.w, max(1, btn_y - (selector_y + SETTINGS_CONTROL_H + 14) - 12))
-                content_h = 1170 + 4 * (SETTINGS_CONTROL_H + SETTINGS_ROW_GAP) + (42 if str(draft.get("user_agent_mode") or "generic") == "custom" else 0)
+                content_h = 1170 + 7 * (SETTINGS_CONTROL_H + SETTINGS_ROW_GAP) + (42 if str(draft.get("user_agent_mode") or "generic") == "custom" else 0)
                 scroll_id = "modal.endpoint.editor"
                 scroll_y = int(self.state.scroll.get(scroll_id, 0))
                 if self.widgets._can_receive_pointer(scroll_id) and point_in_rect(self.state.input.mouse_x, self.state.input.mouse_y, body) and self.state.input.wheel_y:
@@ -71660,6 +72243,12 @@ class Panels:
                     tooltip="Shown while editing this endpoint. Errors, logs, exported debug reports, and header previews still redact the value.",
                 )
                 text_row("modal.endpoint.model", "Model", "model", "provider/model-id")
+                for price_key, price_label in zip(ENDPOINT_PRICE_FIELDS, ("Input USD / 1M", "Cache USD / 1M", "Output USD / 1M")):
+                    text_row("modal.endpoint." + price_key, price_label, price_key, "Blank = unpriced; 0 = free",
+                             tooltip="USD per million tokens. Input means uncached input; cache means cache reads. "
+                             "List prices checked 2026-09-27. Local DSV4F Exp uses a theoretical Novita proxy. "
+                             "GPT-6 long-context and explicit service-tier multipliers apply automatically. "
+                             "Changes affect future requests only. Blank is unknown, not free.")
 
                 ua_rect = Rect(field_x, y, min(330, max(180, full_w - 160)), SETTINGS_CONTROL_H)
                 view_rect = Rect(ua_rect.x + ua_rect.w + 10, y, min(146, max(100, full_w - ua_rect.w - 10)), SETTINGS_CONTROL_H)
@@ -80309,6 +80898,11 @@ class Panels:
         input_tps = max(0.0, float(rec.get("prefill_tokens_per_second") or 0.0))
         generation_tps = max(0.0, float(rec.get("generation_tokens_per_second") or 0.0))
         display_id = max(1, int(rec.get("display_id") or (rec.get("metadata") or {}).get("display_id") or 0))
+        cache_label = cached_input_label(rec)
+        reported = max(0, int(rec.get("cache_reported_rounds") or 0))
+        rounds = max(reported, int(rec.get("cache_total_rounds") or 0))
+        cache_detail = (f"{reported:,}/{rounds:,} requests" + ("; reported subset, lower bound" if reported < rounds else "")
+                        if cache_label != "N/A" else "no count, not a reported zero")
         return {
             "id": task_id,
             "display_id": {"label": str(display_id), "sort": display_id},
@@ -80329,18 +80923,20 @@ class Panels:
             "output_tokens": {"label": f"{output_tokens:,}", "sort": output_tokens},
             "input_tps": {"label": f"{input_tps:,.1f}" if input_tps > 0 else "—", "sort": input_tps},
             "generation_tps": {"label": f"{generation_tps:,.1f}" if generation_tps > 0 else "—", "sort": generation_tps},
+            "cost": {"label": token_cost_label(rec.get("token_cost")),
+                     "sort": float((rec.get("token_cost") or {}).get("total_usd") or 0),
+                     "tooltip": token_cost_tooltip(rec.get("token_cost"))},
             "_context_menu": self._dashboard_task_context_menu_items(rec),
             "_tooltip_all_cells": True,
             "_tooltip": (
                 f"{task_type} #{display_id}: {rec.get('title') or rec.get('description') or 'LLM Task'}\n"
                 f"Endpoint: {rec.get('endpoint_name') or 'Unassigned'}\n"
                 f"Status: {status.title()} | Priority: {'Pinned (*)' if prioritized else (priority if priority else 'Not queued')}\n"
-                f"Start: {format_dashboard_start_time(rec.get('created_at'))}\n"
-                f"Active duration: {format_duration_hms(duration)} (queue, pause, and idle excluded)\n"
-                + cached_input_tooltip(rec) + "\n"
-                f"Output: {output_tokens:,} | Total: {input_tokens + output_tokens:,} tokens\n"
-                f"IN t/s: {input_tps:,.1f} | OUT t/s: {generation_tps:,.1f}\n"
-                f"Task ID: {task_id}"
+                f"Start: {format_dashboard_start_time(rec.get('created_at'))} | Wall: {format_duration_hms(duration)} (waits/tools/pauses included)\n"
+                f"Input: {input_tokens:,} | Output: {output_tokens:,} | Total: {input_tokens + output_tokens:,} tokens\n"
+                f"Cached Input: {cache_label} | Cache reporting: {cache_detail}\n"
+                f"IN t/s: {input_tps:,.1f} | OUT t/s: {generation_tps:,.1f} | Task ID: {task_id}\n"
+                + token_cost_tooltip(rec.get("token_cost"))
             ),
         }
 
@@ -80491,8 +81087,9 @@ class Panels:
         card_count = 5
         columns = 5 if rect.w >= 1450 else (3 if rect.w >= 960 else (2 if rect.w >= 620 else 1))
         row_count = int(math.ceil(card_count / columns))
-        # Five statistics rows must remain inside their card at larger UI fonts.
-        card_h = max(232, self.f.line_h + 64 + 5 * max(27, self.f.line_h + 3))
+        # Fit five statistics lines and the cost total plus five endpoint rows.
+        card_h = max(232, self.f.line_h + 64 + 5 * max(27, self.f.line_h + 3),
+                     self.f.line_h + 60 + 6 * max(23, self.f.line_h + 1))
         card_w = max(1, (rect.w - gap * (columns - 1)) // columns)
         cards: list[Rect] = []
         for index in range(card_count):
@@ -80602,40 +81199,29 @@ class Panels:
             (f"{float(percentages.get('cancelled', 0.0) or 0.0):.0f}% Cancelled ({cancelled:,})", Palette.warn, f"Cancelled: {cancelled:,}"),
         ])
 
-        top_tools_body = self._draw_agent_metric_card(cards[3], "Top tools")
-        raw_top_tools = stats.get("top_tools") if isinstance(stats.get("top_tools"), list) else []
-        top_tools: list[tuple[str, int]] = []
-        for item in raw_top_tools[:10]:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("tool_name") or "").strip()
-            try:
-                count = max(0, int(item.get("count") or 0))
-            except (TypeError, ValueError):
-                count = 0
-            if name and count:
-                top_tools.append((name, count))
-        if top_tools:
-            column_gap = 12
-            column_w = max(1, (top_tools_body.w - column_gap) // 2)
-            first_y = top_tools_body.y + 4
-            compact_line_h = max(23, self.f.line_h + 1)
-            compact_gap = 3
-            for index, (name, count) in enumerate(top_tools):
-                column = index // 5
-                row = index % 5
-                x = top_tools_body.x + column * (column_w + column_gap)
-                line_rect = Rect(x, first_y + row * (compact_line_h + compact_gap), column_w, compact_line_h)
-                label = f"{index + 1}. {name}  {count:,}"
-                self.widgets.clipped_text(
-                    line_rect, label, Palette.muted,
-                    tooltip=f"{name}: {count:,} call{'s' if count != 1 else ''}",
-                )
-        else:
-            self.widgets.clipped_text(
-                Rect(top_tools_body.x, top_tools_body.y + 8, top_tools_body.w, line_h),
-                "No tool calls yet", Palette.muted2,
-            )
+        cost_body = self._draw_agent_metric_card(cards[3], "Costs / 24h (USD)")
+        costs = stats.get("costs_24h") or {}
+        cost_hint = token_cost_tooltip(costs) + "\nRolling 24 hours; recorded requests survive restarts and Task deletion. Top five endpoint types by cost, not token count."
+        if costs.get("error"):
+            cost_hint += "\n" + str(costs["error"])
+        total_label = "Total " + token_cost_label(costs) + (" !" if costs.get("error") else "")
+        compact_h = max(23, self.f.line_h + 1)
+        self.widgets.clipped_text(Rect(cost_body.x, cost_body.y + 3, cost_body.w, compact_h),
+                                  total_label, Palette.text, tooltip=cost_hint)
+        ranked = costs.get("top_endpoints") or []
+        for index, endpoint in enumerate(ranked[:5]):
+            rr = Rect(cost_body.x, cost_body.y + 3 + (index + 1) * (compact_h + 3), cost_body.w, compact_h)
+            value = token_cost_label(endpoint)
+            value_w = min(rr.w // 2, max(86, self.widgets._text_width(value) + 6))
+            label = str(endpoint.get("label") or "Unknown")
+            hint = label + "\n" + token_cost_tooltip(endpoint)
+            self.widgets.clipped_text(Rect(rr.x, rr.y, max(1, rr.w - value_w - 8), rr.h),
+                                      label, Palette.muted, tooltip=hint)
+            self.widgets.clipped_text(Rect(rr.x + rr.w - value_w, rr.y, value_w, rr.h),
+                                      value, Palette.text, align="right", tooltip=hint)
+        if not ranked:
+            self.widgets.clipped_text(Rect(cost_body.x, cost_body.y + compact_h + 9, cost_body.w, compact_h),
+                                      "No usage in the last 24h", Palette.muted2, tooltip=cost_hint)
 
         checklist_body = self._draw_agent_metric_card(cards[4], "Checklist statistics")
         checklist_stats = stats.get("checklist_statistics") or {"status": "loading"}
@@ -81251,6 +81837,7 @@ class Panels:
             ("output_tokens", "Output", 150, 150, "right"),
             ("input_tps", "IN t/s", 110, 110, "right"),
             ("generation_tps", "OUT t/s", 110, 110, "right"),
+            ("cost", "Est. USD", 140, 140, "right"),
         ]
         preferred_fixed = sum(row[2] for row in fixed_columns)
         minimum_fixed = sum(row[3] for row in fixed_columns)
@@ -81281,6 +81868,7 @@ class Panels:
             {"key": "output_tokens", "title": "Output", "width": 150, "min_width": 150, "fixed_width": 150, "sort_type": "number", "align": "right", "sortable": False},
             {"key": "input_tps", "title": "IN t/s", "width": 110, "min_width": 110, "fixed_width": 110, "sort_type": "number", "align": "right", "sortable": False},
             {"key": "generation_tps", "title": "OUT t/s", "width": 110, "min_width": 110, "fixed_width": 110, "sort_type": "number", "align": "right", "sortable": False},
+            {"key": "cost", "title": "Est. USD", "width": 140, "min_width": 140, "fixed_width": 140, "sort_type": "number", "align": "right", "sortable": False},
         ]
         self.state.selected_llm_task_id, action = self.widgets.table_view(
             "dashboard.tasks", chat_table_rect, columns, task_rows,
