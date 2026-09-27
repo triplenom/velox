@@ -75,7 +75,16 @@ _TIMING_TIME = time.time
 _CHILD_STARTED = _TIMING_PERF()
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import velox
+# Prefer this test file's matching application, even beside an older velox.py.
+# Register the normal module name so dataclasses, mocks and child tests agree.
+import importlib.util
+_application_path = Path(__file__).with_name(Path(__file__).name.removeprefix("test_"))
+_application_spec = importlib.util.spec_from_file_location("velox", _application_path)
+if _application_spec is None or _application_spec.loader is None:
+    raise ImportError(f"Cannot load matching application: {_application_path}")
+velox = importlib.util.module_from_spec(_application_spec)
+sys.modules["velox"] = velox
+_application_spec.loader.exec_module(velox)
 
 
 def _legacy_endpoint_fixture_profiles() -> list[dict[str, Any]]:
@@ -622,8 +631,8 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         return paths, storage, chats, chat, agents, tools, runtime
 
     def test_application_metadata_and_navigation_destinations(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertNotIn("SUPPORTED_DATA_FILE_VERSIONS", vars(velox))
         self.assertNotIn("PREVIOUS_DATA_FILE_VERSION", vars(velox))
         self.assertNotIn("PREVIOUS_APP_SCHEMA", vars(velox))
@@ -646,7 +655,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("fast_profile_id", llm)
         self.assertNotIn("smart_profile_id", llm)
         self.assertNotIn("accounts", config)
-        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, "velox_account_credentials.v1")
+        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, velox.data_schema('velox_account_credentials'))
         self.assertEqual(velox.CREDENTIAL_XOR_BYTE, 0x77)
         agents = config["agents"]
         self.assertEqual(set(agents), {"timeout_minutes", "auto_compaction_enabled", "personal_assistant"})
@@ -667,7 +676,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             velox.VAULT_SYNC_STATE_SCHEMA, velox.SCHEDULED_TASK_SCHEMA, velox.CONTEXT_DOC_SCHEMA,
             velox.CONTEXT_DOC_REVISION_SCHEMA, velox.EXPERT_MODE_SCHEMA,
         )
-        self.assertTrue(all(value.endswith(".v303") for value in schemas))
+        self.assertTrue(all(value.endswith("." + velox.DATA_FILE_VERSION) for value in schemas))
         self.assertIn("Capabilities", velox.__doc__ or "")
         self.assertIn("Architecture", velox.__doc__ or "")
         for component in (velox.ChatRuntime, velox.AgentRuntime, velox.LLMClient, velox.ToolRegistry, velox.ChecklistStore):
@@ -1105,7 +1114,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("SUPPORTED_DATA_FILE_VERSIONS", production)
         self.assertIn("this build requires exactly", inspect.getsource(velox.DataRootRegistry.assert_supported))
         self.assertIn("persisted schemas", velox.__doc__ or "")
-        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, "velox_account_credentials.v1")
+        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, velox.data_schema('velox_account_credentials'))
 
 
     def test_chat_directory_has_required_files_and_subdirectories(self) -> None:
@@ -1120,7 +1129,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("workspace_id", persisted)
             self.assertNotIn("scope_id", persisted)
             self.assertNotIn("summary_path", persisted)
-            self.assertEqual(persisted["schema"], "chat.v303")
+            self.assertEqual(persisted["schema"], velox.data_schema('chat'))
             self.assertEqual(persisted["chat_kind"], "standard")
             self.assertIsNone(persisted["week_start_date"])
 
@@ -1407,7 +1416,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self._write_chat_summary(paths, chat["chat_id"], "- One stored summary")
             tools = velox.ToolRegistry(storage)
             result = await tools.tool_chats_get_all_summaries(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=chat["chat_id"]), {})
-            self.assertEqual(result["schema"], "all_chats_summary.v2")
+            self.assertEqual(result["schema"], velox.data_schema('all_chats_summary'))
             self.assertEqual(result["count"], 1)
             self.assertIn("One stored summary", result["summary_markdown"])
             self.assertTrue(result["newest_first"])
@@ -1919,7 +1928,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
             self.assertTrue(paths.agent_json(first_id).is_file())
             self.assertTrue(paths.agent_transcript_jsonl(first_id).is_file())
-            self.assertEqual(velox.read_json(paths.agent_json(first_id), {})["schema"], "agent.v303")
+            self.assertEqual(velox.read_json(paths.agent_json(first_id), {})["schema"], velox.data_schema('agent'))
             created_events = agents.load_transcript(first_id)
             self.assertEqual([event.get("kind") for event in created_events], ["created"])
             self.assertEqual(created_events[0]["data"]["source_chat_id"], chat_a["chat_id"])
@@ -1993,7 +2002,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(result["ok"])
             started = result["result"]
             agent_id = str(started["agent_id"])
-            self.assertEqual(started["schema"], "agent_start_result.v5")
+            self.assertEqual(started["schema"], velox.data_schema('agent_start_result'))
             self.assertNotIn("expert_mode", started)
             self.assertNotIn("persistence_enabled", started)
             self.assertNotIn("persistence_max_prompts", started)
@@ -4290,7 +4299,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             corrupt.write_bytes(b'{"index":6}\nnot-json\n{"index":7}\n')
             rows = velox.iter_jsonl(corrupt)
             self.assertEqual(rows[0], {"index": 6})
-            self.assertEqual(rows[1]["schema"], "corrupt_jsonl_line.v1")
+            self.assertEqual(rows[1]["schema"], velox.data_schema('corrupt_jsonl_line'))
             self.assertEqual(rows[2], {"index": 7})
 
 
@@ -6166,7 +6175,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "fs_read": ("path",),
                 "fs_write": ("path", "content"),
                 "fs_append": ("path", "content"),
-                "shell_exec": ("command", "timeout_minutes"),
+                "shell_exec": ("command", "timeout_minutes", "cwd"),
                 "python_exec": ("script", "timeout_minutes"),
                 "doc_read": ("path",),
                 "doc_pdf_images": ("path",),
@@ -6709,7 +6718,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             frame_a.write_bytes(png)
             frame_b.write_bytes(png)
             base_result = {
-                "schema": "browser_demo_playback.v303",
+                "schema": velox.data_schema("browser_demo_playback"),
                 "chatId": chat_id,
                 "target": "file:///example.html",
                 "page": {"dataset": {"tests": "passed"}},
@@ -9509,7 +9518,7 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             serialized = json.dumps(app_payload)
             self.assertNotIn("xoxp-token", serialized)
             self.assertNotIn("abcdefghijklmnop", serialized)
-            self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, "velox_account_credentials.v1")
+            self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, velox.data_schema('velox_account_credentials'))
 
     def test_gmail_mime_parsing_plain_html_encoded_headers_and_attachments(self) -> None:
         plain = velox.parse_gmail_mime_message(
@@ -14412,7 +14421,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             def fake_run_sync(**kwargs: Any) -> dict[str, Any]:
                 captured_timeout["seconds"] = int(kwargs["timeout_seconds"])
                 return {
-                    "schema": "browser_demo_playback.v303",
+                    "schema": velox.data_schema("browser_demo_playback"),
                     "success": True,
                     "playback": {},
                     "artifacts": {},
@@ -14994,7 +15003,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertEqual(sidecar, Path(td) / "frame.txt")
             self.assertIn('"yaw":1.5', sidecar.read_text(encoding="utf-8"))
             prompt = velox.BrowserTools._browser_visual_review_prompt(
-                {"schema": "browser_demo_playback.v303", "target": "game.html", "page": {}, "playback": {}},
+                {"schema": velox.data_schema("browser_demo_playback"), "target": "game.html", "page": {}, "playback": {}},
                 {"snapshotData": {"excerpt": sidecar.read_text(encoding="utf-8")}},
                 1, 1,
             )
@@ -15535,7 +15544,7 @@ class CalendarLayoutAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             self.assertIn(token, page_source)
 
     def test_window_title_always_ends_with_revision_tag(self) -> None:
-        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, "[V303]")
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, f"[V{velox.CURRENT_VERSION}]")
         create_source = inspect.getsource(velox.SDLHost.init)
         title_source = inspect.getsource(velox.VeloxApp.draw_frame)
         self.assertIn('f"{APP_NAME} {WINDOW_TITLE_SUFFIX}"', create_source)
@@ -17278,12 +17287,12 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
 
     def test_documentation_describes_execution_and_setup(self) -> None:
         readme = _project_documentation("README.md")
-        for phrase in ("## Run it", "checklists", "Reviewer", "Calendar", "Context Docs", "`v303` data files"):
+        for phrase in ("## Run it", "checklists", "Reviewer", "Calendar", "Context Docs", "data files"):
             self.assertIn(phrase, readme)
         self.assertIn("python velox.py", velox.__doc__ or "")
         self.assertIn("persisted schemas", velox.__doc__ or "")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         self.assertEqual(len(velox.default_config()["llm"]["endpoint_profiles"]), 9)
 
 
@@ -17964,8 +17973,8 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=chat_id, endpoint_profile_id=velox.DEFAULT_ENDPOINT_PROFILE_ID, cancel_event=threading.Event())
             ui = await tools.analyze_ui(ctx, {"path": str(image_path), "prompt": "Expected complete text."})
             scene = await tools.analyze_3d_scene(ctx, {"path": str(image_path), "prompt": "Expected closed cube."})
-            self.assertEqual(ui["schema"], "image_analysis_ui.v3")
-            self.assertEqual(scene["schema"], "image_analysis_3d_scene.v3")
+            self.assertEqual(ui["schema"], velox.data_schema('image_analysis_ui'))
+            self.assertEqual(scene["schema"], velox.data_schema('image_analysis_3d_scene'))
             self.assertEqual(ui["mode"], "separate_ui_context_streaming")
             self.assertEqual(scene["mode"], "separate_3d_scene_context_streaming")
             self.assertEqual(len(fake.requests), 2)
@@ -21490,7 +21499,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
                 snapshot = await registry.tool_programming_toolchain_discover(
                     velox.ToolContext(velox.APP_SCOPE_ID), {},
                 )
-            self.assertEqual(snapshot["schema"], "programming_toolchain_snapshot.v262")
+            self.assertEqual(snapshot["schema"], velox.data_schema('programming_toolchain_snapshot'))
             self.assertEqual(snapshot["hostOs"], "Windows")
             self.assertEqual(snapshot["cpp"]["installations"], cpp["installations"])
             self.assertEqual(snapshot["cmakeInstallations"], cpp["cmakeInstallations"])
@@ -21636,7 +21645,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             image_tools = FakeImageTools()
             browser = velox.BrowserTools(storage, SimpleNamespace(), image_tools)  # type: ignore[arg-type]
             result = {
-                "schema": "browser_demo_playback.v303", "target": "game.html", "page": {},
+                "schema": velox.data_schema("browser_demo_playback"), "target": "game.html", "page": {},
                 "playback": {"minimumDurationsMet": True},
                 "artifacts": {
                     "screenshot": {"absolutePath": str(paths[0]), "path": paths[0].name},
@@ -21721,8 +21730,8 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             ]
             self.assertEqual(outdated_names, [], path.name)
             del syntax
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, "velox_account_credentials.v1")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, velox.data_schema('velox_account_credentials'))
 
 
 def _fail_test_selection(message: str) -> NoReturn:
@@ -22893,7 +22902,7 @@ class TranscriptScrollingAndToolRowsTests(_DataRootsIsolatedTestMixin, unittest.
             result = await browser._augment_visual_evidence(
                 velox.ToolContext(velox.APP_SCOPE_ID, chat_id=chat_id),
                 {
-                    "schema": "browser_run_headless.v303", "target": "file:///animation.html",
+                    "schema": velox.data_schema("browser_run_headless"), "target": "file:///animation.html",
                     "viewport": {"width": 1920, "height": 1080}, "page": {"dataset": {}},
                     "artifacts": {"screenshot": {"absolutePath": str(frame), "path": "workspace/frame.png", "mime": "image/png"}},
                 },
@@ -23159,7 +23168,8 @@ class RateLimitEncodingAndDecisionTests(_DataRootsIsolatedTestMixin, unittest.Te
         production = Path(velox.__file__).read_text(encoding="utf-8")
         self.assertNotIn("velox.modernized.v229", production)
         self.assertNotIn('"data_version": "v229"', production)
-        self.assertIn(velox.CREDENTIAL_FILE_SCHEMA, production)
+        self.assertIn("CREDENTIAL_FILE_SCHEMA = data_schema(", production)
+        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, velox.data_schema("velox_account_credentials"))
 
 class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     """Wrapping, token accounting, task times and prompt construction."""
@@ -25193,8 +25203,8 @@ class ExecutableVisualLoopTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     """Executable feedback, visual orientation and checklist icons."""
 
     def test_source_revision(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, "[V303]")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, f"[V{velox.CURRENT_VERSION}]")
 
 
     def test_checklist_status_icons_are_blank_white_green_gold(self) -> None:
@@ -25814,14 +25824,14 @@ class ChatSidebarReportTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("open_local_path", source)
 
     def test_rejects_unsupported_root_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
-        self.assertEqual(velox.CHAT_SCHEMA, "chat.v303")
-        self.assertEqual(velox.AGENT_SCHEMA, "agent.v303")
-        self.assertEqual(velox.CHECKLIST_COLLECTION_SCHEMA, "checklist_collection.v303")
-        self.assertEqual(velox.CHECKLIST_HISTORY_SCHEMA, "checklist_history_event.v303")
-        self.assertEqual(velox.AGENT_ROLE_SIDECAR_FILENAME, "agent_role.v303.json")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
+        self.assertEqual(velox.CHAT_SCHEMA, velox.data_schema('chat'))
+        self.assertEqual(velox.AGENT_SCHEMA, velox.data_schema('agent'))
+        self.assertEqual(velox.CHECKLIST_COLLECTION_SCHEMA, velox.data_schema('checklist_collection'))
+        self.assertEqual(velox.CHECKLIST_HISTORY_SCHEMA, velox.data_schema('checklist_history_event'))
+        self.assertEqual(velox.AGENT_ROLE_SIDECAR_FILENAME, velox.data_schema('agent_role') + ".json")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -25866,7 +25876,7 @@ class ReviewerQualityTests(unittest.TestCase):
     def test_browser_visual_prompt_starts_with_unbiased_defect_sweep(self) -> None:
         prompt = velox.BrowserTools._browser_visual_review_prompt(
             {
-                "schema": "browser_run_headless.v303",
+                "schema": velox.data_schema("browser_run_headless"),
                 "target": "game.html",
                 "page": {"dataset": {"boot": "ready"}},
                 "playback": {},
@@ -25905,9 +25915,9 @@ class ReviewerQualityTests(unittest.TestCase):
         self.assertNotIn("critic reviewer", prompt.lower())
 
     def test_rejects_an_unsupported_application_root(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -26031,8 +26041,8 @@ class ChecklistUiReviewCardTests(_DataRootsIsolatedTestMixin, unittest.TestCase)
         self.assertIn('ui.get("table_word_wrap", True)', normalize_source)
         draw_source = inspect.getsource(velox.Panels._draw_appearance_settings_content)
         self.assertIn('bool(ui.get("table_word_wrap", True))', draw_source)
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -26287,8 +26297,8 @@ class InferenceYieldAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertIn("del_rect = Rect(rr.x + rr.w - del_size - 8", source)
 
     def test_rejects_unsupported_schema_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -26551,7 +26561,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "tool_name": "skills_load",
                 "provider_tool_call": provider_call,
                 "result": {
-                    "schema": "velox_loaded_skills.v1",
+                    "schema": velox.data_schema('velox_loaded_skills'),
                     "skills": [{"name": "DynamicSkill", "instructions": "DYNAMIC_SKILL_SENTINEL"}],
                 },
             }]
@@ -26633,7 +26643,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             )
 
     def test_strict_data_model_rejects_unsupported_root_without_migration(self) -> None:
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -26702,9 +26712,9 @@ class WindowsCommandAndCompactionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         self.assertNotIn('"Reasoning outcome: " + reasoning', production)
 
     def test_rejects_unsupported_schema_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -26942,9 +26952,9 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertTrue(any("selected chat was deleted" in text.lower() for text in renderer.text))
 
     def test_rejects_unsupported_schema_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -27080,9 +27090,9 @@ class ToolRowIdentityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("Internal tool-row placeholders are owned exclusively by Velox", source)
 
     def test_rejects_unsupported_schema_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -27432,9 +27442,9 @@ class ReviewerReliabilitySecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('FINAL RESPONSE: exactly one unwrapped JSON object', velox.REVIEWER_SYSTEM_PROMPT)
         self.assertIn('Then emit this final non-empty line, with nothing after it:\n$$AGENT_PROGRESS: {"message":"Independent Checklist Review complete","percent":100}', velox.REVIEWER_SYSTEM_PROMPT)
         self.assertIn('final non-empty line, with nothing after it', velox.REVIEWER_SYSTEM_PROMPT)
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -27804,9 +27814,9 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
                     await client.chat_completions_once_full(dataclasses.replace(request, stream=False))
 
     def test_rejects_unsupported_schema_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -28109,9 +28119,9 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             asyncio.run(scenario(Path(td)))
 
     def test_rejects_unsupported_schema_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
@@ -28964,7 +28974,7 @@ class CompactionIntegrityTests(_AsyncRuntimeFixture):
             {"role": "system", "content": "Original system"},
             {"role": "user", "content": "Original task"},
             {"role": "assistant", "content": "", "tool_calls": [skill_call]},
-            {"role": "tool", "tool_call_id": "load-skill", "content": '{"schema":"velox_loaded_skills.v1","content":"EXACT DYNAMIC INSTRUCTIONS"}'},
+            {"role": "tool", "tool_call_id": "load-skill", "content": json.dumps({"schema": velox.data_schema("velox_loaded_skills"), "content": "EXACT DYNAMIC INSTRUCTIONS"})},
             *[{"role": "assistant", "content": f"Interim note {i}"} for i in range(12)],
             {"role": "assistant", "content": "", "tool_calls": [source_call]},
             {"role": "tool", "tool_call_id": "read-source", "content": "int exact_api(int count);"},
@@ -32780,7 +32790,12 @@ class RealLoopbackCancellationTests(_AsyncRuntimeFixture):
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent)
         env["VELOX_NEGATIVE_CONTROL"] = "1"
         proc = subprocess.Popen(
-            [sys.executable, "-c", "import test_velox as t; t._run_negative_control_child()"],
+            [sys.executable, "-c",
+             "import importlib.util, sys; "
+             "s=importlib.util.spec_from_file_location('test_velox', sys.argv[1]); "
+             "t=importlib.util.module_from_spec(s); sys.modules['test_velox']=t; "
+             "s.loader.exec_module(t); t._run_negative_control_child()",
+             str(Path(__file__).resolve())],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True,
         )
         try:
@@ -34436,7 +34451,7 @@ class RecoveryEdgeTests(_AsyncRuntimeFixture):
     def test_bad_calibration_entry_is_repaired_by_next_valid_sample(self) -> None:
         profile=self.llm.resolve_endpoint(self.eid);profile['_request_capacity']={'base_complete_tokens':100000}
         path=self.paths.app_json_path.parent/'endpoint_token_calibration.json'
-        path.write_text(json.dumps({'schema':'endpoint_token_calibration.v1','endpoints':{velox._endpoint_token_calibration_key(profile):{'multiplier':'broken'}}}))
+        path.write_text(json.dumps({'schema':velox.data_schema('endpoint_token_calibration'),'endpoints':{velox._endpoint_token_calibration_key(profile):{'multiplier':'broken'}}}))
         self.assertEqual(velox.endpoint_token_estimate_multiplier(self.llm.resolve_endpoint(self.eid)),1.0)
         velox.observe_endpoint_prompt_usage(self.storage,profile,{'prompt_tokens':120000})
         self.assertAlmostEqual(velox.endpoint_token_estimate_multiplier(self.llm.resolve_endpoint(self.eid)),1.26)
@@ -35496,9 +35511,9 @@ class ToolFeedbackTests(_AsyncRuntimeFixture):
         self.assertTrue(any(row.get("tool_calls") == native["tool_calls"] for row in replay))
 
     def test_strict_root_rejects_unsupported_without_migration(self) -> None:
-        self.assertEqual(velox.APP_VERSION, "velox.v303")
-        self.assertEqual(velox.DATA_FILE_VERSION, "v303")
-        self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
+        self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
+        self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
+        self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         path = self.paths.app_json_path
         original = json.loads(path.read_text(encoding="utf-8"))
         original["schema"] = "velox_app.v287"
@@ -38944,7 +38959,7 @@ class ChecklistRenderingTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
         self.assertTrue(all(a != b for a, b in zip(colors, colors[1:])))
 
     def test_current_version_and_schema_reject_previous_roots(self) -> None:
-        self.assertEqual(velox.SOURCE_REVISION, '303'); self.assertEqual(velox.DATA_FILE_VERSION, 'v303')
+        self.assertEqual(velox.SOURCE_REVISION, str(velox.CURRENT_VERSION)); self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td))); storage.ensure_first_run_files()
             app = velox.read_json(storage.paths.app_json_path)
@@ -39456,7 +39471,7 @@ class ChecklistDurabilityTests(_NestedChecklistFixture):
 
     def test_direct_claims_of_verified_state_cannot_be_imported_from_mirror(self) -> None:
         cid=self.create(); adapter=velox.ExpertModeStore.for_chat(self.storage,self.chat_id)
-        adapter.path.write_text(json.dumps({'schema':'expert_mode_state.v303','requirements':[{'id':'R1','status':'verified'}]}),encoding='utf-8')
+        adapter.path.write_text(json.dumps({'schema':velox.data_schema('expert_mode_state'),'requirements':[{'id':'R1','status':'verified'}]}),encoding='utf-8')
         self.assertEqual(adapter.load()['requirements'][0]['status'],'not_started')
         self.assertEqual(self.status(cid)['counts']['verified'],0)
 
@@ -40526,7 +40541,7 @@ class ChecklistToggleTests(_StorageFixture):
             with self.subTest(previous=version):
                 previous=copy.deepcopy(raw); previous['schema']='chat.'+version; previous['data_version']=version
                 with self.assertRaises(velox.UnsupportedDataVersionError): velox.validate_chat_record(previous)
-        self.assertEqual(velox.SOURCE_REVISION,'303')
+        self.assertEqual(velox.SOURCE_REVISION,str(velox.CURRENT_VERSION))
 
     def test_disabled_create_is_rejected_before_any_checklist_files_exist(self) -> None:
         self.chats.set_chat_feature(velox.APP_SCOPE_ID,self.cid,'checklists_enabled',False)
@@ -40799,7 +40814,7 @@ def _browser_diagnostic_storm(*, unique: bool = False, records: int = 500) -> di
         "ok": False, "status": "failed", "tool_name": "browser_demo_playback",
         "tool_call_id": "executed-browser-1", "provider_tool_call_id": "provider-browser-1",
         "result": {
-            "schema": "browser_demo_playback.v303", "success": False, "diagnosticsClean": False,
+            "schema": velox.data_schema("browser_demo_playback"), "success": False, "diagnosticsClean": False,
             "browserExitCode": 0, "consoleErrorCount": records, "capturedErrorCount": 100,
             "target": "file:///workspace/doom.html", "events": {"console": console, "exceptions": exceptions},
             "page": {"capturedErrors": [copy.deepcopy(detail) for _ in range(100)], "title": "Doom test"},
@@ -40914,7 +40929,7 @@ class ContextStormTests(_AsyncRuntimeFixture):
                 {'role': 'user', 'content': 'Exact task' if agent else 'Build the requested game.'}]
         rows += [{'role': 'assistant', 'content': f'Observed checkpoint {i}. ' + 'Source inspected. ' * 500} for i in range(18)]
         rows += [{'role': 'assistant', 'tool_calls': [_make_test_provider_call('load-skill', 'skills_load', {'names': ['General Programming']})]},
-                 {'role': 'tool', 'tool_call_id': 'load-skill', 'content': '{"schema":"velox_loaded_skills.v1","content":"EXACT DYNAMIC INSTRUCTIONS"}'},
+                 {'role': 'tool', 'tool_call_id': 'load-skill', 'content': json.dumps({"schema": velox.data_schema("velox_loaded_skills"), "content": "EXACT DYNAMIC INSTRUCTIONS"})},
                  {'role': 'user', 'content': 'Fix visible rendering. Literal <think>example</think> must remain exact.'},
                  {'role': 'assistant', 'content': None, 'tool_calls': [_make_test_provider_call('provider-browser-1', 'browser_demo_playback', {'target': 'doom.html', 'events': []})]},
                  {'role': 'tool', 'tool_call_id': 'provider-browser-1', 'content': json.dumps(_browser_diagnostic_storm())}]
@@ -41729,7 +41744,7 @@ class AgentRetrievalTests(_AsyncRuntimeFixture):
         with self.assertRaises(velox.UnsupportedDataVersionError):velox.validate_agent_record(old)
         oldchat=self.chats.load_chat(self.cid);oldchat['schema']='chat.v300';oldchat['data_version']='v300'
         with self.assertRaises(velox.UnsupportedDataVersionError):velox.validate_chat_record(oldchat)
-        self.assertEqual(velox.SOURCE_REVISION,'303')
+        self.assertEqual(velox.SOURCE_REVISION,str(velox.CURRENT_VERSION))
 
 
 class AgentDeliveryTests(_AsyncRuntimeFixture):
@@ -43083,9 +43098,9 @@ class ReleaseSchemaTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
             turn['schema'] = 'chat_turn.v301'
             with self.assertRaises(velox.UnsupportedDataVersionError):
                 velox.validate_chat_turn_record(turn, chat['chat_id'])
-            self.assertEqual(velox.APP_SCHEMA, 'velox_app.v303')
-            self.assertEqual(velox.AGENT_SCHEMA, 'agent.v303')
-            self.assertEqual(velox.SOURCE_REVISION, '303')
+            self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
+            self.assertEqual(velox.AGENT_SCHEMA, velox.data_schema('agent'))
+            self.assertEqual(velox.SOURCE_REVISION, str(velox.CURRENT_VERSION))
 
 
 
@@ -43522,7 +43537,7 @@ class AttachmentManagerTests(_AttachmentUiFixture, unittest.TestCase):
             with self.assertRaises(velox.UnsupportedDataVersionError): validator(record)
         turn['schema'] = 'chat_turn.v302'
         with self.assertRaises(velox.UnsupportedDataVersionError): velox.validate_chat_turn_record(turn, self.cid)
-        self.assertEqual(velox.ATTACHMENT_SCHEMA, 'attachment.v303')
+        self.assertEqual(velox.ATTACHMENT_SCHEMA, velox.data_schema('attachment'))
 
 
 class AttachmentPreviewWorkerTests(_AttachmentUiFixture, unittest.TestCase):
@@ -44161,6 +44176,373 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
         self.user('Second')
         self.assertPrefix(before, self.messages())
         self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(self.cid), self.eid)
+
+
+class UnifiedReleaseVersionTests(_StorageFixture):
+    def test_current_and_supported_data_generation_are_310(self) -> None:
+        self.assertEqual(velox.CURRENT_VERSION, 310)
+        self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 310)
+        self.assertEqual(velox.APP_VERSION, 'velox.v310')
+        self.assertEqual(velox.SOURCE_REVISION, '310')
+        self.assertEqual(velox.DATA_FILE_VERSION, 'v310')
+
+    def test_all_exported_schema_constants_share_data_generation(self) -> None:
+        schemas = {name: value for name, value in vars(velox).items()
+                   if name.endswith('_SCHEMA') and isinstance(value, str)}
+        self.assertGreater(len(schemas), 30)
+        for name, value in schemas.items():
+            with self.subTest(name=name):
+                self.assertTrue(value.endswith('.v310'), value)
+        self.assertEqual(velox.AGENT_ROLE_SIDECAR_FILENAME, 'agent_role.v310.json')
+
+    def test_no_internal_schema_literal_has_its_own_version(self) -> None:
+        # Future releases must change the two generation constants, not dozens of tags.
+        literals = [node.value for node in ast.walk(ast.parse(application_source()))
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        independent = [value for value in literals if re.fullmatch(r'[a-z_][a-z_0-9.]*\.v[0-9]+', value)]
+        self.assertEqual(independent, [])
+
+    def test_compatible_application_bump_does_not_change_data_format(self) -> None:
+        with mock.patch.object(velox, 'CURRENT_VERSION', 311):
+            self.assertEqual(velox.data_schema('chat'), 'chat.v310')
+            self.assertEqual(velox.data_schema('web_visible_content'), 'web_visible_content.v310')
+
+    def test_old_and_future_chat_generations_are_rejected_without_rewriting(self) -> None:
+        original = self.chats.load_chat(self.cid)
+        for generation in (301, 303, 304, 309, 311):
+            row = copy.deepcopy(original)
+            row['schema'] = f'chat.v{generation}'
+            row['data_version'] = f'v{generation}'
+            before = copy.deepcopy(row)
+            with self.subTest(generation=generation), self.assertRaises(velox.UnsupportedDataVersionError):
+                velox.validate_chat_record(row)
+            self.assertEqual(row, before)
+        self.assertEqual(self.chats.load_chat(self.cid), original)
+
+
+class ShellExecutionGuidanceRegressionTests(_AsyncRuntimeFixture):
+    async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        call = self.tools.convert_openai_tool_call(_make_test_provider_call(velox.uuid_v4(), 'shell_exec', arguments))
+        return await self.tools.execute_tool_call(velox.APP_SCOPE_ID, call, chat_id=self.cid, endpoint_profile_id=self.eid)
+
+    def test_cwd_is_optional_in_schema_and_positional_contract(self) -> None:
+        definition = self.tools.tools['shell_exec']
+        self.assertEqual(definition.parameters['required'], ['command', 'timeout_minutes'])
+        self.assertEqual(definition.parameters['properties']['cwd']['type'], 'string')
+        self.assertEqual(tuple(a.name for a in definition.positional_arguments), ('command', 'timeout_minutes', 'cwd'))
+
+    def test_host_guidance_is_specific_and_does_not_use_inference_host(self) -> None:
+        windows = velox.shell_execution_guidance(windows=True)
+        linux = velox.shell_execution_guidance(windows=False)
+        self.assertTrue(windows.startswith('Execution host: Windows'))
+        self.assertIn("NOT the inference server's Linux shell", windows)
+        self.assertTrue(linux.startswith('Execution host: POSIX'))
+        self.assertIn('/bin/sh, not necessarily Bash', linux)
+        self.assertIn('INITIAL process directory', windows)
+        self.assertIn('Calls start fresh', windows)
+
+    def test_windows_rejects_bash_and_powershell_syntax_before_execution(self) -> None:
+        for command in ('python <<EOF\nprint(1)\nEOF', 'export TOKEN=value && git status', '$env:TOKEN="value" && git status'):
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, 'cmd.exe'):
+                velox.validate_shell_command_for_platform(command, windows=True)
+
+    def test_windows_rejects_same_line_set_percent_expansion(self) -> None:
+        for command in ('set TOKEN=example && echo %TOKEN%', 'set "TOKEN=example" && git -c key=%TOKEN% status',
+                        '@SET Token=example && echo "%token%"', 'set "TOKEN=a&&b" && echo %TOKEN%'):
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, 'expands %VAR% before'):
+                velox.validate_shell_command_for_platform(command, windows=True)
+
+    def test_windows_allows_quoted_payloads_and_explicit_other_shells(self) -> None:
+        commands = ('echo "x <<EOF export A=b $env:A=c"', 'echo ^<^<EOF',
+                    'powershell -NoProfile -Command "$env:A=1; Write-Output $env:A"',
+                    'set "TOKEN=a&&b%TOKEN%"', 'set TOKEN=example && echo !TOKEN!',
+                    'set TOKEN=example && call echo %%TOKEN%%', 'set TOKEN=example\necho %TOKEN%',
+                    'git -C "C:/work/my project" status', 'echo first && echo second')
+        for command in commands:
+            with self.subTest(command=command):
+                velox.validate_shell_command_for_platform(command, windows=True)
+
+    def test_posix_syntax_is_not_rejected_as_windows_syntax(self) -> None:
+        for command in ('export X=x; printf "%s" "$X"', "python <<'EOF'\nprint(1)\nEOF"):
+            velox.validate_shell_command_for_platform(command, windows=False)
+        for windows in (False, True):
+            with self.assertRaisesRegex(ValueError, 'NUL'):
+                velox.validate_shell_command_for_platform('echo a\x00b', windows=windows)
+
+    async def test_explicit_cwd_and_command_are_forwarded_exactly(self) -> None:
+        folder = Path(self.temp.name) / 'repo with spaces'
+        folder.mkdir()
+        command = 'git status --short'
+        async def run(ctx: Any, actual: Any, **kwargs: Any) -> Any:
+            self.assertEqual(actual, command)
+            self.assertTrue(_paths_equivalent(kwargs['cwd'], folder))
+            self.assertTrue(kwargs['shell'])
+            self.assertEqual(kwargs['timeout_seconds'], 60)
+            return subprocess.CompletedProcess(actual, 0, 'clean\n', '')
+        with mock.patch.object(velox, 'run_cancellable_subprocess', side_effect=run):
+            result = await self.execute({'command': command, 'cwd': str(folder), 'timeout_minutes': 1})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['result']['cwd_scope'], 'initial_process_directory')
+        self.assertIn('cd and git -C', result['result']['cwd_note'])
+
+    async def test_missing_or_relative_cwd_fails_without_creating_or_running(self) -> None:
+        missing = Path(self.temp.name) / 'missing'
+        with mock.patch.object(velox, 'run_cancellable_subprocess') as run:
+            for cwd in ('relative/subdir', str(missing)):
+                result = await self.execute({'command': 'echo unsafe', 'cwd': cwd, 'timeout_minutes': 1})
+                self.assertFalse(result['ok'], result)
+            run.assert_not_called()
+        self.assertFalse(missing.exists())
+
+    async def test_default_workspace_remains_the_default(self) -> None:
+        with mock.patch.object(velox, 'run_cancellable_subprocess', return_value=subprocess.CompletedProcess('echo ok', 0, 'ok', '')) as run:
+            result = await self.execute({'command': 'echo ok', 'timeout_minutes': 1})
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(_paths_equivalent(run.call_args.kwargs['cwd'], self.paths.chat_workspace_dir(self.cid)))
+
+    async def test_git_not_checkout_hint_preserves_failure_and_initial_directory(self) -> None:
+        with mock.patch.object(velox, 'run_cancellable_subprocess', return_value=subprocess.CompletedProcess('git status', 128, '', 'fatal: not a git repository')):
+            result = await self.execute({'command': 'git status', 'timeout_minutes': 1})
+        self.assertFalse(result['ok'], result)
+        self.assertEqual(result['result']['returncode'], 128)
+        self.assertIn('does not show that cd failed', result['result']['hint'])
+        self.assertIn('do not initialize or overwrite', result['result']['hint'])
+
+    async def test_actual_process_uses_cwd_and_cd_does_not_persist(self) -> None:
+        folder = Path(self.temp.name) / 'chosen folder'; folder.mkdir()
+        second = folder / 'nested'; second.mkdir()
+        command = 'cd nested && cd' if os.name == 'nt' else 'cd nested && pwd'
+        result = await self.execute({'command': command, 'cwd': str(folder), 'timeout_minutes': 1})
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(_paths_equivalent(Path(result['result']['stdout'].strip()), second))
+        self.assertTrue(_paths_equivalent(Path(result['result']['cwd']), folder))
+        result2 = await self.execute({'command': 'cd' if os.name == 'nt' else 'pwd', 'cwd': str(folder), 'timeout_minutes': 1})
+        self.assertTrue(result2['ok'], result2)
+        self.assertTrue(_paths_equivalent(Path(result2['result']['stdout'].strip()), folder))
+
+
+class ReaderAgentRegressionTests(_AsyncRuntimeFixture):
+    async def reader(self, **extra: Any) -> dict[str, Any]:
+        self.tools.bind_agent_runtime(self.aruntime)
+        args = {'task': 'Read the specified sources and return cited findings.', 'agent_subtype': 'reader',
+                'parent_objective': 'Summarize current reporting', 'global_constraints': 'Read only; cite dates', **extra}
+        native = _make_test_provider_call(velox.uuid_v4(), 'agents_start', args)
+        call = self.tools.convert_openai_tool_call(native)
+        with mock.patch.object(self.aruntime, 'start_agent') as start:
+            result = await self.tools.execute_tool_call(velox.APP_SCOPE_ID, call, chat_id=self.cid, endpoint_profile_id=self.eid)
+        self.assertTrue(result['ok'], result)
+        aid = result['result']['agent_id']
+        start.assert_called_once_with(aid)
+        return self.agents.load_agent(aid)
+
+    async def test_native_reader_creation_keeps_endpoint_constraints_and_read_only_flags(self) -> None:
+        chosen = velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, chosen)
+        original_flags = copy.deepcopy(self.chats.get_chat_tool_features(self.cid))
+        agent = await self.reader()
+        self.assertEqual(agent['endpoint_profile_id'], chosen)
+        self.assertEqual(agent['context_window_tokens'], 262144)
+        self.assertFalse(agent['tool_features']['checklists_enabled'])
+        self.assertFalse(agent['tool_features']['agent_tools_enabled'])
+        self.assertEqual(self.chats.get_chat_tool_features(self.cid), original_flags)
+        role = velox.AgentRoleStore(self.storage).load(agent['agent_id'])
+        self.assertEqual(role['subtype'], 'reader')
+        self.assertEqual(role['parent_objective'], 'Summarize current reporting')
+        self.assertEqual(role['global_constraints'], 'Read only; cite dates')
+
+    async def test_reader_schema_excludes_execution_mutation_and_recursive_delegation(self) -> None:
+        agent = await self.reader()
+        names = {row['function']['name'] for row in self.aruntime._native_tools_for_agent(agent)}
+        for name in ('web_search', 'web_fetch_visible_content', 'fs_read', 'doc_read', 'skills_load'):
+            self.assertIn(name, names)
+        for name in ('shell_exec', 'python_exec', 'fs_write', 'drive_upload', 'agents_start', 'verify_checklist', 'calendar_event_create'):
+            self.assertNotIn(name, names)
+        self.assertTrue({n.lower() for n in names}.issubset(velox._READER_TOOL_NAMES))
+        registered = {n.lower() for n in self.tools.tools}
+        self.assertTrue(velox._READER_TOOL_NAMES.issubset(registered), velox._READER_TOOL_NAMES - registered)
+        self.assertFalse(velox._role_allows_tool('reader', 'future_unknown_tool'))
+        self.assertTrue(velox._role_allows_tool('reader', 'image_analyze_3D_scene'))
+
+    async def test_reader_does_not_restore_disabled_parent_web_permission(self) -> None:
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'web_tools_enabled', False)
+        agent = await self.reader()
+        names = {row['function']['name'] for row in self.aruntime._native_tools_for_agent(agent)}
+        self.assertNotIn('web_search', names)
+        self.assertIn('fs_read', names)
+        with self.assertRaises(PermissionError):
+            self.tools._prepare_tool_execution('web_search', {'query': 'news'}, self.cid, agent['agent_id'], self.eid)
+
+    async def test_unadvertised_reader_mutation_call_is_blocked_before_handler(self) -> None:
+        agent = await self.reader()
+        target = self.paths.chat_workspace_dir(self.cid) / 'should-not-exist.txt'
+        call = self.tools.convert_openai_tool_call(_make_test_provider_call('forged-reader-write', 'fs_write', {'path': str(target), 'content': 'bad'}))
+        result = await self.tools.execute_tool_call(velox.APP_SCOPE_ID, call, chat_id=self.cid, agent_id=agent['agent_id'], endpoint_profile_id=self.eid)
+        self.assertFalse(result['ok'], result)
+        self.assertIn('reader', result['error'])
+        self.assertFalse(target.exists())
+        for name in ('shell_exec', 'python_exec', 'agents_start', 'calendar_event_create'):
+            with self.subTest(name=name), self.assertRaisesRegex(PermissionError, 'reader'):
+                self.tools._prepare_tool_execution(name, {}, self.cid, agent['agent_id'], self.eid)
+
+    async def test_corrupt_reader_role_fails_closed_instead_of_becoming_general(self) -> None:
+        agent = await self.reader()
+        velox.AgentRoleStore(self.storage).path(agent['agent_id']).write_text('{broken', encoding='utf-8')
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            self.aruntime._native_tools_for_agent(agent)
+        with self.assertRaises((ValueError, json.JSONDecodeError)):
+            self.tools._prepare_tool_execution('shell_exec', {'command': 'echo bad', 'timeout_minutes': 1}, self.cid, agent['agent_id'], self.eid)
+        failed = dict(agent, status='failed', failure_message='Invalid role sidecar')
+        report = self.runtime._agent_report_turn_payload(failed, 'terminal')
+        self.assertEqual(report['status'], 'failed')
+        self.assertIn('Invalid role sidecar', report['result_text'])
+
+    async def test_reader_prompt_has_contract_without_checklist_workflow(self) -> None:
+        agent = await self.reader()
+        prompt = self.aruntime.build_standard_system_prompt(agent)
+        for fragment in ('AGENT SUBTYPE: READER', '1,200 words', 'source URLs', 'publication and event dates', 'Summarize current reporting', 'Read only; cite dates'):
+            self.assertIn(fragment, prompt)
+        self.assertNotIn('Use one Checklist for a large or complex task', prompt)
+
+    def test_general_agent_keeps_explicit_objective_and_constraints(self) -> None:
+        agent = self.agent()
+        velox.AgentRoleStore(self.storage).save(agent['agent_id'], {'subtype': 'general', 'parent_objective': 'Only inspect the named module', 'global_constraints': 'Never edit the public API'})
+        prompt = self.aruntime.build_standard_system_prompt(agent)
+        self.assertIn('Only inspect the named module', prompt)
+        self.assertIn('Never edit the public API', prompt)
+
+    async def test_reader_report_is_bounded_but_full_result_is_preserved(self) -> None:
+        agent = await self.reader()
+        text = 'a' * 16000 + ' IMPORTANT END'
+        agent = self.agents.update_agent(agent['agent_id'], {'status': 'succeeded', 'final_output': text})
+        payload = self.runtime._agent_report_turn_payload(agent, 'terminal')
+        self.assertTrue(payload['result_truncated'])
+        self.assertEqual(payload['result_next_offset'], 12000)
+        self.assertEqual(payload['result_total_chars'], len(text))
+        self.assertLess(len(payload['result_text']), 12500)
+        self.assertIn('offset=12000', payload['result_text'])
+        self.assertEqual(self.agents.load_agent(agent['agent_id'])['final_output'], text)
+
+    def test_general_report_limit_is_unchanged(self) -> None:
+        agent = self.agents.update_agent(self.agent()['agent_id'], {'status': 'succeeded', 'final_output': 'a' * 16000})
+        payload = self.runtime._agent_report_turn_payload(agent, 'terminal')
+        self.assertFalse(payload['result_truncated'])
+        self.assertEqual(len(payload['result_text']), 16000)
+
+    async def test_reader_tool_loop_keeps_bulk_source_out_of_parent_history(self) -> None:
+        self.user('Summarize the named page, using a reader.')
+        before = copy.deepcopy(self.messages())
+        agent = await self.reader()
+        article = '<html><body><article>' + ('BULK_ONLY_IN_READER ' * 900) + '</article></body></html>'
+        requests = []
+        async def response(request: velox.LLMRequest) -> dict[str, Any]:
+            requests.append(copy.deepcopy(request))
+            if len(requests) == 1:
+                return {'text': '', 'tool_calls': [_make_test_provider_call('reader-fetch', 'web_fetch_visible_content', {'url': 'https://example.org/article'})], 'usage': {}, 'finish_reason': 'tool_calls'}
+            return {'text': 'Compact finding, source https://example.org/article.\n$$AGENT_PROGRESS: {"message":"Done","percent":100}', 'usage': {}, 'finish_reason': 'stop'}
+        with mock.patch.object(self.aruntime, '_agent_full_response', side_effect=response), \
+             mock.patch.object(velox.WebTools, '_urlopen_download', return_value=(article.encode(), 'text/html', 'https://example.org/article')):
+            await asyncio.wait_for(self.aruntime._run_agent(agent['agent_id']), 10)
+        completed = self.agents.load_agent(agent['agent_id'])
+        self.assertEqual(completed['status'], 'succeeded', completed)
+        self.assertGreaterEqual(len(requests), 2)
+        self.assertIn('BULK_ONLY_IN_READER', json.dumps(requests[-1].messages))
+        payload = self.runtime._agent_report_turn_payload(completed, 'terminal')
+        self.assertIn('Compact finding', payload['result_text'])
+        self.assertNotIn('BULK_ONLY_IN_READER', payload['instruction'])
+        self.assertPrefix(before, self.messages())
+        self.assertNotIn('BULK_ONLY_IN_READER', json.dumps(self.messages()))
+        self.assertPrefix(requests[0].messages, requests[1].messages)
+
+
+class DelegationAndSourceRegressionTests(_AsyncRuntimeFixture):
+    def test_news_routing_is_early_explicit_and_applies_to_loaded_skills(self) -> None:
+        self.user('Get the current news and summarize')
+        prompt = self.messages()[0]['content']
+        self.assertLess(prompt.index('READING-HEAVY DELEGATION'), prompt.index('STREAMLINED ENGINEERING WORKFLOW'))
+        for text in ('agent_subtype="reader" BEFORE', 'current-news briefing', 'not a series of small lookups', 'loaded Skill', 'Use direct tools for small targeted reads'):
+            self.assertIn(text, prompt)
+        for skill in (velox.DEFAULT_NEWS_SKILL_MARKDOWN, velox.DEFAULT_RESEARCH_SKILL_MARKDOWN):
+            self.assertIn('agent_subtype="reader"', skill)
+            self.assertIn('agents_start', skill)
+
+    def test_disabled_agents_do_not_get_unavailable_reader_instructions(self) -> None:
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'agent_tools_enabled', False)
+        self.user('Read the page')
+        prompt = self.messages()[0]['content']
+        self.assertNotIn('READING-HEAVY DELEGATION', prompt)
+        names = {row['function']['name'] for row in self.tools.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, self.cid)}
+        self.assertNotIn('agents_start', names)
+        self.assertIn('web_fetch_visible_content', names)
+
+    async def test_visible_content_preserves_source_and_redirect_for_citation(self) -> None:
+        tool = velox.WebTools(self.storage)
+        html = b'<html><body><p>Evidence</p><a href="/other">Related</a></body></html>'
+        with mock.patch.object(tool, '_urlopen_download', return_value=(html, 'text/html', 'https://example.org/final')):
+            result = await tool.fetch_visible_content(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid), {'url': 'https://example.org/original'})
+        self.assertEqual(result['url'], 'https://example.org/original')
+        self.assertEqual(result['final_url'], 'https://example.org/final')
+        self.assertIn('Evidence', result['text'])
+        self.assertNotIn('https://example.org/other', result['text'])
+        self.assertFalse(result['includes_links'])
+        self.assertEqual(result['schema'], 'web_visible_content.v310')
+
+    async def test_visible_content_falls_back_to_requested_url_without_redirect(self) -> None:
+        tool = velox.WebTools(self.storage)
+        with mock.patch.object(tool, '_urlopen_download', return_value=(b'Plain evidence', 'text/plain', '')):
+            result = await tool.fetch_visible_content(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid), {'url': 'https://example.org/source'})
+        self.assertEqual(result['final_url'], result['url'])
+
+    async def test_raw_html_limit_error_recommends_visible_content_not_just_higher_limits(self) -> None:
+        tool = velox.WebTools(self.storage)
+        with mock.patch.object(tool, '_urlopen_download', return_value=(b'<html>' + b' ' * 1000 + b'</html>', 'text/html', 'https://example.org/source')), \
+             mock.patch.object(tool, '_extract_max_chars', return_value=200):
+            with self.assertRaisesRegex(ValueError, 'web_fetch_visible_content'):
+                await tool.fetch(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid), {'url': 'https://example.org/source'})
+
+    def test_web_tool_descriptions_reinforce_reader_routing_and_html_distinction(self) -> None:
+        for name in ('web_search', 'web_fetch_visible_content'):
+            self.assertIn('reader', self.tools.tools[name].description)
+        self.assertIn('HTML', self.tools.tools['web_fetch'].description)
+        self.assertIn('web_fetch_visible_content', self.tools.tools['web_fetch'].description)
+
+    async def test_loading_news_skill_does_not_change_frozen_system_prefix(self) -> None:
+        self.user('Get the current news and summarize')
+        before = copy.deepcopy(self.messages())
+        call = self.tools.convert_openai_tool_call(_make_test_provider_call('load-news', 'skills_load', {'names': ['News']}))
+        result = await self.tools.execute_tool_call(velox.APP_SCOPE_ID, call, chat_id=self.cid, endpoint_profile_id=self.eid)
+        self.assertTrue(result['ok'], result)
+        self.user('Continue with that guidance')
+        self.assertPrefix(before, self.messages())
+
+
+class NewChatLabelRegressionTests(_AsyncRuntimeFixture):
+    def test_label_draws_unclipped_at_supported_card_widths_and_font_sizes(self) -> None:
+        for viewport in (400, 560, 1000):
+            for char_width in (8, 11, 15):
+                with self.subTest(viewport=viewport, char_width=char_width):
+                    panel = object.__new__(velox.Panels)
+                    panel.widgets = ChecklistRenderingTests.widgets()
+                    panel.widgets.font.char_w = char_width
+                    panel.state = panel.widgets.state
+                    panel.state.active_chat_id = self.cid
+                    panel.services = SimpleNamespace(storage=self.storage, chats=self.chats)
+                    with mock.patch.object(panel.widgets, 'clipped_text', wraps=panel.widgets.clipped_text) as labels, \
+                         mock.patch.object(panel.widgets, 'dropdown', wraps=panel.widgets.dropdown) as dropdowns:
+                        panel._draw_new_chat_task_settings(velox.Rect(0, 0, viewport, 700))
+                    label_calls = {c.args[1]: c.args[0] for c in labels.call_args_list if c.args[1] in ('Endpoint', 'Subagent')}
+                    self.assertEqual(set(label_calls), {'Endpoint', 'Subagent'})
+                    rectangles = {c.args[0]: c.args[1] for c in dropdowns.call_args_list}
+                    self.assertEqual(label_calls['Endpoint'].w, label_calls['Subagent'].w)
+                    for text, key in (('Endpoint', 'chat.task_setup.endpoint'), ('Subagent', 'chat.task_setup.subagent_endpoint')):
+                        label, drop = label_calls[text], rectangles[key]
+                        self.assertGreaterEqual(label.w, panel.widgets._text_width(text))
+                        self.assertLessEqual(label.x + label.w, drop.x)
+                        self.assertGreater(drop.w, 0)
+                        self.assertLessEqual(drop.x + drop.w, viewport)
+                    drawn = [args[0] for name, args, kwargs in panel.widgets.renderer.drawn if name == 'draw_text']
+                    self.assertIn('Subagent', drawn)
+                    self.assertIn('Endpoint', drawn)
+                    self.assertNotIn('Subag...', drawn)
 
 
 def main() -> None:
