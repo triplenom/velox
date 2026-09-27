@@ -78,6 +78,59 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import velox
 
 
+def _legacy_endpoint_fixture_profiles() -> list[dict[str, Any]]:
+    """Saved custom endpoints remain supported after their default presets retire.
+
+    Only tests explicitly covering these transports install the old presets.
+    Production defaults and inventory tests always use the real current list.
+    """
+    rows = [
+        velox.default_endpoint_profile(velox.DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID,
+            "Qwen 3.6 (vLLM)", timeout_seconds=velox.IMAGE_ANALYSIS_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="http://127.0.0.1:8070/v1/chat/completions", model="model",
+            model_type=velox.ENDPOINT_MODEL_TYPE_QWEN_3_6),
+        velox.default_endpoint_profile(velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
+            "DSV4F 0731 (vLLM)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="http://127.0.0.1:8090/v1/chat/completions", model="model",
+            model_type=velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4),
+        velox.default_endpoint_profile(velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_NOVITA_ENDPOINT_PROFILE_ID,
+            "DSV4F 0731 (Novita)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="https://api.novita.ai/openai/v1/chat/completions", model="deepseek/deepseek-v4-flash",
+            model_type=velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4, provider=velox.ENDPOINT_PROVIDER_NOVITA),
+        velox.default_endpoint_profile(velox.DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID,
+            "GPT 5.6 Sol (OpenAI)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="https://api.openai.com/v1/responses", model_type=velox.ENDPOINT_MODEL_TYPE_GPT_5_6_SOL,
+            provider=velox.ENDPOINT_PROVIDER_OPENAI),
+        velox.default_endpoint_profile(velox.DEFAULT_GPT_5_6_LUNA_ENDPOINT_PROFILE_ID,
+            "GPT 5.6 Luna (OpenAI)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="https://api.openai.com/v1/responses", model_type=velox.ENDPOINT_MODEL_TYPE_GPT_5_6_LUNA,
+            provider=velox.ENDPOINT_PROVIDER_OPENAI),
+    ]
+    kimi = velox.default_endpoint_profile(velox.DEFAULT_KIMI_K3_BASETEN_ENDPOINT_PROFILE_ID,
+        "Kimi K3 (Baseten)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+        base_url="https://inference.baseten.co/v1/chat/completions", model="moonshotai/Kimi-K3",
+        model_type=velox.ENDPOINT_MODEL_TYPE_KIMI_K3, provider=velox.ENDPOINT_PROVIDER_BASETEN)
+    kimi.update(max_output_tokens=4096, temperature=1.0, top_p=0.95,
+                presence_penalty=0.0, frequency_penalty=0.0)
+    rows.append(kimi)
+    return rows
+
+
+def _config_with_legacy_endpoint_fixtures() -> dict[str, Any]:
+    config = velox.default_config()
+    config["llm"]["endpoint_profiles"].extend(_legacy_endpoint_fixture_profiles())
+    return config
+
+
+def _install_legacy_endpoint_fixtures(storage: velox.Storage) -> None:
+    config = storage.load_config()
+    present = {row["id"] for row in config["llm"]["endpoint_profiles"]}
+    missing = [row for row in _legacy_endpoint_fixture_profiles() if row["id"] not in present]
+    if missing:
+        config["llm"]["endpoint_profiles"].extend(missing)
+        storage.write_config(config)
+
+
 def _project_documentation(filename: str) -> str:
     return Path(__file__).with_name(filename).read_text(encoding="utf-8")
 
@@ -586,7 +639,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         llm = config["llm"]
         self.assertEqual(
             set(llm),
-            {"default_profile_id", "endpoint_profiles", "comfy", "stall_detection_minutes"},
+            {"default_profile_id", "default_chat_subagent_profile_id", "endpoint_profiles", "comfy", "stall_detection_minutes"},
         )
         self.assertEqual(llm["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID)
         self.assertEqual(config["chat"], {"auto_compaction_enabled": True})
@@ -1269,6 +1322,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_first_send_snapshots_history_and_locks_endpoint_and_tool_categories(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
+            _install_legacy_endpoint_fixtures(storage)
             history_chat = chats.create_chat("History")
             self._write_chat_summary(paths, history_chat["chat_id"], "- Snapshot context")
             current = chats.create_chat("Current")
@@ -2347,9 +2401,9 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("persistence_enabled", agents["personal_assistant"])
         local = velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)
         self.assertEqual(local["provider"], velox.ENDPOINT_PROVIDER_VLLM)
-        self.assertEqual(local["max_concurrent_requests"], 2)
+        self.assertEqual(local["max_concurrent_requests"], 4)
         self.assertEqual(local["context_window_tokens"], 524_288)
-        novita = velox.endpoint_profile_ref(cfg, velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_NOVITA_ENDPOINT_PROFILE_ID)
+        novita = velox.endpoint_profile_ref(cfg, velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID)
         self.assertEqual(novita["provider"], velox.ENDPOINT_PROVIDER_NOVITA)
         self.assertEqual(novita["max_concurrent_requests"], 4)
         self.assertEqual(cfg["tools"]["chat_max_tool_iterations"], velox.TOOL_CALL_MAX_ITERATIONS)
@@ -2387,6 +2441,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_settings_timeout_minutes_widths_and_endpoint_editor_validation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
+            _install_legacy_endpoint_fixtures(storage)
             panel = velox.Panels.__new__(velox.Panels)
             panel.services = type("ServicesStub", (), {"storage": storage})()
             panel.state = velox.UIState()
@@ -2899,7 +2954,8 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             local_assistant = next(msg for msg in payload["messages"] if msg["role"] == "assistant")
             self.assertEqual(local_assistant["reasoning_content"], "private reasoning")
             self.assertEqual(json.loads(body.decode("utf-8")), payload)
-            self.assertEqual(payload["messages"][0]["content"], "system one\n\nsystem two")
+            self.assertEqual(payload["messages"][0]["content"], "system one")
+            self.assertEqual(payload["messages"][1], {"role": "user", "content": "[Application context]\nsystem two"})
 
             config = storage.load_config()
             novita_secret = "sk_novita_unit_test_123456789"
@@ -10023,9 +10079,9 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
         self.assertEqual(profile["temperature"], 1.0)
         self.assertEqual(profile["top_p"], 0.95)
         labels = {row["label"] for row in config["llm"]["endpoint_profiles"]}
-        self.assertIn("Qwen 3.6 (vLLM)", labels)
+        self.assertNotIn("Qwen 3.6 (vLLM)", labels)
         self.assertIn("Kimi K3 (Novita)", labels)
-        self.assertIn("Kimi K3 (Baseten)", labels)
+        self.assertNotIn("Kimi K3 (Baseten)", labels)
         self.assertNotIn("Kimi K2.6 (vLLM)", labels)
         self.assertNotIn("(Local vLLM)", "\n".join(labels))
 
@@ -10271,7 +10327,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
         self.assertEqual(dsv4f["max_image_inputs_per_prompt"], 256)
         self.assertTrue(velox.endpoint_supports_vision(dsv4f))
         self.assertEqual(dsv4f["image_analysis_context"], "inline")
-        qwen = velox.endpoint_profile_ref(config, velox.DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID)
+        qwen = velox.endpoint_profile_ref(_config_with_legacy_endpoint_fixtures(), velox.DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID)
         self.assertEqual(qwen["label"], "Qwen 3.6 (vLLM)")
         self.assertEqual(qwen["model_type"], velox.ENDPOINT_MODEL_TYPE_QWEN_3_6)
         self.assertEqual(qwen["context_window_tokens"], 98_304)
@@ -10299,7 +10355,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
         velox.validate_agent_settings(config["agents"])
         local = velox.endpoint_profile_ref(config, velox.DEFAULT_ENDPOINT_PROFILE_ID)
         self.assertEqual(local["provider"], velox.ENDPOINT_PROVIDER_VLLM)
-        self.assertEqual(local["max_concurrent_requests"], 2)
+        self.assertEqual(local["max_concurrent_requests"], 4)
         invalid = copy.deepcopy(config["agents"])
         invalid["personal_assistant"]["start_time"] = "25:99"
         with self.assertRaisesRegex(ValueError, "HH:MM"):
@@ -11920,7 +11976,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("Tool execution time", draw_source)
 
     def test_effective_prompt_capacity_and_vllm_overflow_detection(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         profile = velox.endpoint_profile_ref(
             config, velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
         )
@@ -12088,6 +12144,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             paths = velox.AppPaths(root)
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             chats = velox.ChatStore(storage)
             chat = chats.create_chat("Overflow recovery")
             chat_id = str(chat["chat_id"])
@@ -12235,6 +12292,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             chats = velox.ChatStore(storage)
             chat_id = str(chats.create_chat("Agent overflow source")["chat_id"])
             agents = velox.AgentStore(storage)
@@ -12378,6 +12436,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             paths = velox.AppPaths(root)
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             chats = velox.ChatStore(storage)
             chat_id = str(chats.create_chat("Initial exact overflow recovery")["chat_id"])
             config = storage.load_config()
@@ -12452,6 +12511,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             paths = velox.AppPaths(root)
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
             endpoint_id = velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID
@@ -12923,7 +12983,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("Load UI and UX for interface work", velox.DEFAULT_GENERAL_PROGRAMMING_SKILL_MARKDOWN)
 
     def test_deepseek_context_and_qwen_image_timeout_defaults(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         deepseek = velox.endpoint_profile_ref(config, velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID)
         qwen = velox.endpoint_profile_ref(config, velox.DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID)
         self.assertEqual(deepseek["context_window_tokens"], 524_288)
@@ -13264,6 +13324,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             request_messages = [
                 {"role": "assistant", "content": "prior", "reasoning_content": "private prior thought"},
                 {"role": "user", "content": "continue"},
@@ -13347,7 +13408,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('"Max image inputs"', editor)
 
     def test_endpoint_image_budget_and_output_ceiling_are_enforced(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         vision_profiles = [
             profile for profile in velox.endpoint_profiles_from_config(config)
             if velox.endpoint_supports_vision(profile)
@@ -13378,6 +13439,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
 
             five_images = [
@@ -13443,14 +13505,14 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 _build_messages=lambda *_args, **_kwargs: [{"role": "system", "content": "base"}],
                 _estimate_messages_tokens=estimate,
             ),
-            storage=SimpleNamespace(load_config=velox.default_config),
+            storage=SimpleNamespace(load_config=_config_with_legacy_endpoint_fixtures),
         )
         line = panel._chat_context_usage_line([])
         self.assertEqual(line, "Context Used: 10.0%")
         self.assertEqual(observed["messages"][-1], {"role": "user", "content": ""})
         self.assertEqual(
             velox.endpoint_prompt_capacity_tokens_from_config(
-                velox.default_config(), velox.DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID,
+                _config_with_legacy_endpoint_fixtures(), velox.DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID,
             ),
             81_920,
         )
@@ -14561,6 +14623,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_gpt_sol_uses_responses_and_other_endpoints_keep_chat_completions(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             config = storage.load_config()
             gpt = velox.endpoint_profile_ref(config, velox.DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID)
@@ -14586,6 +14649,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_responses_payload_supports_text_images_reasoning_and_function_tools(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             native_tools = [{"type": "function", "function": {
                 "name": "time_now", "description": "Return time",
@@ -14640,6 +14704,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_responses_nonstream_parses_reasoning_text_and_tool_call(self) -> None:
         async def scenario(root: Path) -> None:
             _paths, storage, _chats = _make_test_chat_stack(root)
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             raw = {
                 "id": "resp_1", "model": "gpt-5.6-sol", "status": "completed",
@@ -14675,6 +14740,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_responses_stream_emits_partial_and_final_function_state(self) -> None:
         async def scenario(root: Path) -> None:
             _paths, storage, _chats = _make_test_chat_stack(root)
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             def event(obj: dict[str, Any]) -> bytes:
                 return b"data: " + json.dumps(obj).encode() + b"\n\n"
@@ -14749,23 +14815,22 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
 
     def test_transport_defaults_and_gpt_profiles(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 12)
+        self.assertEqual(len(profiles), 9)
         by_type = {velox.normalize_endpoint_model_type(row.get("model_type")): row for row in profiles}
         self.assertEqual(set(by_type), {
-            velox.ENDPOINT_MODEL_TYPE_QWEN_3_6,
             velox.ENDPOINT_MODEL_TYPE_QWEN_3_8,
             velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
             velox.ENDPOINT_MODEL_TYPE_KIMI_K3,
             velox.ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH,
-            velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4,
             velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
-            velox.ENDPOINT_MODEL_TYPE_GPT_5_6_SOL,
-            velox.ENDPOINT_MODEL_TYPE_GPT_5_6_LUNA,
+            velox.ENDPOINT_MODEL_TYPE_GPT_6_SOL,
+            velox.ENDPOINT_MODEL_TYPE_GPT_6_LUNA,
+            velox.ENDPOINT_MODEL_TYPE_GPT_6_ASTRA,
         })
-        for model_type in velox.ENDPOINT_GPT_5_6_MODEL_TYPES:
+        for model_type in velox.ENDPOINT_GPT_6_MODEL_TYPES:
             profile = by_type[model_type]
             self.assertEqual(velox.endpoint_api_transport(profile), velox.ENDPOINT_API_TRANSPORT_RESPONSES)
-            self.assertEqual(profile["reasoning_effort"], "xhigh")
+            self.assertEqual(profile["reasoning_effort"], velox.endpoint_reasoning_level_default(model_type))
             self.assertEqual(profile["max_output_tokens"], 128000)
             self.assertEqual(profile["max_image_inputs_per_prompt"], 5)
             self.assertEqual(profile["context_window_tokens"], 1050000)
@@ -14821,6 +14886,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_selected_transport_routes_every_model_family(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             deepseek = velox.endpoint_profile_ref(storage.load_config(), velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID)
             deepseek_responses = dict(deepseek, api_transport=velox.ENDPOINT_API_TRANSPORT_RESPONSES)
@@ -14854,6 +14920,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_gpt_responses_reasoning_is_model_specific(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             custom_gpt54 = velox.default_endpoint_profile(
                 "endpoint-test-gpt-5-4", "Custom GPT 5.4", timeout_seconds=60,
@@ -16023,9 +16090,9 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
 
 
     def test_novita_deepseek_profile_inherits_local_defaults_and_payload(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         profiles = velox.endpoint_profiles_from_config(config)
-        self.assertEqual(len(profiles), 12)
+        self.assertEqual(len(profiles), len(velox.default_endpoint_profiles()) + 6)
         local = velox.endpoint_profile_ref(config, velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID)
         hosted = velox.endpoint_profile_ref(config, velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_NOVITA_ENDPOINT_PROFILE_ID)
         self.assertEqual(hosted["label"], "DSV4F 0731 (Novita)")
@@ -16040,6 +16107,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             request = velox.LLMRequest(
                 velox.APP_SCOPE_ID,
                 velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_NOVITA_ENDPOINT_PROFILE_ID,
@@ -16074,14 +16142,12 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             velox.ENDPOINT_PROVIDER_BASETEN,
         )
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 12)
+        self.assertEqual(len(profiles), 9)
         labels = {str(profile["label"]) for profile in profiles}
         self.assertEqual(labels, {
-            "Qwen 3.6 (vLLM)", "Qwen 3.8 (vLLM)", "Qwen 3.8 Flash Next (vLLM)",
+            "Qwen 3.8 (vLLM)", "Qwen 3.8 Flash Next (vLLM)",
             "Qwen 3.8 Flash (Novita)", "Kimi K3 (Novita)", "GLM 5.3 Flash (Novita)",
-            "Kimi K3 (Baseten)", "DSV4F 0731 (vLLM)", "DSV4F Exp (vLLM)",
-            "DSV4F 0731 (Novita)",
-            "GPT 5.6 Sol (OpenAI)", "GPT 5.6 Luna (OpenAI)",
+            "DSV4F Exp (vLLM)", "OpenAI ChatGPT 6 Luna", "OpenAI ChatGPT 6 Sol", "OpenAI ChatGPT 6 Astra",
         })
         for removed in (
             "GPT 5.2 (OpenAI)", "GPT 5.4 (OpenAI)", "Kimi K2.6 (vLLM)",
@@ -16146,7 +16212,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertIn("tooltip=tooltip", document_source)
 
     def test_baseten_kimi_profile_and_openai_compatible_payload(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         profile = velox.endpoint_profile_ref(config, velox.DEFAULT_KIMI_K3_BASETEN_ENDPOINT_PROFILE_ID)
         self.assertEqual(profile["label"], "Kimi K3 (Baseten)")
         self.assertEqual(profile["provider"], velox.ENDPOINT_PROVIDER_BASETEN)
@@ -16163,6 +16229,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             config = storage.load_config()
             velox.endpoint_profile_ref(
                 config, velox.DEFAULT_KIMI_K3_BASETEN_ENDPOINT_PROFILE_ID,
@@ -16200,6 +16267,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             config = storage.load_config()
             local = velox.endpoint_profile_ref(config, velox.DEFAULT_ENDPOINT_PROFILE_ID)
             local["system_prompt_addon"] = "ENDPOINT FIRST\nsecond endpoint line"
@@ -16396,7 +16464,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
     def test_agent_defaults_and_prompts_keep_percent_estimates_visible(self) -> None:
         cfg = velox.default_config()
         self.assertNotIn("max_concurrent_running", cfg["agents"])
-        self.assertEqual(velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)["max_concurrent_requests"], 2)
+        self.assertEqual(velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)["max_concurrent_requests"], 4)
         with tempfile.TemporaryDirectory() as td:
             paths = velox.AppPaths(Path(td)); storage = velox.Storage(paths); storage.ensure_first_run_files()
             chats = velox.ChatStore(storage); chat = chats.create_chat("Progress estimates")
@@ -16608,7 +16676,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertLessEqual(renderer._text_geometry_cache_bytes, velox.TEXT_GEOMETRY_CACHE_MAX_BYTES)
 
     def test_deepseek_flash_profiles_default_to_512k_context(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         local = velox.endpoint_profile_ref(
             config, velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
         )
@@ -17216,7 +17284,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertIn("persisted schemas", velox.__doc__ or "")
         self.assertEqual(velox.DATA_FILE_VERSION, "v303")
         self.assertEqual(velox.APP_SCHEMA, "velox_app.v303")
-        self.assertEqual(len(velox.default_config()["llm"]["endpoint_profiles"]), 12)
+        self.assertEqual(len(velox.default_config()["llm"]["endpoint_profiles"]), 9)
 
 
 
@@ -17563,6 +17631,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             endpoint_id = velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID
             profile = velox.endpoint_profile_for_id(storage.load_config(), endpoint_id)
@@ -17601,6 +17670,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             endpoint_id = velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID
             profile = velox.endpoint_profile_for_id(storage.load_config(), endpoint_id)
@@ -17674,6 +17744,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
             scheduler = velox.EndpointInferenceScheduler(storage, client.resolve_endpoint, monitor)
@@ -17781,6 +17852,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
             endpoint_id = velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID
@@ -20346,7 +20418,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         return storage, chats, chat
 
     def test_qwen38_profile_reasoning_payload_and_vision_defaults(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         profile = velox.endpoint_profile_ref(config, velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID)
         defaults = velox.endpoint_model_type_defaults(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8)
         self.assertEqual(velox.ENDPOINT_MODEL_TYPE_LABELS[velox.ENDPOINT_MODEL_TYPE_QWEN_3_8], "Qwen 3.8")
@@ -20382,6 +20454,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             request = velox.LLMRequest(
                 scope_id=velox.APP_SCOPE_ID,
@@ -21200,6 +21273,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
             scheduler = velox.EndpointInferenceScheduler(storage, client.resolve_endpoint, monitor)
@@ -21304,6 +21378,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             cancel_event = threading.Event()
 
@@ -21806,6 +21881,7 @@ class StallAndProgressTests(unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
             scheduler = velox.EndpointInferenceScheduler(storage, client.resolve_endpoint, monitor)
@@ -21876,6 +21952,7 @@ class StallAndProgressTests(unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
             scheduler = velox.EndpointInferenceScheduler(storage, client.resolve_endpoint, monitor)
@@ -23564,7 +23641,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertEqual(payload["tool_choice"], "auto")
 
     def test_image_context_defaults_strict_schema_and_editor_control(self) -> None:
-        config = velox.default_config()
+        config = _config_with_legacy_endpoint_fixtures()
         deepseek = velox.endpoint_profile_ref(
             config, velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
         )
@@ -23601,6 +23678,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
+            _install_legacy_endpoint_fixtures(storage)
             updated = storage.load_config()
             velox.endpoint_profile_ref(
                 updated, velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID,
@@ -27416,6 +27494,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
     @staticmethod
     def _responses_client(root: Path) -> tuple[LLMClient, LLMRequest]:
         _paths, storage, _chats = _make_test_chat_stack(root)
+        _install_legacy_endpoint_fixtures(storage)
         return velox.LLMClient(storage), velox.LLMRequest(
             scope_id=velox.APP_SCOPE_ID,
             endpoint_profile_id=velox.DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID,
@@ -31004,8 +31083,8 @@ class GLMFlashProfileTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase)
 
     def test_fresh_root_contains_complete_novita_profile_and_preserves_defaults(self) -> None:
         profiles = velox.endpoint_profiles_from_config(self.storage.load_config())
-        self.assertEqual(len(profiles), 12)
-        self.assertEqual(len({p["id"] for p in profiles}), 12)
+        self.assertEqual(len(profiles), 9)
+        self.assertEqual(len({p["id"] for p in profiles}), 9)
         profile = self.profile()
         expected = {
             "label": "GLM 5.3 Flash (Novita)", "provider": velox.ENDPOINT_PROVIDER_NOVITA,
@@ -31206,7 +31285,8 @@ class GLMFlashRuntimeTests(_AsyncRuntimeFixture):
         self.eid = velox.DEFAULT_GLM_5_3_FLASH_NOVITA_ENDPOINT_PROFILE_ID
         self.chats.set_chat_endpoint_profile_id(self.cid, self.eid)
 
-    async def test_spawned_agent_inherits_glm_endpoint_and_vision(self) -> None:
+    async def test_spawned_agent_uses_explicit_glm_subagent_endpoint_and_vision(self) -> None:
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, self.eid)
         self.user("Use this model for the whole task.")
         self.tools.bind_agent_runtime(self.aruntime)
         ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, endpoint_profile_id=self.eid)
@@ -31368,9 +31448,9 @@ class DeadlinePolicyTests(_AsyncRuntimeFixture):
         self.storage.write_config(cfg)
         return copy.deepcopy(profile)
 
-    def test_all_twelve_bundled_endpoints_and_custom_default_to_fifteen_minutes(self) -> None:
+    def test_all_nine_bundled_endpoints_and_custom_default_to_fifteen_minutes(self) -> None:
         profiles = velox.default_endpoint_profiles() + [velox.endpoint_profile_template()]
-        self.assertEqual(len(profiles), 13)
+        self.assertEqual(len(profiles), 10)
         for profile in profiles:
             self.assertEqual(profile['timeout_seconds'], 900, profile['label'])
             self.assertEqual(profile['error_recovery_attempts'], 10)
@@ -35200,6 +35280,7 @@ class ProviderByteIntegrityTests(_AsyncRuntimeFixture):
     _sse = staticmethod(InferenceProtocolHardeningTests._sse)
 
     def request(self, responses: bool = False) -> LLMRequest:
+        _install_legacy_endpoint_fixtures(self.storage)
         return velox.LLMRequest(velox.APP_SCOPE_ID,
             velox.DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID if responses else self.eid,
             [{"role": "user", "content": "Literal bytes only."}], stream=True)
@@ -35594,7 +35675,7 @@ class EndpointDefaultsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         families = {velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4, velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
                     velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT, velox.ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH}
         profiles = [p for p in velox.default_endpoint_profiles() if p['model_type'] in families]
-        self.assertEqual(len(profiles), 6)
+        self.assertEqual(len(profiles), 4)
         for p in profiles + [velox.endpoint_model_type_defaults(f) for f in sorted(families)]:
             with self.subTest(model=p['model']):
                 self.assertEqual(p['context_window_tokens'], 524288)
@@ -35603,14 +35684,14 @@ class EndpointDefaultsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_profile_inventory_adds_one_unique_endpoint(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 12)
-        self.assertEqual(len({p['id'] for p in profiles}), 12)
+        self.assertEqual(len(profiles), 9)
+        self.assertEqual(len({p['id'] for p in profiles}), 9)
         self.assertEqual(sum(p['model'] == 'qwen/qwen3.8-flash' for p in profiles), 1)
 
     def test_unrelated_qwen_27b_and_kimi_baseten_defaults_unchanged(self) -> None:
         q = velox.endpoint_model_type_defaults(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8)
         self.assertEqual((q['context_window_tokens'], q['max_output_tokens']), (262144, 65536))
-        k = velox.endpoint_profile_ref(velox.default_config(), velox.DEFAULT_KIMI_K3_BASETEN_ENDPOINT_PROFILE_ID)
+        k = velox.endpoint_profile_ref(_config_with_legacy_endpoint_fixtures(), velox.DEFAULT_KIMI_K3_BASETEN_ENDPOINT_PROFILE_ID)
         self.assertEqual(k['max_output_tokens'], 4096)
 
     def test_provider_rate_and_concurrency_defaults_remain_distinct(self) -> None:
@@ -36836,13 +36917,13 @@ class UnifiedEndpointConfigTests(_AsyncRuntimeFixture):
 
     def test_exactly_one_default_selection_in_fresh_config(self) -> None:
         llm = velox.default_config()['llm']
-        self.assertEqual(set(llm), {'default_profile_id', 'endpoint_profiles', 'comfy', 'stall_detection_minutes'})
+        self.assertEqual(set(llm), {'default_profile_id', 'default_chat_subagent_profile_id', 'endpoint_profiles', 'comfy', 'stall_detection_minutes'})
         self.assertEqual(llm['default_profile_id'], velox.DEFAULT_ENDPOINT_PROFILE_ID)
         self.assertEqual(self.chats.get_endpoint_profile_id(), velox.DEFAULT_ENDPOINT_PROFILE_ID)
 
     def test_all_bundled_profiles_have_provider_specific_context_defaults(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 12)
+        self.assertEqual(len(profiles), 9)
         for profile in profiles:
             with self.subTest(endpoint=profile['label']):
                 expected = 'inline' if profile['provider'] == velox.ENDPOINT_PROVIDER_VLLM else 'separate'
@@ -37065,6 +37146,7 @@ class CurrentImageRoutingTests(_AsyncRuntimeFixture):
         self.assertEqual(self.capture.requests, [])
 
     async def test_nonvision_current_endpoint_rejects_both_modes(self) -> None:
+        _install_legacy_endpoint_fixtures(self.storage)
         self.ctx.endpoint_profile_id = velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID
         for mode in ('inline', 'separate'):
             self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, self.ctx.endpoint_profile_id).update(image_analysis_context=mode))
@@ -37158,6 +37240,7 @@ class UnifiedEndpointEditorTests(_AsyncRuntimeFixture):
             self.assertEqual(panel.widgets.clips, [])
 
     def test_nonvision_profile_keeps_editable_context_preference(self) -> None:
+        _install_legacy_endpoint_fixtures(self.storage)
         eid = velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID
         panel = self.panel(eid, {'modal.endpoint.image_analysis_context': 'Separate'})
         panel.draw_modals(velox.Rect(0, 0, 1920, 1080))
@@ -37192,18 +37275,29 @@ class UnifiedEndpointEditorTests(_AsyncRuntimeFixture):
         saved = velox.endpoint_profile_ref(self.storage.load_config(), self.eid)
         self.assertEqual(saved['image_analysis_context'], 'separate')
 
-    def test_endpoints_settings_draw_exactly_one_default_dropdown(self) -> None:
+    def test_endpoints_settings_draw_and_save_separate_chat_and_subagent_defaults(self) -> None:
         panel = self.panel(); panel.state.modal = None
         cfg = panel.state.config_draft
         target = velox.DEFAULT_GLM_5_3_FLASH_NOVITA_ENDPOINT_PROFILE_ID
         _, _, display = panel._endpoint_profile_display_map(cfg)
         panel.widgets.overrides['settings.llm.default_profile_id'] = display[target]
+        worker = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        panel.widgets.overrides['settings.llm.default_chat_subagent_profile_id'] = display[worker]
         panel._draw_endpoints_settings_content(velox.Rect(0, 0, 1280, 2000), cfg)
         controls = [key for key, _, _ in panel.widgets.rows if key.startswith('settings.llm.') and key.endswith('profile_id')]
-        self.assertEqual(controls, ['settings.llm.default_profile_id'])
+        self.assertEqual(controls, ['settings.llm.default_profile_id', 'settings.llm.default_chat_subagent_profile_id'])
         self.assertEqual(cfg['llm']['default_profile_id'], target)
-        height = panel._endpoint_settings_card_heights(1280)[0]
-        self.assertLess(height, 306)
+        self.assertEqual(cfg['llm']['default_chat_subagent_profile_id'], worker)
+        panel._autosave_settings_if_changed(cfg)
+        reloaded = velox.Storage(self.paths).load_config()['llm']
+        self.assertEqual(reloaded['default_profile_id'], target)
+        self.assertEqual(reloaded['default_chat_subagent_profile_id'], worker)
+        rects = {key: rect for key, rect, _ in panel.widgets.rows}
+        first = rects['settings.llm.default_profile_id']
+        second = rects['settings.llm.default_chat_subagent_profile_id']
+        buttons = rects['settings.llm.new_endpoint']
+        self.assertLessEqual(first.y + first.h, second.y)
+        self.assertLessEqual(second.y + second.h, buttons.y)
 
     def test_default_card_description_measurement_matches_draw(self) -> None:
         for method in (velox.Panels._endpoint_settings_card_heights, velox.Panels._draw_endpoints_settings_content):
@@ -37259,7 +37353,7 @@ class UnifiedSystemTests(_AsyncRuntimeFixture):
 
     def test_deleting_unused_default_selects_one_remaining_endpoint(self) -> None:
         target = velox.DEFAULT_GLM_5_3_FLASH_NOVITA_ENDPOINT_PROFILE_ID
-        self.storage.update_config(lambda cfg: cfg['llm'].update(default_profile_id=target))
+        self.storage.update_config(lambda cfg: cfg['llm'].update(default_profile_id=target, default_chat_subagent_profile_id=target))
         before = self.storage.load_config()
         expected = next(p['id'] for p in before['llm']['endpoint_profiles'] if p['id'] != target)
         panel = self.delete_panel(target)
@@ -37268,6 +37362,7 @@ class UnifiedSystemTests(_AsyncRuntimeFixture):
         self.assertFalse(panel.state.modal.get('error'), panel.state.modal)
         config = self.storage.load_config()
         self.assertEqual(config['llm']['default_profile_id'], expected)
+        self.assertEqual(config['llm']['default_chat_subagent_profile_id'], expected)
         self.assertNotIn(target, [p['id'] for p in config['llm']['endpoint_profiles']])
         opened.assert_called_once_with(expected)
 
@@ -40669,6 +40764,7 @@ class ChecklistPolicyRuntimeTests(_AsyncRuntimeFixture):
         self.assertFalse(list(self.paths.agent_dir(agent['agent_id']).glob('checklists_*.json')))
 
     def test_both_wire_transports_exclude_disabled_checklist_schemas(self) -> None:
+        _install_legacy_endpoint_fixtures(self.storage)
         self.disable(); self.user(); messages=self.messages()
         tools=self.tools.build_openai_chat_completion_tools(velox.APP_SCOPE_ID,self.cid)
         for endpoint_id in (self.eid,velox.DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID):
@@ -43534,6 +43630,537 @@ class AttachmentPreviewWorkerTests(_AttachmentUiFixture, unittest.TestCase):
         with mock.patch.object(cache,'get',return_value={'status':'ready','width':1920,'height':1080,'bytes':20}):
             self.reset_input();self.draw_manager()
         self.assertIs(modal['layouts'],layouts)
+
+
+class CurrentEndpointPresetRegressionTests(_AsyncRuntimeFixture):
+    """Real shipped defaults, separate from legacy/custom transport fixtures."""
+    GPT6 = (
+        (velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_LUNA, 'gpt-6-luna', 'xhigh'),
+        (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_SOL, 'gpt-6-sol', 'high'),
+        (velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_ASTRA, 'gpt-6-astra', 'medium'),
+    )
+
+    def test_current_inventory_excludes_all_retired_presets(self) -> None:
+        profiles = velox.default_endpoint_profiles()
+        self.assertEqual(len(profiles), 9)
+        self.assertEqual(len({p['id'] for p in profiles}), 9)
+        retired = {p['id'] for p in _legacy_endpoint_fixture_profiles()}
+        self.assertFalse(retired.intersection(p['id'] for p in profiles))
+        self.assertFalse(any(p['provider'] == velox.ENDPOINT_PROVIDER_BASETEN for p in profiles))
+        self.assertFalse(any('0731' in p['label'] or '5.6' in p['label'] for p in profiles))
+        self.assertIn(velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID, {p['id'] for p in profiles})
+
+    def test_gpt6_model_effort_and_transport_defaults(self) -> None:
+        config = velox.default_config()
+        for eid, family, model, effort in self.GPT6:
+            with self.subTest(model=model):
+                p = velox.endpoint_profile_ref(config, eid)
+                self.assertEqual(p['model_type'], family)
+                self.assertEqual(p['model'], model)
+                self.assertEqual(p['reasoning_effort'], effort)
+                self.assertEqual(p['api_transport'], velox.ENDPOINT_API_TRANSPORT_RESPONSES)
+                self.assertEqual(p['base_url'], 'https://api.openai.com/v1/responses')
+                self.assertEqual(p['label'], 'OpenAI ChatGPT 6 ' + model.rsplit('-', 1)[1].title())
+                self.assertEqual((p['context_window_tokens'], p['max_output_tokens']), (1050000, 128000))
+                self.assertEqual(velox.normalize_endpoint_profile(p), p)
+
+    def test_gpt6_wire_reasoning_is_standard_and_stateless(self) -> None:
+        tools = self.tools.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, self.cid)
+        for eid, _family, model, effort in self.GPT6:
+            with self.subTest(model=model):
+                req = velox.LLMRequest(velox.APP_SCOPE_ID, eid, [{'role': 'system', 'content': 'Fixed instructions'},
+                    {'role': 'user', 'content': 'Inspect'}], native_tools=tools)
+                for stream in (False, True):
+                    _endpoint, url, body, _headers, _timeout, payload = self.llm._payload_and_headers(req, stream=stream)
+                    self.assertEqual(url, 'https://api.openai.com/v1/responses')
+                    self.assertEqual(json.loads(body), payload)
+                    self.assertEqual(payload['model'], model)
+                    self.assertEqual(payload['reasoning'], {'effort': effort, 'summary': 'auto', 'mode': 'standard', 'context': 'all_turns'})
+                    self.assertIs(payload['store'], False)
+                    self.assertIn('reasoning.encrypted_content', payload['include'])
+                    self.assertEqual(payload['instructions'], 'Fixed instructions')
+                    self.assertTrue(payload['tools'])
+                    for field in ('temperature', 'top_p', 'top_logprobs', 'logprobs'):
+                        self.assertNotIn(field, payload)
+
+    def test_gpt6_thinking_strips_incompatible_extra_body_sampling(self) -> None:
+        for eid, _family, _model, _effort in self.GPT6:
+            with self.subTest(endpoint=eid):
+                self.storage.update_config(lambda c: velox.endpoint_profile_ref(c, eid).update(temperature=1.0, top_p=.8,
+                    extra_body_json=json.dumps({'top_logprobs': 5, 'logprobs': True})))
+                req = velox.LLMRequest(velox.APP_SCOPE_ID, eid, [{'role': 'user', 'content': 'Hi'}])
+                payload = self.llm._payload_and_headers(req, stream=False)[-1]
+                self.assertEqual(payload['include'], ['reasoning.encrypted_content'])
+                for key in ('temperature', 'top_p', 'top_logprobs', 'logprobs'):
+                    self.assertNotIn(key, payload)
+
+    def test_gpt6_reasoning_controls_match_each_model(self) -> None:
+        for _eid, family, _model, _effort in self.GPT6:
+            options = {value for value, _ in velox.endpoint_reasoning_level_options(family)}
+            self.assertTrue({'low', 'medium', 'high', 'xhigh', 'max'}.issubset(options))
+            self.assertNotIn('minimal', options)
+            self.assertEqual('none' in options, family != velox.ENDPOINT_MODEL_TYPE_GPT_6_ASTRA)
+
+    def test_gpt6_rejects_incompatible_chat_completions_tools_locally(self) -> None:
+        for eid, _family, _model, _effort in self.GPT6:
+            self.storage.update_config(lambda c: velox.endpoint_profile_ref(c, eid).update(api_transport=velox.ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS))
+            req = velox.LLMRequest(velox.APP_SCOPE_ID, eid, [{'role': 'user', 'content': 'Hi'}],
+                native_tools=[{'type': 'function', 'function': {'name': 'time_now', 'parameters': {'type': 'object', 'properties': {}}}}])
+            with self.subTest(endpoint=eid), self.assertRaisesRegex(ValueError, 'requires the Responses API'):
+                self.llm._payload_and_headers(req, stream=False)
+
+    def test_gpt6_sol_no_reasoning_can_keep_chat_tools_and_sampling(self) -> None:
+        eid = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        self.storage.update_config(lambda c: velox.endpoint_profile_ref(c, eid).update(
+            api_transport=velox.ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS, reasoning_effort='none', temperature=.3, top_p=.7))
+        req = velox.LLMRequest(velox.APP_SCOPE_ID, eid, [{'role': 'user', 'content': 'Hi'}],
+            native_tools=[{'type': 'function', 'function': {'name': 'time_now', 'parameters': {'type': 'object', 'properties': {}}}}])
+        payload = self.llm._payload_and_headers(req, stream=False)[-1]
+        self.assertEqual(payload['reasoning_effort'], 'none')
+        self.assertEqual(payload['temperature'], .3)
+        self.assertEqual(payload['top_p'], .7)
+        self.assertTrue(payload['tools'])
+
+    def test_gpt6_astra_cannot_be_forced_to_none_through_extra_body(self) -> None:
+        eid = velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID
+        with self.assertRaisesRegex(velox.UnsupportedDataVersionError, 'cannot override: reasoning'):
+            self.storage.update_config(lambda c: velox.endpoint_profile_ref(c, eid).update(extra_body_json='{"reasoning":{"effort":"none"}}'))
+        endpoint = self.llm.resolve_endpoint(eid)
+        with self.assertRaisesRegex(ValueError, 'Unsupported GPT-6 reasoning effort'):
+            self.llm._apply_gpt6_request_contract({'reasoning': {'effort': 'none'}}, endpoint,
+                velox.ENDPOINT_PROVIDER_OPENAI, responses=True, reasoning_level='medium')
+
+    def test_exp_concurrency_is_four_without_changing_other_local_profiles(self) -> None:
+        config = velox.default_config()
+        for p in config['llm']['endpoint_profiles']:
+            if p['provider'] == velox.ENDPOINT_PROVIDER_VLLM:
+                with self.subTest(endpoint=p['id']):
+                    self.assertEqual(p['max_concurrent_requests'], 4 if p['id'] == velox.DEFAULT_ENDPOINT_PROFILE_ID else 2)
+        self.assertEqual(config['llm']['default_chat_subagent_profile_id'], velox.DEFAULT_ENDPOINT_PROFILE_ID)
+
+
+class WirePrefixCacheRegressionTests(_AsyncRuntimeFixture):
+    """Compare serialized model input, not just Velox's internal message list."""
+    def payload(self, messages: list[dict[str, Any]], responses: bool, *, tools: list[dict[str, Any]] | None = None,
+                client: velox.LLMClient | None = None) -> dict[str, Any]:
+        eid = velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID if responses else self.eid
+        request = velox.LLMRequest(velox.APP_SCOPE_ID, eid, messages,
+            native_tools=tools if tools is not None else self.tools.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, self.cid))
+        return (client or self.llm)._payload_and_headers(request, stream=True)[-1]
+
+    def assertWirePrefix(self, before: dict[str, Any], after: dict[str, Any], responses: bool) -> None:
+        self.assertEqual(before.get('instructions'), after.get('instructions'))
+        self.assertPrefix(before['input' if responses else 'messages'], after['input' if responses else 'messages'])
+        self.assertEqual(json.dumps(before.get('tools'), ensure_ascii=False, separators=(',', ':')),
+                         json.dumps(after.get('tools'), ensure_ascii=False, separators=(',', ':')))
+
+    def test_append_only_application_context_does_not_rewrite_either_wire_prefix(self) -> None:
+        # One initial instruction, then dated application updates at their actual positions.
+        messages = [{'role': 'system', 'content': '  Immutable system\nUnicode caf\u00e9\n'},
+                    {'role': 'system', 'content': 'DATE: 2026-09-27'},
+                    {'role': 'user', 'content': 'First question'}]
+        for responses in (False, True):
+            with self.subTest(responses=responses):
+                history = copy.deepcopy(messages)
+                previous = self.payload(history, responses)
+                for role, content in [('assistant', 'First answer'), ('system', 'DATE: 2026-09-28'),
+                                      ('developer', 'New calendar facts'), ('system', 'New document facts'),
+                                      ('user', 'Next question')]:
+                    history.append({'role': role, 'content': content})
+                    untouched = copy.deepcopy(history)
+                    current = self.payload(history, responses)
+                    self.assertWirePrefix(previous, current, responses)
+                    self.assertEqual(history, untouched)
+                    previous = copy.deepcopy(current)
+                system = previous.get('instructions') if responses else previous['messages'][0]['content']
+                self.assertEqual(system, messages[0]['content'])
+                self.assertNotIn('New document facts', system)
+
+    def test_endpoint_addon_remains_with_initial_instructions_without_hoisting_later_context(self) -> None:
+        messages = [{"role": "system", "content": "Base instructions"},
+                    {"role": "user", "content": "First user"}]
+        original = copy.deepcopy(messages)
+        for eid in (self.eid, velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID):
+            self.storage.update_config(lambda c: velox.endpoint_profile_ref(c, eid).update(system_prompt_addon="Endpoint instructions"))
+        for responses in (False, True):
+            with self.subTest(responses=responses):
+                before = self.payload(messages, responses)
+                after = self.payload(messages + [{"role": "system", "content": "Later context"},
+                    {"role": "user", "content": "Next user"}], responses)
+                self.assertWirePrefix(before, after, responses)
+                leading = after["instructions"] if responses else after["messages"][0]["content"]
+                self.assertEqual(leading, "Endpoint instructions\n\nBase instructions")
+        self.assertEqual(messages, original)
+
+    def test_no_late_system_message_becomes_leading_instructions(self) -> None:
+        first = [{'role': 'user', 'content': 'User first'}]
+        later = first + [{'role': 'system', 'content': 'Later application update'}, {'role': 'user', 'content': 'Next'}]
+        for responses in (False, True):
+            with self.subTest(responses=responses):
+                self.assertWirePrefix(self.payload(first, responses), self.payload(later, responses), responses)
+
+    def test_tools_arguments_results_reasoning_and_images_remain_identical(self) -> None:
+        calls = [_make_test_provider_call('call-a', 'fs_read', {'path': 'a.txt'}),
+                 _make_test_provider_call('call-b', 'fs_read', {'path': 'b.txt'})]
+        calls[0]['function']['arguments'] = '{ "path" : "a.txt", "literal" : "\\u03c4" }'
+        history = [{'role': 'system', 'content': 'Fixed system'}, {'role': 'user', 'content': 'Read these'},
+            {'role': 'assistant', 'content': '', 'reasoning_content': ' Prior reasoning\n',
+             'reasoning_details': [{'type': 'reasoning.text', 'text': 'opaque details', 'index': 0}], 'tool_calls': calls},
+            {'role': 'tool', 'tool_call_id': 'call-a', 'name': 'fs_read', 'content': ' First raw result\n\u03c4\n'},
+            {'role': 'tool', 'tool_call_id': 'call-b', 'name': 'fs_read', 'content': '{ "literal": "\\n" }'},
+            {'role': 'user', 'content': [{'type': 'text', 'text': 'Image evidence'},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA==', 'detail': 'low'}}]}]
+        original = copy.deepcopy(history)
+        for responses in (False, True):
+            with self.subTest(responses=responses):
+                before = self.payload(history, responses)
+                after = self.payload(history + [{'role': 'system', 'content': 'Context changed'},
+                    {'role': 'assistant', 'content': 'Done'}, {'role': 'user', 'content': 'Continue'}], responses)
+                self.assertWirePrefix(before, after, responses)
+                wire = json.dumps(after, ensure_ascii=False)
+                self.assertIn('call-a', wire); self.assertIn('call-b', wire)
+                self.assertIn('First raw result', wire)
+        self.assertEqual(history, original)
+
+    def test_encrypted_responses_output_items_are_replayed_verbatim_across_turns(self) -> None:
+        output = [{'id': 'rs_123', 'type': 'reasoning', 'encrypted_content': 'opaque-encrypted-reasoning==',
+                   'summary': [{'type': 'summary_text', 'text': 'Brief summary'}]},
+                  {'id': 'fc_123', 'type': 'function_call', 'call_id': 'call123', 'name': 'fs_read',
+                   'arguments': '{  "path": "literal.txt" }', 'status': 'completed'}]
+        history = [{'role': 'system', 'content': 'Fixed'}, {'role': 'user', 'content': 'Read'},
+                   {'role': 'assistant', 'content': '', 'response_output_items': copy.deepcopy(output)},
+                   {'role': 'tool', 'tool_call_id': 'call123', 'content': 'Exact\nresult\n'}]
+        old = self.payload(history, True)
+        new = self.payload(history + [{'role': 'system', 'content': 'Later context'},
+            {'role': 'user', 'content': 'Next'}], True)
+        self.assertWirePrefix(old, new, True)
+        self.assertEqual(old['input'][1:3], output)
+        self.assertEqual(history[2]['response_output_items'], output)
+
+    def test_persisted_chat_snapshots_survive_context_updates_and_restart_on_both_transports(self) -> None:
+        self.user('First durable user text: caf\u00e9')
+        initial = copy.deepcopy(self.messages())
+        call = _make_test_provider_call('persist-call', 'fs_read', {'path': 'large.txt'})
+        turn = velox.make_turn(self.cid, 'assistant', 'Compact result', endpoint_profile_id=self.eid)
+        turn['model_replay_messages'] = [
+            {'role': 'assistant', 'content': 'Reading', 'tool_calls': [call], 'reasoning_content': 'Literal old reasoning'},
+            {'role': 'tool', 'tool_call_id': 'persist-call', 'name': 'fs_read', 'content': 'Exact original result\n'}]
+        self.chats.append_turn(velox.APP_SCOPE_ID, self.cid, turn)
+        self.runtime._append_hidden_application_context_turn(velox.APP_SCOPE_ID, self.cid, self.eid,
+            kind=velox.CHAT_APP_CONTEXT_DOCS_KIND, text='LATER DOCS CONTEXT', fingerprint='snapshot-2')
+        self.user('Next durable request')
+        later = copy.deepcopy(self.messages())
+        self.assertPrefix(initial, later)
+        restart_storage = velox.Storage(self.paths)
+        restart_chats = velox.ChatStore(restart_storage)
+        restart = velox.ChatRuntime(restart_storage, restart_chats, velox.ContextAssembler(self.paths),
+                                   velox.LLMClient(restart_storage), velox.ToolRegistry(restart_storage))
+        reloaded = restart._build_messages(velox.APP_SCOPE_ID, self.cid)
+        self.assertEqual(later, reloaded)
+        for responses in (False, True):
+            with self.subTest(responses=responses):
+                before = self.payload(initial, responses)
+                after = self.payload(later, responses)
+                again = self.payload(reloaded, responses, client=restart.llm)
+                self.assertWirePrefix(before, after, responses)
+                self.assertEqual(after, again)
+
+    async def test_real_context_doc_refresh_changes_only_wire_suffix(self) -> None:
+        class Docs:
+            text = 'FIRST CONTEXT DOCUMENT'
+            def prompt_context(self) -> str:
+                return self.text
+        docs = Docs()
+        self.runtime.context = velox.ContextAssembler(self.paths, context_docs=docs)
+        self.runtime._run_chat = PrefixCacheStabilityTests._no_run
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, 'First', self.eid, [])
+        await asyncio.sleep(0)
+        first = copy.deepcopy(self.messages())
+        docs.text = 'SECOND CONTEXT DOCUMENT'
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, 'Second', self.eid, [])
+        await asyncio.sleep(0)
+        second = self.messages()
+        self.assertIn('SECOND CONTEXT DOCUMENT', json.dumps(second))
+        for responses in (False, True):
+            self.assertWirePrefix(self.payload(first, responses), self.payload(second, responses), responses)
+
+    def test_native_tool_schema_order_stays_stable_across_turns_and_reload(self) -> None:
+        self.user('First')
+        original = self.tools.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, self.cid)
+        self.chats.rename_chat(velox.APP_SCOPE_ID, self.cid, 'Renamed without changing tools')
+        self.user('Second')
+        later = self.tools.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, self.cid)
+        reloaded = velox.ToolRegistry(velox.Storage(self.paths)).build_openai_chat_completion_tools(velox.APP_SCOPE_ID, self.cid)
+        encode = lambda obj: json.dumps(obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        self.assertEqual(encode(original), encode(later))
+        self.assertEqual(encode(original), encode(reloaded))
+
+    def test_agent_restart_prefix_and_tools_are_stable_after_global_prompt_change(self) -> None:
+        agent = self.agent()
+        tools = self.aruntime._native_tools_for_agent(agent)
+        messages = [{'role': 'system', 'content': 'Immutable system', '_velox_endpoint_prompt_frozen': True},
+                    {'role': 'user', 'content': 'Exact task'}, {'role': 'assistant', 'content': 'First result'}]
+        previous = copy.deepcopy(messages)
+        self.storage.update_config(lambda c: c['prompting'].update(system_prompt_addon='CHANGED GLOBAL PROMPT'))
+        self.aruntime._enforce_original_agent_prefix(agent['agent_id'], messages)
+        self.assertEqual(messages, previous)
+        self.assertEqual(self.aruntime._native_tools_for_agent(self.agents.load_agent(agent['agent_id'])), tools)
+        for responses in (False, True):
+            self.assertWirePrefix(self.payload(previous, responses, tools=tools),
+                                  self.payload(messages + [{'role': 'user', 'content': 'Continue'}], responses, tools=tools), responses)
+
+
+    async def test_actual_chat_tool_rounds_and_next_turn_preserve_serialized_prefix(self) -> None:
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'checklists_enabled', False)
+        first_call = _make_test_provider_call('wire-round-1', 'time_now', {})
+        second_call = _make_test_provider_call('wire-round-2', 'time_now', {})
+        fake = await self.run_chat_rounds([
+            [velox.LLMChunk(native_tool_calls=[first_call], done=True, finish_reason='tool_calls')],
+            [velox.LLMChunk(native_tool_calls=[second_call], done=True, finish_reason='tool_calls')],
+            [velox.LLMChunk(text='Two time observations completed.', done=True, finish_reason='stop')],
+        ])
+        self.assertEqual(len(fake.requests), 3)
+        self.user('Keep the earlier observations and continue.')
+        histories = [r.messages for r in fake.requests] + [self.messages()]
+        for responses in (False, True):
+            with self.subTest(responses=responses):
+                payloads = [self.payload(messages, responses) for messages in histories]
+                for before, after in zip(payloads, payloads[1:]):
+                    self.assertWirePrefix(before, after, responses)
+                serialized = json.dumps(payloads[-1], ensure_ascii=False)
+                self.assertIn('wire-round-1', serialized)
+                self.assertIn('wire-round-2', serialized)
+
+    async def test_actual_agent_tool_rounds_preserve_serialized_prefix(self) -> None:
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'checklists_enabled', False)
+        requests = []
+        calls = [_make_test_provider_call('agent-wire-1', 'time_now', {}),
+                 _make_test_provider_call('agent-wire-2', 'time_now', {})]
+        async def reply(request: velox.LLMRequest) -> dict[str, Any]:
+            requests.append(copy.deepcopy(request))
+            if len(requests) <= 2:
+                return {'text': '', 'tool_calls': [calls[len(requests)-1]], 'usage': {}, 'finish_reason': 'tool_calls'}
+            return {'text': 'Observed both times.\n$$AGENT_PROGRESS: {"message":"Done","percent":100}',
+                    'usage': {}, 'finish_reason': 'stop'}
+        agent = self.agents.create_agent(self.cid, 'Get two time observations and return a concise report.', endpoint_profile_id=self.eid)
+        with mock.patch.object(self.aruntime, '_agent_full_response', side_effect=reply):
+            await asyncio.wait_for(self.aruntime._run_agent(agent['agent_id']), 5)
+        self.assertEqual(self.agents.load_agent(agent['agent_id'])['status'], 'succeeded')
+        self.assertEqual(len(requests), 3)
+        for responses in (False, True):
+            with self.subTest(responses=responses):
+                payloads = [self.payload(r.messages, responses, tools=r.native_tools) for r in requests]
+                for before, after in zip(payloads, payloads[1:]):
+                    self.assertWirePrefix(before, after, responses)
+                serialized = json.dumps(payloads[-1], ensure_ascii=False)
+                self.assertIn('agent-wire-1', serialized)
+                self.assertIn('agent-wire-2', serialized)
+
+
+class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
+    def change_default(self, eid: str) -> None:
+        self.storage.update_config(lambda c: c['llm'].update(default_chat_subagent_profile_id=eid))
+
+    def test_new_chat_snapshots_separate_defaults(self) -> None:
+        main = velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID
+        self.storage.update_config(lambda c: c['llm'].update(default_profile_id=main))
+        chat = self.chats.create_chat('Separate defaults')
+        self.assertEqual(chat['endpoint_profile_id'], main)
+        self.assertEqual(chat['subagent_endpoint_profile_id'], velox.DEFAULT_ENDPOINT_PROFILE_ID)
+        self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(chat['chat_id']), velox.DEFAULT_ENDPOINT_PROFILE_ID)
+
+    def test_changed_subagent_default_affects_only_new_chats(self) -> None:
+        selected = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        self.change_default(selected)
+        new = self.chats.create_chat('New default')
+        self.assertEqual(new['subagent_endpoint_profile_id'], selected)
+        self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(self.cid), self.eid)
+        self.assertEqual(new['endpoint_profile_id'], self.eid)
+
+    def test_explicit_subagent_choice_roundtrips_and_locks_at_first_message(self) -> None:
+        selected = velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, selected)
+        restarted = velox.ChatStore(velox.Storage(self.paths))
+        self.assertEqual(restarted.get_chat_subagent_endpoint_profile_id(self.cid), selected)
+        self.assertEqual(restarted.get_chat_endpoint_profile_id(self.cid), self.eid)
+        self.user()
+        with self.assertRaisesRegex(ValueError, 'locked'):
+            self.chats.set_chat_subagent_endpoint_profile_id(self.cid, self.eid)
+        self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(self.cid), selected)
+
+    def test_invalid_default_and_per_chat_ids_fail_without_corrupting_data(self) -> None:
+        before = self.paths.app_json_path.read_bytes()
+        for value in ('missing', '', None, True):
+            with self.subTest(value=value), self.assertRaises((ValueError, velox.UnsupportedDataVersionError)):
+                self.change_default(value)
+            self.assertEqual(self.paths.app_json_path.read_bytes(), before)
+        chat_before = self.paths.chat_json(self.cid).read_bytes()
+        with self.assertRaisesRegex(ValueError, 'Unknown Chat subagent'):
+            self.chats.set_chat_subagent_endpoint_profile_id(self.cid, 'missing')
+        self.assertEqual(self.paths.chat_json(self.cid).read_bytes(), chat_before)
+        with self.assertRaisesRegex(ValueError, 'Unknown Chat subagent'):
+            self.chats.create_chat('Invalid', subagent_endpoint_profile_id='missing')
+
+    def test_copy_and_branch_preserve_subagent_and_locked_tool_policy(self) -> None:
+        chosen = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, chosen)
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'web_tools_enabled', False)
+        turn = self.user()
+        self.change_default(velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID)
+        for copied in (self.chats.copy_chat(velox.APP_SCOPE_ID, self.cid),
+                       self.chats.branch_chat(velox.APP_SCOPE_ID, self.cid, turn['turn_id'])):
+            self.assertEqual(copied['subagent_endpoint_profile_id'], chosen)
+            self.assertEqual(copied['endpoint_profile_id'], self.eid)
+            self.assertFalse(copied['features']['web_tools_enabled'])
+            self.assertTrue(self.chats.is_chat_endpoint_locked(copied['chat_id']))
+
+    def test_legacy_chat_keeps_its_original_provider_not_new_global_subagent_default(self) -> None:
+        main = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_endpoint_profile_id(self.cid, main)
+        legacy = self.chats.load_chat(self.cid)
+        legacy.pop('subagent_endpoint_profile_id')
+        self.chats.write_chat(legacy)
+        self.change_default(velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID)
+        restarted = velox.ChatStore(velox.Storage(self.paths))
+        self.assertEqual(restarted.get_chat_subagent_endpoint_profile_id(self.cid), main)
+        self.assertNotIn('subagent_endpoint_profile_id', restarted.load_chat(self.cid))
+
+    def test_legacy_settings_accept_additive_default_without_resetting_saved_profiles(self) -> None:
+        config = self.storage.load_config()
+        config['llm'].pop('default_chat_subagent_profile_id')
+        self.storage.write_config(config)
+        restarted = velox.Storage(self.paths)
+        loaded = restarted.load_config()
+        self.assertEqual(loaded['llm']['endpoint_profiles'], config['llm']['endpoint_profiles'])
+        self.assertEqual(velox.chat_subagent_endpoint_profile_id_from_config(loaded), self.eid)
+        chat = velox.ChatStore(restarted).create_chat('Legacy settings, new chat')
+        self.assertEqual(chat['subagent_endpoint_profile_id'], self.eid)
+
+    def test_legacy_settings_without_exp_choose_saved_default_not_unknown_preset(self) -> None:
+        config = self.storage.load_config()
+        chosen = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        config['llm'].pop('default_chat_subagent_profile_id')
+        config['llm']['default_profile_id'] = chosen
+        config['llm']['endpoint_profiles'] = [p for p in config['llm']['endpoint_profiles'] if p['id'] == chosen]
+        self.storage.write_config(config)
+        new = self.chats.create_chat('Only saved provider')
+        self.assertEqual(new['subagent_endpoint_profile_id'], chosen)
+
+    async def test_worker_uses_selected_endpoint_limits_and_chat_tool_policy(self) -> None:
+        main = velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID
+        worker = velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_endpoint_profile_id(self.cid, main)
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, worker)
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'web_tools_enabled', False)
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'checklists_enabled', False)
+        self.user('Delegate this read')
+        self.tools.bind_agent_runtime(self.aruntime)
+        ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, endpoint_profile_id=main)
+        with mock.patch.object(self.aruntime, 'start_agent') as start:
+            result = await self.tools.tool_agents_start(ctx, {'task': 'Read-only inspection. Return a short finding.'})
+        agent = self.agents.load_agent(result['agent_id'])
+        self.assertEqual(agent['endpoint_profile_id'], worker)
+        self.assertEqual(result['endpoint_profile_id'], worker)
+        self.assertEqual(agent['context_window_tokens'], 262144)
+        self.assertEqual(agent['max_output_tokens'], 65536)
+        self.assertFalse(agent['tool_features']['web_tools_enabled'])
+        names = {row['function']['name'] for row in self.aruntime._native_tools_for_agent(agent)}
+        self.assertNotIn('web_search', names)
+        self.assertNotIn('checklist_create', names)
+        self.assertIn('fs_read', names)
+        self.assertEqual(self.chats.get_chat_endpoint_profile_id(self.cid), main)
+        start.assert_called_once_with(agent['agent_id'])
+        requests = []
+        async def reply(request: velox.LLMRequest) -> dict[str, Any]:
+            requests.append(request)
+            return {'text': 'Brief delegated finding.\n$$AGENT_PROGRESS: {"message":"Done","percent":100}', 'usage': {}, 'finish_reason': 'stop'}
+        with mock.patch.object(self.aruntime, '_agent_full_response', side_effect=reply):
+            await asyncio.wait_for(self.aruntime._run_agent(agent['agent_id']), 5)
+        self.assertTrue(requests)
+        self.assertTrue(all(r.endpoint_profile_id == worker for r in requests))
+        self.assertEqual(self.agents.load_agent(agent['agent_id'])['status'], 'succeeded', self.agents.load_agent(agent['agent_id']))
+
+    async def test_missing_worker_profile_never_falls_back_to_main_or_default(self) -> None:
+        chosen = velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, chosen)
+        self.storage.update_config(lambda c: c['llm'].update(endpoint_profiles=[p for p in c['llm']['endpoint_profiles'] if p['id'] != chosen]))
+        with mock.patch.object(self.aruntime, 'start_agent') as start:
+            with self.assertRaisesRegex(ValueError, 'Unknown Chat subagent endpoint'):
+                await self.aruntime.start_from_tool(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, endpoint_profile_id=self.eid), {'task': 'Read'})
+        start.assert_not_called()
+
+    async def test_personal_assistant_child_keeps_parent_endpoint_and_permissions(self) -> None:
+        parent_endpoint = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID)
+        parent = self.agents.create_agent(self.cid, 'Assistant task', endpoint_profile_id=parent_endpoint,
+            agent_kind=velox.AGENT_KIND_PERSONAL_ASSISTANT, pa_date=date.today().isoformat())
+        ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, agent_id=parent['agent_id'], endpoint_profile_id=parent_endpoint)
+        with mock.patch.object(self.aruntime, 'start_agent'):
+            result = await self.aruntime.start_from_tool(ctx, {'task': 'Read-only child work'})
+        child = self.agents.load_agent(result['agent_id'])
+        self.assertEqual(child['endpoint_profile_id'], parent_endpoint)
+        self.assertEqual(child['tool_features'], parent['tool_features'])
+        self.assertEqual(child['parent_agent_id'], parent['agent_id'])
+
+    def test_new_chat_ui_exposes_and_persists_separate_endpoint(self) -> None:
+        panel = object.__new__(velox.Panels)
+        panel.widgets = ChecklistRenderingTests.widgets()
+        panel.state = panel.widgets.state
+        panel.state.active_chat_id = self.cid
+        panel.services = SimpleNamespace(storage=self.storage, chats=self.chats)
+        chosen = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        _options, _to_id, to_display = panel._endpoint_profile_display_map_cached(self.storage.load_config_view())
+        original = panel.widgets.dropdown
+        seen = []
+        def dropdown(key: str, rect: velox.Rect, value: str, options: list[str], **kwargs: Any) -> str:
+            seen.append((key, rect))
+            return to_display[chosen] if key == 'chat.task_setup.subagent_endpoint' else original(key, rect, value, options, **kwargs)
+        with mock.patch.object(panel.widgets, 'dropdown', side_effect=dropdown):
+            self.assertTrue(panel._draw_new_chat_task_settings(velox.Rect(0, 0, 1000, 600)))
+        self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(self.cid), chosen)
+        self.assertEqual(self.chats.get_chat_endpoint_profile_id(self.cid), self.eid)
+        rects = dict(seen)
+        self.assertGreater(rects['chat.task_setup.subagent_endpoint'].y,
+                           rects['chat.task_setup.endpoint'].y + rects['chat.task_setup.endpoint'].h)
+        self.user()
+        self.assertFalse(panel._draw_new_chat_task_settings(velox.Rect(0, 0, 1000, 600)))
+
+    def test_settings_draws_default_subagent_control_and_delete_guards_both_ids(self) -> None:
+        settings = inspect.getsource(velox.Panels._draw_endpoints_settings_content)
+        self.assertIn('settings.llm.default_chat_subagent_profile_id', settings)
+        self.assertIn('default_chat_subagent_profile_id', inspect.getsource(velox.Panels._sanitized_settings_config))
+        source = inspect.getsource(velox.Panels.draw_modals)
+        self.assertIn('row.get("subagent_endpoint_profile_id")', source)
+        worker = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        self.chats.set_chat_subagent_endpoint_profile_id(self.cid, worker)
+        before = self.storage.load_config()
+        panel = UnifiedSystemTests.delete_panel(self, worker)
+        panel.draw_modals(velox.Rect(0, 0, 1920, 1080))
+        self.assertIn('referenced by 1 chat(s)', panel.state.modal['error'])
+        self.assertEqual(self.storage.load_config(), before)
+        self.assertEqual(self.chats.get_chat_endpoint_profile_id(self.cid), self.eid)
+
+    def test_chat_prompt_delegates_read_heavy_work_but_not_every_small_action(self) -> None:
+        self.user()
+        prompt = self.messages()[0]['content']
+        self.assertIn('READING-HEAVY DELEGATION', prompt)
+        for fragment in ('web searches', 'large file reads', 'source URLs', 'compact return format',
+                         'Use direct tools for small targeted reads', 'never delegate around disabled tools',
+                         'do not poll'):
+            self.assertIn(fragment, prompt)
+
+    def test_disabling_agents_omits_orchestration_instruction(self) -> None:
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, 'agent_tools_enabled', False)
+        self.user()
+        self.assertNotIn('READING-HEAVY DELEGATION', self.messages()[0]['content'])
+
+    def test_changing_global_subagent_default_does_not_rewrite_established_chat_prefix(self) -> None:
+        self.user('First')
+        before = copy.deepcopy(self.messages())
+        self.change_default(velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID)
+        self.user('Second')
+        self.assertPrefix(before, self.messages())
+        self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(self.cid), self.eid)
 
 
 def main() -> None:
