@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 312
+CURRENT_VERSION = 313
 BACKWARD_COMPATIBLE_VERSION = 311
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -4486,21 +4486,35 @@ def token_cost_label(cost: dict[str, Any] | None) -> str:
     return text + (" + ?" if missing else "")
 
 
-def token_cost_tooltip(cost: dict[str, Any] | None) -> str:
+def sum_token_costs(costs: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Sum request-local costs before display rounding, never rolled-up rows."""
+    rows = list(costs)
+    return {key: (math.fsum(float(row.get(key) or 0) for row in rows)
+                  if key.endswith("_usd") else sum(int(row.get(key) or 0) for row in rows))
+            for key in TOKEN_COST_SUM_FIELDS}
+
+
+def token_cost_tooltip(
+    cost: dict[str, Any] | None, *, chat_breakdown: dict[str, Any] | None = None,
+) -> str:
     cost = cost or {}
+    lines = ["Estimated token cost (USD): " + token_cost_label(cost)]
+    if chat_breakdown is not None:
+        lines.append("Chat " + token_cost_label(chat_breakdown.get("chat"))
+                     + " | Subagents " + token_cost_label(chat_breakdown.get("subagents")))
+    components = [("input_usd", "Input"), ("cached_input_usd", "Cache read"), ("output_usd", "Output")]
+    if cost.get("cache_write_premium_usd"):
+        components.append(("cache_write_premium_usd", "Cache write"))
+    lines.append(" | ".join(label + " " + token_cost_label({"total_usd": cost.get(key)})
+                            for key, label in components))
     flags = []
     for key, label in (("unpriced_requests", "unpriced"), ("unknown_cache_requests", "cache unknown (full input rate)"),
                        ("estimated_requests", "estimated usage")):
         if cost.get(key):
             flags.append(f"{int(cost[key])} {label}")
-    return "\n".join([
-        "Estimated token cost (USD): " + token_cost_label(cost),
-        " | ".join(label + " " + token_cost_label({"total_usd": cost.get(key)})
-                   for key, label in (("input_usd", "Input"), ("cached_input_usd", "Cache read"), ("output_usd", "Output"))),
-        "Reported cache-write premium +" + token_cost_label({"total_usd": cost.get("cache_write_premium_usd")}) + "; own requests only, excludes child rows.",
-        ("; ".join(flags) + ". ") if flags else "Provider usage; output includes billed reasoning.",
-        "Frozen per-request rates. Excludes tool fees, taxes, regional premiums, unreported cache writes and discounts.",
-    ])
+    if flags:
+        lines.append("; ".join(flags))
+    return "\n".join(lines)
 
 
 class TokenCostLedger:
@@ -5292,9 +5306,14 @@ ENDPOINT_DEFAULTS_DESCRIPTION = (
 )
 
 
-def endpoint_default_image_analysis_context(provider: Any) -> str:
-    """Context policy is a provider default, independent of vision capability."""
-    return "inline" if str(provider or "").strip().lower() == ENDPOINT_PROVIDER_VLLM else "separate"
+def endpoint_default_image_analysis_context(provider: Any, model_type: Any = None) -> str:
+    """New-profile defaults; saved user choices are not rewritten on load."""
+    provider_key = str(provider or "").strip().lower()
+    if provider_key == ENDPOINT_PROVIDER_VLLM:
+        return "inline"
+    if provider_key == ENDPOINT_PROVIDER_OPENAI and normalize_endpoint_model_type(model_type) in ENDPOINT_GPT_6_MODEL_TYPES:
+        return "inline"
+    return "separate"
 
 
 def default_endpoint_profile(
@@ -5334,7 +5353,7 @@ def default_endpoint_profile(
     }
     profile.update(endpoint_model_type_defaults(model_type))
     profile.update(endpoint_default_token_prices(model_type, provider_key))
-    profile["image_analysis_context"] = endpoint_default_image_analysis_context(provider_key)
+    profile["image_analysis_context"] = endpoint_default_image_analysis_context(provider_key, model_type)
     if model is not None:
         profile["model"] = str(model)
     return profile
@@ -48010,6 +48029,11 @@ class LLMTaskMonitor:
         # priority slot. The pointer is process-local like the live Task records.
         self._cost_prices: dict[tuple[str, str], dict[str, Any]] = {}
         self._cost_events: dict[tuple[str, str], dict[str, Any]] = {}
+        # Keep request-local costs on records. Chat rollups are a separate view,
+        # so a parent's displayed total can never be charged again to the ledger.
+        self._retired_chat_costs: dict[str, dict[str, dict[str, Any]]] = {}
+        self._chat_cost_rollups: dict[str, dict[str, Any]] = {}
+        self._chat_cost_rollup_revision = -1
         self.cost_ledger = TokenCostLedger(storage.paths.root_dir)
         self._priority_task_id: str | None = None
         self._lock = threading.RLock()
@@ -49065,6 +49089,11 @@ class LLMTaskMonitor:
             if rec is None or rec.state not in self.TERMINAL_STATES:
                 return False
             snapshot = self._snapshot_record(rec)
+            chat_id = self._cost_owner_chat_id(rec)
+            if chat_id and rec.metadata.get("token_cost"):
+                bucket = "chat" if rec.task_kind == "chat" else "subagents"
+                retired = self._retired_chat_costs.setdefault(chat_id, {})
+                retired[bucket] = sum_token_costs([retired.get(bucket, {}), rec.metadata["token_cost"]])
             self._records.pop(rid, None)
             self._cancel_callbacks.pop(rid, None)
             self._pause_callbacks.pop(rid, None)
@@ -49218,6 +49247,37 @@ class LLMTaskMonitor:
             self.update(rid, state="cancelled")
         return self.record_state(rid) == "cancelled"
 
+    @staticmethod
+    def _cost_owner_chat_id(rec: LLMTaskRecord) -> str:
+        # Agents, nested workers, reviewers and separate image tasks all carry
+        # their originating chat ID. Unowned system jobs must not be attributed.
+        return str(rec.metadata.get("chat_id") or rec.metadata.get("source_chat_id") or "").strip()
+
+    def _chat_cost_breakdown_locked(self, rec: LLMTaskRecord) -> dict[str, Any]:
+        """One O(tasks) grouping per revision, independent of visible row limits."""
+        chat_id = self._cost_owner_chat_id(rec)
+        if not chat_id:
+            own = copy.deepcopy(rec.metadata.get("token_cost") or {})
+            return {"chat": own, "subagents": {}, "total": copy.deepcopy(own)}
+        if self._chat_cost_rollup_revision != self._revision:
+            groups: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            for owner, retired in self._retired_chat_costs.items():
+                groups[owner] = {bucket: [retired.get(bucket, {})] for bucket in ("chat", "subagents")}
+            for task in self._records.values():
+                owner = self._cost_owner_chat_id(task)
+                if not owner:
+                    continue
+                group = groups.setdefault(owner, {"chat": [], "subagents": []})
+                group["chat" if task.task_kind == "chat" else "subagents"].append(task.metadata.get("token_cost") or {})
+            rollups = {}
+            for owner, group in groups.items():
+                own = sum_token_costs(group["chat"])
+                children = sum_token_costs(group["subagents"])
+                rollups[owner] = {"chat": own, "subagents": children, "total": sum_token_costs([own, children])}
+            self._chat_cost_rollups = rollups
+            self._chat_cost_rollup_revision = self._revision
+        return copy.deepcopy(self._chat_cost_rollups[chat_id])
+
     def _row_from_record(self, rec: LLMTaskRecord, now_mono: float) -> dict[str, Any]:
         row = dataclasses.asdict(self._snapshot_record(rec))
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
@@ -49293,6 +49353,8 @@ class LLMTaskMonitor:
             "pausable": self.can_pause_task(rec.task_id),
             "resumable": self.can_resume_task(rec.task_id),
         })
+        if rec.task_kind == "chat":
+            row["chat_cost_breakdown"] = self._chat_cost_breakdown_locked(rec)
         return row
 
     def list_records(self, scope_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -64455,13 +64517,18 @@ class Widgets:
                             break
         return desired
 
-    def _draw_table_status_icon(self, cell: Rect, icon: str, color: Color) -> None:
-        """Draw a centered read-only status mark inside its cell, without glyphs."""
+    def _draw_table_status_icon(self, cell: Rect, icon: str, color: Color, indent: int = 0) -> None:
+        """Draw a read-only mark; step indentation stays inside the status cell."""
         if icon not in ("check", "dot") or cell.w < 6 or cell.h < 6:
             return
         color = color if isinstance(color, Color) else Palette.text
         size = min(18, cell.w - 4, cell.h - 4)
-        bounds = Rect(cell.x + (cell.w - size) // 2, cell.y + (cell.h - size) // 2, size, size)
+        left = cell.x + (cell.w - size) // 2
+        # The check's actual rightmost stroke is 5/6 of its nominal square.
+        # Clamp to that geometry instead of clipping a shifted mark at the edge.
+        rightmost = size * 5 // 6 if icon == "check" else (size + max(3, size // 2)) // 2
+        shift = min(max(0, int(indent)), max(0, cell.x + cell.w - 1 - left - rightmost))
+        bounds = Rect(left + shift, cell.y + (cell.h - size) // 2, size, size)
         self.renderer.push_clip(cell)
         try:
             if icon == "dot":
@@ -64483,22 +64550,24 @@ class Widgets:
         """Draw connected two-level ID branches, including through clipped rows."""
         if cell.w < 28 or cell.h < 12:
             return
-        trunk_x = cell.x + 12
+        # Parent IDs start at x+10. The boundary after C puts the trunk
+        # between C and its number, using the same font metrics as the label.
+        trunk_x = cell.x + 10 + self._text_width("C")
         self.renderer.push_clip(cell)
         try:
             if value.get("tree_branch") and indent >= 20:
                 middle_y = cell.y + cell.h // 2
                 bottom_y = middle_y if value.get("tree_last") else cell.y + cell.h
-                self.renderer.draw_line(trunk_x, cell.y, trunk_x, bottom_y, Palette.muted)
+                self.renderer.draw_line(trunk_x, cell.y, trunk_x, bottom_y, Palette.muted2)
                 # Eight pixels of clear space between the arrow tip and ID text.
                 tip_x = cell.x + 10 + indent - 8
-                self.renderer.draw_line(trunk_x, middle_y, tip_x, middle_y, Palette.muted)
-                self.renderer.draw_line(tip_x - 4, middle_y - 3, tip_x, middle_y, Palette.muted)
-                self.renderer.draw_line(tip_x - 4, middle_y + 3, tip_x, middle_y, Palette.muted)
+                self.renderer.draw_line(trunk_x, middle_y, tip_x, middle_y, Palette.muted2)
+                self.renderer.draw_line(tip_x - 4, middle_y - 3, tip_x, middle_y, Palette.muted2)
+                self.renderer.draw_line(tip_x - 4, middle_y + 3, tip_x, middle_y, Palette.muted2)
             elif value.get("tree_children"):
                 # Start below the parent's label, never draw through its glyphs.
                 self.renderer.draw_line(trunk_x, cell.y + cell.h - 5,
-                                        trunk_x, cell.y + cell.h, Palette.muted)
+                                        trunk_x, cell.y + cell.h, Palette.muted2)
         finally:
             self.renderer.pop_clip()
 
@@ -64753,7 +64822,7 @@ class Widgets:
                 elif isinstance(value, dict) and value.get("type") == "status_icon":
                     # Status is geometry, not a font character. Narrow columns
                     # and fonts without U+2713 must never hide completion marks.
-                    self._draw_table_status_icon(cell, str(value.get("icon") or ""), value.get("color", Palette.text))
+                    self._draw_table_status_icon(cell, str(value.get("icon") or ""), value.get("color", Palette.text), int(value.get("indent") or 0))
                     if hovered_row and point_in_rect(self.inp.mouse_x, self.inp.mouse_y, cell):
                         if not row_owns_tooltip:
                             self._queue_tooltip(f"{widget_id}.{row_id}.status", cell, str(value.get("tooltip") or ""))
@@ -64824,6 +64893,10 @@ class Widgets:
                     display_value = value.get("label", "") if isinstance(value, dict) else value
                     display_text = str(display_value)
                     indent = min(max(0, int(value.get("indent") or 0)), max(0, cell.w - 28)) if isinstance(value, dict) else 0
+                    if isinstance(value, dict) and value.get("tree_branch"):
+                        # Large fonts need a longer branch, still with the same
+                        # eight-pixel arrow-to-text gap and unindented requirements.
+                        indent = min(max(indent, self._text_width("C") + 14), max(0, cell.w - 28))
                     if isinstance(value, dict) and (value.get("tree_branch") or value.get("tree_children")):
                         self._draw_table_tree_connector(cell, indent, value)
                     self.clipped_text(
@@ -70366,7 +70439,7 @@ class Panels:
                 "expand": {"type": "disclosure", "expanded": item_id not in collapsed,
                            "action": "toggle_subitems", "tooltip": "Expand implementation steps" if item_id in collapsed else "Collapse implementation steps"} if children else "",
                 "status": {"type": "status_icon", "icon": "check" if item_state in (CHECKLIST_ITEM_DONE, CHECKLIST_ITEM_VERIFIED) else "dot" if item_state == CHECKLIST_ITEM_IN_PROGRESS else "",
-                           "label": marker, "color": color, "tooltip": state_label},
+                           "label": marker, "color": color, "indent": 10 if parent_id else 0, "tooltip": state_label},
                 "requirement_id": {"label": item_id, "color": Palette.muted2 if parent_id else Palette.text,
                                    "indent": 26 if parent_id else 0, "tree_branch": bool(parent_id),
                                    "tree_children": bool(children and item_id not in collapsed), "tooltip": tooltip},
@@ -71486,6 +71559,9 @@ class Panels:
     def _apply_endpoint_model_type_to_editor_draft(draft: dict[str, Any], model_type: Any) -> None:
         """Replace model-specific fields with a preset while preserving connection fields."""
         preset = endpoint_model_type_defaults(model_type)
+        prior_context_default = endpoint_default_image_analysis_context(endpoint_provider(draft), draft.get("model_type"))
+        if draft.get("image_analysis_context") == prior_context_default:
+            draft["image_analysis_context"] = endpoint_default_image_analysis_context(endpoint_provider(draft), preset["model_type"])
         if (preset["model_type"] == ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH
                 and endpoint_provider_name(str(draft.get("base_url") or ""), draft.get("provider")) == ENDPOINT_PROVIDER_NOVITA):
             # Hosted Novita IDs are lowercase; the local family preset names
@@ -72311,8 +72387,8 @@ class Panels:
                             draft["max_concurrent_requests"] = endpoint_default_max_concurrent_requests(next_provider)
                         if bool(draft.get("rate_limit_enabled")) == endpoint_default_rate_limit_enabled(prior_provider):
                             draft["rate_limit_enabled"] = endpoint_default_rate_limit_enabled(next_provider)
-                        if draft.get("image_analysis_context") == endpoint_default_image_analysis_context(prior_provider):
-                            draft["image_analysis_context"] = endpoint_default_image_analysis_context(next_provider)
+                        if draft.get("image_analysis_context") == endpoint_default_image_analysis_context(prior_provider, draft.get("model_type")):
+                            draft["image_analysis_context"] = endpoint_default_image_analysis_context(next_provider, draft.get("model_type"))
                     draft["provider"] = next_provider
                 y += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
 
@@ -81034,6 +81110,9 @@ class Panels:
         rounds = max(reported, int(rec.get("cache_total_rounds") or 0))
         cache_detail = (f"{reported:,}/{rounds:,} requests" + ("; reported subset, lower bound" if reported < rounds else "")
                         if cache_label != "N/A" else "no count, not a reported zero")
+        breakdown = rec.get("chat_cost_breakdown") if str(rec.get("task_kind") or task_type).lower() == "chat" else None
+        cost = breakdown.get("total", {}) if isinstance(breakdown, dict) else rec.get("token_cost")
+        cost_tooltip = token_cost_tooltip(cost, chat_breakdown=breakdown)
         return {
             "id": task_id,
             "display_id": {"label": str(display_id), "sort": display_id},
@@ -81054,9 +81133,9 @@ class Panels:
             "output_tokens": {"label": f"{output_tokens:,}", "sort": output_tokens},
             "input_tps": {"label": f"{input_tps:,.1f}" if input_tps > 0 else "—", "sort": input_tps},
             "generation_tps": {"label": f"{generation_tps:,.1f}" if generation_tps > 0 else "—", "sort": generation_tps},
-            "cost": {"label": token_cost_label(rec.get("token_cost")),
-                     "sort": float((rec.get("token_cost") or {}).get("total_usd") or 0),
-                     "tooltip": token_cost_tooltip(rec.get("token_cost"))},
+            "cost": {"label": token_cost_label(cost),
+                     "sort": float((cost or {}).get("total_usd") or 0),
+                     "tooltip": cost_tooltip},
             "_context_menu": self._dashboard_task_context_menu_items(rec),
             "_tooltip_all_cells": True,
             "_tooltip": (
@@ -81067,7 +81146,7 @@ class Panels:
                 f"Input: {input_tokens:,} | Output: {output_tokens:,} | Total: {input_tokens + output_tokens:,} tokens\n"
                 f"Cached Input: {cache_label} | Cache reporting: {cache_detail}\n"
                 f"IN t/s: {input_tps:,.1f} | OUT t/s: {generation_tps:,.1f} | Task ID: {task_id}\n"
-                + token_cost_tooltip(rec.get("token_cost"))
+                + cost_tooltip
             ),
         }
 

@@ -21773,19 +21773,45 @@ class _RawFDTestStream:
         return None
 
 
-class StallAndProgressTests(unittest.TestCase):
+def _normalized_prompt_budget_sample(storage: velox.Storage, chat_id: str) -> str:
+    """Exercise real assembly with a fixed environment and canonical root spelling.
+
+    The budget guards prompt growth, not a runner's username, checkout location,
+    CPU/GPU inventory or Windows path aliases. Only fixture-specific text changes.
+    """
+    host = "VELOX LOCAL EXECUTION ENVIRONMENT\nOS: TestOS; architecture: 64-bit\nCPU: Test CPU\nRAM: 16 GiB\nGPU: Test GPU"
+    with mock.patch.object(velox, "host_environment_prompt", return_value=host):
+        prompt = velox.ContextAssembler(storage.paths).assemble_chat_context(velox.APP_SCOPE_ID, chat_id)[0]["content"]
+    roots = {str(storage.paths.root_dir), storage.paths.root_dir.as_posix(),
+             str(storage.paths.root_dir.resolve()), storage.paths.root_dir.resolve().as_posix()}
+    for root in sorted(roots, key=len, reverse=True):
+        prompt = prompt.replace(root, "/VELOX_TEST_ROOT")
+    return prompt
+
+
+class StallAndProgressTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
+    @contextlib.contextmanager
+    def _temporary_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                yield td
+            finally:
+                # Drain while the directory still exists; do not race Windows
+                # file handles or discard pending persistence during rmtree.
+                self.assertTrue(velox.CHAT_STREAM_SNAPSHOT_WRITER.flush(timeout=5.0))
+                self.assertTrue(velox.APP_LOG_WRITER.flush(timeout=5.0))
+                velox.DATA_ROOTS.clear_for_tests()
+
     @staticmethod
     def _storage(root: Path) -> tuple[Storage, ChatStore, dict[str, Any]]:
-        storage = velox.Storage(velox.AppPaths(root))
-        storage.ensure_first_run_files()
+        storage = _make_test_storage(root)
         chats = velox.ChatStore(storage)
         chat = chats.create_chat("Stall and progress test")
         return storage, chats, chat
 
     def test_stalled_provider_activity_is_visible_and_terminal_safe(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = velox.Storage(velox.AppPaths(Path(td)))
-            storage.ensure_first_run_files()
+        with self._temporary_directory() as td:
+            storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
             client.request_monitor = monitor
@@ -21872,26 +21898,34 @@ class StallAndProgressTests(unittest.TestCase):
                 chat_id, "assistant", "", status="streaming",
                 endpoint_profile_id="endpoint", endpoint_label="Endpoint",
             )
-            self.assertTrue(panel._chat_toolbar_activity([live_turn])[0].startswith("Prompt "))
-            self.assertTrue(runtime.cancel(chat_id))
-            self.assertEqual(monitor.record_state(task_id), "cancelled")
-            self.assertEqual(panel._chat_toolbar_activity([live_turn])[0], "Inactive")
+            try:
+                self.assertTrue(panel._chat_toolbar_activity([live_turn])[0].startswith("Prompt "))
+                self.assertTrue(runtime.cancel(chat_id))
+                self.assertEqual(monitor.record_state(task_id), "cancelled")
+                self.assertEqual(panel._chat_toolbar_activity([live_turn])[0], "Inactive")
+    
+                # Simulate task cleanup removing the process-local monitor mapping
+                # before the transcript worker replaces the stale streaming card.
+                runtime._monitor_task_ids.pop(chat_id, None)
+                runtime.running.pop(chat_id, None)
+                self.assertEqual(panel._chat_toolbar_activity([live_turn])[0], "Inactive")
+                with self.assertRaises(asyncio.CancelledError):
+                    await owner
+            finally:
+                owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
+                await runtime.wait_for_user_stops()
+                for pending in runtime._checklist_stop_tasks.values():
+                    self.assertTrue(pending.done())
+                    pending.result()  # Propagate persistence failures, not just completion.
+                self.assertTrue(chats.load_chat(chat_id)['agent_reports_suspended'])
 
-            # Simulate task cleanup removing the process-local monitor mapping
-            # before the transcript worker replaces the stale streaming card.
-            runtime._monitor_task_ids.pop(chat_id, None)
-            runtime.running.pop(chat_id, None)
-            self.assertEqual(panel._chat_toolbar_activity([live_turn])[0], "Inactive")
-            with self.assertRaises(asyncio.CancelledError):
-                await owner
-
-        with tempfile.TemporaryDirectory() as td:
+        with self._temporary_directory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_no_first_delta_wait_never_counts_as_prefill_throughput(self) -> None:
         async def scenario(root: Path) -> None:
-            storage = velox.Storage(velox.AppPaths(root))
-            storage.ensure_first_run_files()
+            storage = _make_test_storage(root)
             _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
@@ -21904,33 +21938,35 @@ class StallAndProgressTests(unittest.TestCase):
                 if False:
                     yield velox.LLMChunk()  # pragma: no cover
 
-            client._chat_completions_stream_unqueued = stalled_stream  # type: ignore[method-assign]
-            task_id = monitor.start(
-                velox.APP_SCOPE_ID, "no first delta", task_kind="chat",
-                metadata={"endpoint_label": "Endpoint", "task_type": "Chat"},
-            )
-            with self.assertRaisesRegex(RuntimeError, "stalled before response headers"):
-                async for _chunk in client.chat_completions_stream(velox.LLMRequest(
-                    velox.APP_SCOPE_ID,
-                    velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
-                    [{"role": "user", "content": "wait"}],
-                    monitor_task_id=task_id,
-                    task_kind="chat",
-                    task_title="no first delta",
-                )):
-                    pass
-            metadata = monitor.record_metadata(task_id)
-            row = monitor.record_snapshot(task_id)
-            self.assertEqual(float(metadata["prefill_seconds"]), 0.0)
-            self.assertEqual(float(metadata["generation_seconds"]), 0.0)
-            self.assertEqual(int(metadata["prefill_measured_input_tokens"]), 0)
-            self.assertEqual(float(row["prefill_tokens_per_second"]), 0.0)
-            self.assertEqual(float(row["generation_tokens_per_second"]), 0.0)
-            self.assertEqual(metadata["activity"], "error")
-            monitor.fail(task_id, "simulated endpoint stalled before response headers")
-            await scheduler.close()
+            try:
+                client._chat_completions_stream_unqueued = stalled_stream  # type: ignore[method-assign]
+                task_id = monitor.start(
+                    velox.APP_SCOPE_ID, "no first delta", task_kind="chat",
+                    metadata={"endpoint_label": "Endpoint", "task_type": "Chat"},
+                )
+                with self.assertRaisesRegex(RuntimeError, "stalled before response headers"):
+                    async for _chunk in client.chat_completions_stream(velox.LLMRequest(
+                        velox.APP_SCOPE_ID,
+                        velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
+                        [{"role": "user", "content": "wait"}],
+                        monitor_task_id=task_id,
+                        task_kind="chat",
+                        task_title="no first delta",
+                    )):
+                        pass
+                metadata = monitor.record_metadata(task_id)
+                row = monitor.record_snapshot(task_id)
+                self.assertEqual(float(metadata["prefill_seconds"]), 0.0)
+                self.assertEqual(float(metadata["generation_seconds"]), 0.0)
+                self.assertEqual(int(metadata["prefill_measured_input_tokens"]), 0)
+                self.assertEqual(float(row["prefill_tokens_per_second"]), 0.0)
+                self.assertEqual(float(row["generation_tokens_per_second"]), 0.0)
+                self.assertEqual(metadata["activity"], "error")
+                monitor.fail(task_id, "simulated endpoint stalled before response headers")
+            finally:
+                await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with self._temporary_directory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_durable_turn_stats_separate_no_output_wait_from_prefill_and_generation(self) -> None:
@@ -21961,8 +21997,7 @@ class StallAndProgressTests(unittest.TestCase):
 
     def test_agent_stream_collector_populates_dashboard_prefill_and_generation_rates(self) -> None:
         async def scenario(root: Path) -> None:
-            storage = velox.Storage(velox.AppPaths(root))
-            storage.ensure_first_run_files()
+            storage = _make_test_storage(root)
             _install_legacy_endpoint_fixtures(storage)
             monitor = velox.LLMTaskMonitor(storage)
             client = velox.LLMClient(storage)
@@ -21981,33 +22016,35 @@ class StallAndProgressTests(unittest.TestCase):
                     usage={"prompt_tokens": 1200, "completion_tokens": 120},
                 )
 
-            client._chat_completions_stream_unqueued = agent_stream  # type: ignore[method-assign]
-            task_id = monitor.start(
-                velox.APP_SCOPE_ID, "Agent streaming metrics", task_kind="agent",
-                metadata={"endpoint_label": "Endpoint", "task_type": "Agent"},
-            )
-            response = await client.chat_completions_stream_full(velox.LLMRequest(
-                velox.APP_SCOPE_ID,
-                velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
-                [{"role": "user", "content": "perform the agent task"}],
-                monitor_task_id=task_id,
-                task_kind="agent",
-                task_title="Agent streaming metrics",
-            ))
-            self.assertIn("<think>", response["text"])
-            self.assertIn("completed answer", response["text"])
-            row = monitor.record_snapshot(task_id)
-            metadata = monitor.record_metadata(task_id)
-            self.assertEqual(int(row["input_tokens"]), 1200)
-            self.assertEqual(int(row["output_tokens"]), 120)
-            self.assertGreater(float(row["prefill_tokens_per_second"]), 0.0)
-            self.assertGreater(float(row["generation_tokens_per_second"]), 0.0)
-            self.assertGreater(float(metadata["prefill_seconds"]), 0.0)
-            self.assertGreater(float(metadata["generation_seconds"]), 0.0)
-            monitor.complete(task_id)
-            await scheduler.close()
+            try:
+                client._chat_completions_stream_unqueued = agent_stream  # type: ignore[method-assign]
+                task_id = monitor.start(
+                    velox.APP_SCOPE_ID, "Agent streaming metrics", task_kind="agent",
+                    metadata={"endpoint_label": "Endpoint", "task_type": "Agent"},
+                )
+                response = await client.chat_completions_stream_full(velox.LLMRequest(
+                    velox.APP_SCOPE_ID,
+                    velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
+                    [{"role": "user", "content": "perform the agent task"}],
+                    monitor_task_id=task_id,
+                    task_kind="agent",
+                    task_title="Agent streaming metrics",
+                ))
+                self.assertIn("<think>", response["text"])
+                self.assertIn("completed answer", response["text"])
+                row = monitor.record_snapshot(task_id)
+                metadata = monitor.record_metadata(task_id)
+                self.assertEqual(int(row["input_tokens"]), 1200)
+                self.assertEqual(int(row["output_tokens"]), 120)
+                self.assertGreater(float(row["prefill_tokens_per_second"]), 0.0)
+                self.assertGreater(float(row["generation_tokens_per_second"]), 0.0)
+                self.assertGreater(float(metadata["prefill_seconds"]), 0.0)
+                self.assertGreater(float(metadata["generation_seconds"]), 0.0)
+                monitor.complete(task_id)
+            finally:
+                await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with self._temporary_directory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_runtime_prefers_streaming_full_response_with_legacy_fallback(self) -> None:
@@ -22100,11 +22137,10 @@ class StallAndProgressTests(unittest.TestCase):
             )),
             7000,
         )
-        with tempfile.TemporaryDirectory() as td:
-            storage = velox.Storage(velox.AppPaths(Path(td)))
-            storage.ensure_first_run_files()
+        with self._temporary_directory() as td:
+            storage = _make_test_storage(Path(td))
             chat_id = str(velox.ChatStore(storage).create_chat("Prompt length")['chat_id'])
-            prompt = velox.ContextAssembler(storage.paths).assemble_chat_context(velox.APP_SCOPE_ID, chat_id)[0]["content"]
+            prompt = _normalized_prompt_budget_sample(storage, chat_id)
         self.assertLess(len(prompt), 13_500)
         self.assertIn("every requested requirement", prompt)
         self.assertIn("visualReview.reviews", prompt)
@@ -22249,6 +22285,57 @@ def _publish_test_result(result: unittest.TestResult, expected_count: int) -> No
             pass
 
 
+def _failure_details_path(marker: Path) -> Path:
+    return marker.with_name(marker.name + ".failure")
+
+
+def _publish_test_failure_details(result: unittest.TestResult, expected_count: int) -> None:
+    """Keep bounded failure IDs/tracebacks available beside the final CI summary."""
+    marker = str(os.environ.get("VELOX_TEST_SUCCESS_MARKER") or "").strip()
+    token = str(os.environ.get("VELOX_TEST_RUN_TOKEN") or "").strip()
+    if not marker or not token or result.wasSuccessful():
+        return
+    details = []
+    for kind, entries in (("FAIL", result.failures), ("ERROR", result.errors)):
+        for test, trace in entries:
+            details.append({"kind": kind, "id": test.id()[:500], "trace": str(trace)[-2000:]})
+    for test in result.unexpectedSuccesses:
+        details.append({"kind": "UNEXPECTED SUCCESS", "id": test.id()[:500], "trace": ""})
+    payload = {"pid": os.getpid(), "token": token, "expected": expected_count,
+               "tests": result.testsRun, "details": details[:12]}
+    path = _failure_details_path(Path(marker))
+    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_test_failure_details(marker: Path, pid: int, token: str, count: int) -> str:
+    """Diagnostics only. A failure sidecar can never authorize a passing group."""
+    try:
+        with _failure_details_path(marker).open("rb") as stream:
+            raw = stream.read(131073)
+        if len(raw) > 131072:
+            return ""
+        value = json.loads(raw)
+        if (not isinstance(value, dict) or type(value.get("pid")) is not int or value["pid"] != pid
+                or not token or value.get("token") != token or type(value.get("expected")) is not int
+                or value["expected"] != count or type(value.get("tests")) is not int
+                or not 0 <= value["tests"] <= count or not isinstance(value.get("details"), list)):
+            return ""
+        details = value["details"]
+        if len(details) > 12 or any(not isinstance(row, dict) or any(not isinstance(row.get(key), str)
+                for key in ("kind", "id", "trace")) for row in details):
+            return ""
+        return "\n".join(f"{row['kind']}: {row['id'][:500]}\n{row['trace'][-2000:]}" for row in details)
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
 def _test_result_matches(path: Path, pid: int, expected_count: int) -> bool:
     try:
         with open(path, "rb") as handle:
@@ -22377,6 +22464,7 @@ def run_test_class(class_name: str) -> NoReturn:
     result = unittest.TextTestRunner(stream=_RawFDTestStream(2), verbosity=2).run(suite)
     t1 = _TIMING_PERF()
     _publish_test_result(result, _count)
+    _publish_test_failure_details(result, _count)
     t2 = _TIMING_PERF()
     _emit_child_timing(class_name, t0, t1, t2)
     # This command runs in a disposable shard process. Exit at the exact point
@@ -22447,6 +22535,7 @@ def run_test_suite() -> int:
     total_count = 0
     total_confirmed = 0
     failed: list[tuple[str, int, str]] = []
+    failure_details: list[tuple[str, str]] = []
     source_path = str(Path(__file__).resolve())
     trace_runner = bool(str(os.environ.get("VELOX_TEST_RUNNER_TRACE") or "").strip())
     if trace_runner and hasattr(signal, "SIGUSR1"):
@@ -22540,10 +22629,15 @@ def run_test_suite() -> int:
                     return_code = 1
                 break
             time.sleep(0.05)
-        try:
-            success_marker.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if return_code != 0 or timed_out or not success_marked:
+            details = _read_test_failure_details(success_marker, child_pid, child_token, count)
+            if details:
+                failure_details.append((label, details))
+        for marker_path in (success_marker, _child_identity_path(success_marker), _failure_details_path(success_marker)):
+            try:
+                marker_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         if timed_out:
             _raw_test_status_write(f"[error] {label} exceeded the 1800-second process timeout.")
         elif finalizer_stall:
@@ -22564,6 +22658,8 @@ def run_test_suite() -> int:
         _raw_test_status_write(
             "FAILED (groups: " + ", ".join(f"{name} [{reason}]" for name, _count, reason in failed) + ")"
         )
+        for label, details in failure_details:
+            _raw_test_status_write(f"\n{label} failure details:\n{details}")
         _raw_test_status_write(
             "Unconfirmed expected counts: "
             + ", ".join(f"{name}={int(count)}" for name, count, _reason in failed)
@@ -36956,7 +37052,7 @@ class UnifiedEndpointConfigTests(_AsyncRuntimeFixture):
         self.assertEqual(len(profiles), 9)
         for profile in profiles:
             with self.subTest(endpoint=profile['label']):
-                expected = 'inline' if profile['provider'] == velox.ENDPOINT_PROVIDER_VLLM else 'separate'
+                expected = 'inline' if (profile['provider'] == velox.ENDPOINT_PROVIDER_VLLM or (profile['provider'] == 'openai' and profile['model_type'] in velox.ENDPOINT_GPT_6_MODEL_TYPES)) else 'separate'
                 self.assertEqual(profile['image_analysis_context'], expected)
                 self.assertEqual(velox.endpoint_uses_inline_image_analysis(profile), expected == 'inline')
                 self.assertEqual(velox.normalize_endpoint_profile(profile)['image_analysis_context'], expected)
@@ -44186,11 +44282,11 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 
 class UnifiedReleaseVersionTests(_StorageFixture):
-    def test_current_version_312_preserves_data_generation_311(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 312)
+    def test_current_version_313_preserves_data_generation_311(self) -> None:
+        self.assertEqual(velox.CURRENT_VERSION, 313)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 311)
-        self.assertEqual(velox.APP_VERSION, 'velox.v312')
-        self.assertEqual(velox.SOURCE_REVISION, '312')
+        self.assertEqual(velox.APP_VERSION, 'velox.v313')
+        self.assertEqual(velox.SOURCE_REVISION, '313')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v311')
 
     def test_all_exported_schema_constants_share_data_generation(self) -> None:
@@ -45465,29 +45561,29 @@ class ConnectedChecklistTreeTests(unittest.TestCase):
     def test_trunks_join_parent_tail_and_siblings_without_vertical_gaps(self) -> None:
         w, calls, text = self.render()
         cells = {c.args[2]['label']: c.args[0] for c in calls}
-        lines = [a for name, a, kw in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted]
-        parent = cells['C1']; trunk = parent.x + 12
-        self.assertIn((trunk, parent.y + parent.h - 5, trunk, parent.y + parent.h, velox.Palette.muted), lines)
+        lines = [a for name, a, kw in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted2]
+        parent = cells['C1']; trunk = parent.x + 10 + w._text_width("C")
+        self.assertIn((trunk, parent.y + parent.h - 5, trunk, parent.y + parent.h, velox.Palette.muted2), lines)
         previous = parent
         for key in ('C1.1', 'C1.2', 'C1.3'):
             child = cells[key]
             self.assertEqual(child.y, previous.y + previous.h)
             end = child.y + child.h // 2 if key == 'C1.3' else child.y + child.h
-            self.assertIn((trunk, child.y, trunk, end, velox.Palette.muted), lines)
+            self.assertIn((trunk, child.y, trunk, end, velox.Palette.muted2), lines)
             previous = child
 
     def test_arrow_heads_leave_eight_pixels_before_id_text(self) -> None:
         w, calls, texts = self.render()
         text_rects = {c.args[1]: c.args[0] for c in texts}
-        lines = [a for name, a, kw in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted]
+        lines = [a for name, a, kw in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted2]
         for c in calls:
             cell, indent, value = c.args
             if not value.get('tree_branch'): continue
             tip = text_rects[value['label']].x - 8
             middle = cell.y + cell.h // 2
-            self.assertIn((tip - 4, middle - 3, tip, middle, velox.Palette.muted), lines)
-            self.assertIn((tip - 4, middle + 3, tip, middle, velox.Palette.muted), lines)
-            self.assertLess(cell.x + 12, tip)
+            self.assertIn((tip - 4, middle - 3, tip, middle, velox.Palette.muted2), lines)
+            self.assertIn((tip - 4, middle + 3, tip, middle, velox.Palette.muted2), lines)
+            self.assertLess(cell.x + 10 + w._text_width("C"), tip)
 
     def test_collapse_removes_hidden_branches_and_parent_tail(self) -> None:
         w, calls, text = self.render(collapse={'C1'})
@@ -45542,6 +45638,434 @@ class FilePickerResizeCursorTests(unittest.TestCase):
         with mock.patch.object(velox, 'sdl', SimpleNamespace()):
             host.set_cursor_kind('resize_nwse')
         self.assertEqual(host._cursor_kind, 'resize_nwse')
+
+
+class ChatTotalCostTests(_StorageFixture):
+    def task(self, kind: str = 'chat', chat_id: str | None = None, **metadata: Any) -> str:
+        return self.monitor.start(velox.APP_SCOPE_ID, 'Cost regression', task_kind=kind,
+            identity_key='chat:' + (chat_id or self.cid) if kind == 'chat' else '',
+            metadata=dict(chat_id=chat_id or self.cid, **metadata))
+
+    def charge(self, task: str, *, endpoint: str = '', input_tokens: int = 100000,
+               output_tokens: int = 20000, cached: int | None = 80000, final: bool = True,
+               round_id: str = '') -> str:
+        endpoint = endpoint or velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
+        profile = velox.endpoint_profile_ref(self.storage.load_config(), endpoint)
+        rid = round_id or self.monitor.begin_inference_round(task,
+            velox.LLMRequest(velox.APP_SCOPE_ID, endpoint, []), profile)
+        self.assertTrue(self.monitor.set_inference_round_metrics(task, rid,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            cached_input_tokens=cached, estimated=not final, final=final))
+        return rid
+
+    def breakdown(self, task: str) -> dict[str, Any]:
+        return self.monitor.record_snapshot(task)['chat_cost_breakdown']
+
+    def panel_row(self, task: str) -> dict[str, Any]:
+        panel = object.__new__(velox.Panels)
+        panel._dashboard_task_context_menu_items = lambda row: []
+        return panel._dashboard_live_task_row(self.monitor.record_snapshot(task))
+
+    def test_chat_row_sums_mixed_endpoint_workers_without_changing_own_metrics(self) -> None:
+        chat, agent = self.task(), self.task('agent', agent_id='worker')
+        self.charge(chat)
+        self.charge(agent, endpoint=velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID)
+        costs = self.breakdown(chat)
+        self.assertAlmostEqual(costs['chat']['total_usd'], .256)
+        self.assertAlmostEqual(costs['subagents']['total_usd'], .0128)
+        self.assertAlmostEqual(costs['total']['total_usd'], .2688)
+        self.assertEqual(self.panel_row(chat)['cost']['label'], '$0.27')
+        self.assertEqual(self.panel_row(agent)['cost']['label'], '$0.01')
+        self.assertAlmostEqual(self.monitor.record_snapshot(chat)['token_cost']['total_usd'], .256)
+        self.assertEqual(self.monitor.record_snapshot(chat)['input_tokens'], 100000)
+
+    def test_tooltip_has_requested_split_and_no_boilerplate(self) -> None:
+        chat, child = self.task(), self.task('agent')
+        self.charge(chat); self.charge(child)
+        row = self.panel_row(chat)
+        self.assertIn('Chat $0.26 | Subagents $0.26', row['_tooltip'])
+        self.assertIn('Estimated token cost (USD): $0.51', row['_tooltip'])
+        self.assertIn('Input $0.08 | Cache read $0.03 | Output $0.40', row['_tooltip'])
+        for phrase in ('own requests only', 'excludes child rows', 'Provider usage;',
+                       'Frozen per-request', 'Excludes tool fees', 'Reported cache-write premium'):
+            self.assertNotIn(phrase, row['_tooltip'])
+            self.assertNotIn(phrase, self.panel_row(child)['_tooltip'])
+        self.assertEqual(len(row['cost']['tooltip'].splitlines()), 3)
+        self.assertEqual(len(self.panel_row(child)['cost']['tooltip'].splitlines()), 2)
+
+    def test_nested_reviewers_images_and_owned_system_requests_are_counted_once(self) -> None:
+        chat = self.task()
+        tasks = [chat, self.task('agent', agent_id='a'), self.task('agent', agent_id='b', parent_agent_id='a'),
+                 self.task('agent', agent_id='review', parent_agent_id='b'),
+                 self.task('image', agent_id='review'), self.task('summary'), self.task('compaction')]
+        for task in tasks: self.charge(task)
+        costs = self.breakdown(chat)
+        self.assertEqual(costs['subagents']['requests'], 6)
+        self.assertAlmostEqual(costs['total']['total_usd'], 7 * .256)
+        self.assertEqual(self.monitor.statistics()['costs_24h']['requests'], 7)
+        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], 7 * .256)
+        self.assertNotIn('chat_cost_breakdown', self.monitor.record_snapshot(tasks[1]))
+
+    def test_other_chats_and_unowned_system_jobs_are_excluded(self) -> None:
+        chat, other = self.task(), self.task(chat_id='another-chat')
+        child = self.task('agent', chat_id='another-chat')
+        system = self.monitor.start(velox.APP_SCOPE_ID, 'Unowned job', task_kind='system')
+        for task in (chat, other, child, system): self.charge(task)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], .256)
+        self.assertAlmostEqual(self.breakdown(other)['total']['total_usd'], .512)
+        self.assertEqual(self.breakdown(chat)['subagents']['requests'], 0)
+
+    def test_costs_reconcile_streaming_final_and_repeated_final_without_duplication(self) -> None:
+        chat, child = self.task(), self.task('agent')
+        rid = self.charge(child, final=False, input_tokens=200000)
+        self.assertEqual(self.breakdown(chat)['total']['estimated_requests'], 1)
+        self.charge(child, round_id=rid)
+        self.charge(child, round_id=rid)
+        cost = self.breakdown(chat)['total']
+        self.assertEqual(cost['estimated_requests'], 0)
+        self.assertEqual(cost['requests'], 1)
+        self.assertAlmostEqual(cost['total_usd'], .256)
+        self.assertEqual(self.monitor.statistics()['costs_24h']['requests'], 1)
+
+    def test_completed_failed_cancelled_and_running_children_all_keep_incurred_cost(self) -> None:
+        chat = self.task()
+        for state in ('completed', 'failed', 'cancelled', 'running'):
+            child = self.task('agent'); self.charge(child)
+            self.monitor.update(child, state=state)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], 4 * .256)
+
+    def test_deleting_child_keeps_chat_cost_without_double_counting_ledger(self) -> None:
+        chat, child = self.task(), self.task('agent')
+        self.charge(chat); self.charge(child); self.monitor.complete(child)
+        before = self.breakdown(chat)
+        self.assertTrue(self.monitor.delete_task(child)); self.assertFalse(self.monitor.delete_task(child))
+        self.assertEqual(self.breakdown(chat), before)
+        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], .512)
+        self.assertFalse(self.monitor.set_inference_round_metrics(child, 'late', input_tokens=999))
+        self.assertEqual(self.breakdown(chat), before)
+
+    def test_reopened_chat_keeps_prior_turns_and_children(self) -> None:
+        chat, child = self.task(), self.task('agent')
+        self.charge(chat); self.charge(child); self.monitor.complete(chat)
+        self.assertEqual(self.task(), chat)
+        self.charge(chat)
+        cost = self.breakdown(chat)
+        self.assertAlmostEqual(cost['chat']['total_usd'], .512)
+        self.assertAlmostEqual(cost['subagents']['total_usd'], .256)
+
+    def test_recreated_dashboard_chat_row_keeps_deleted_own_and_child_costs(self) -> None:
+        chat, child = self.task(), self.task('agent')
+        self.charge(chat); self.charge(child)
+        self.monitor.complete(chat); self.monitor.complete(child)
+        self.monitor.delete_task(child); self.monitor.delete_task(chat)
+        reopened = self.task(); self.assertNotEqual(reopened, chat)
+        self.assertAlmostEqual(self.breakdown(reopened)['total']['total_usd'], .512)
+        self.charge(reopened)
+        self.assertAlmostEqual(self.breakdown(reopened)['total']['total_usd'], .768)
+
+    def test_unpriced_and_cache_unknown_children_are_not_presented_as_free(self) -> None:
+        cfg = self.storage.load_config(); eid = velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID
+        velox.endpoint_profile_ref(cfg, eid).update(dict.fromkeys(velox.ENDPOINT_PRICE_FIELDS, None))
+        self.storage.write_config(cfg)
+        chat, child = self.task(), self.task('agent')
+        self.charge(chat); self.charge(child, endpoint=eid, cached=None)
+        row = self.panel_row(chat)
+        self.assertEqual(row['cost']['label'], '$0.26 + ?')
+        self.assertIn('Subagents Unpriced', row['_tooltip'])
+        self.assertIn('1 unpriced', row['_tooltip'])
+        self.assertIn('1 cache unknown', row['_tooltip'])
+
+    def test_subcent_requests_are_added_before_rounding_and_sorting_uses_full_total(self) -> None:
+        chat = self.task()
+        for _ in range(3):
+            self.charge(self.task('image'), input_tokens=0, output_tokens=8000, cached=0,
+                        endpoint=velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID)
+        row = self.panel_row(chat)
+        self.assertEqual(row['cost']['label'], '$0.01')
+        self.assertAlmostEqual(row['cost']['sort'], .012)
+
+    def test_snapshot_and_visible_limits_cannot_mutate_or_truncate_rollup(self) -> None:
+        chat = self.task()
+        for _ in range(5): self.charge(self.task('agent'))
+        snapshot = self.breakdown(chat)
+        snapshot['subagents']['total_usd'] = 9000
+        self.monitor.dashboard_records(limit=1); self.monitor.list_records(limit=1)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], 5 * .256)
+
+    def test_source_chat_id_fallback_and_unidentified_chat_are_safe(self) -> None:
+        chat = self.task()
+        child = self.monitor.start(velox.APP_SCOPE_ID, 'Worker', task_kind='agent', metadata={'source_chat_id': self.cid})
+        orphan = self.monitor.start(velox.APP_SCOPE_ID, 'No owner', task_kind='chat')
+        self.charge(child); self.charge(orphan)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], .256)
+        self.assertAlmostEqual(self.breakdown(orphan)['chat']['total_usd'], .256)
+        self.assertEqual(self.breakdown(orphan)['subagents'], {})
+
+    def test_grouping_cache_is_reused_and_invalidates_on_child_changes(self) -> None:
+        chat, other = self.task(), self.task(chat_id='other')
+        child = self.task('agent'); self.charge(child)
+        self.breakdown(chat); cache = self.monitor._chat_cost_rollups
+        self.breakdown(other)
+        self.assertIs(self.monitor._chat_cost_rollups, cache)
+        self.charge(child); self.breakdown(chat)
+        self.assertIsNot(self.monitor._chat_cost_rollups, cache)
+        self.assertAlmostEqual(self.breakdown(chat)['subagents']['total_usd'], .512)
+
+    def test_nonzero_cache_write_component_remains_visible_without_notes(self) -> None:
+        tip = velox.token_cost_tooltip({'total_usd': 1.25, 'cache_write_premium_usd': .25})
+        self.assertIn('Cache write $0.25', tip)
+        self.assertEqual(len(tip.splitlines()), 2)
+
+
+class GPT6InlineDefaultTests(_StorageFixture):
+    def test_all_three_bundled_openai_presets_default_to_inline(self) -> None:
+        profiles = [p for p in velox.default_endpoint_profiles() if p['model_type'] in velox.ENDPOINT_GPT_6_MODEL_TYPES]
+        self.assertEqual(len(profiles), 3)
+        for profile in profiles:
+            with self.subTest(model=profile['model_type']):
+                self.assertEqual(profile['image_analysis_context'], 'inline')
+                self.assertTrue(velox.endpoint_uses_inline_image_analysis(profile))
+                self.assertTrue(velox.endpoint_supports_vision(profile))
+
+    def test_new_custom_named_gpt6_profiles_use_inline_only_on_requested_providers(self) -> None:
+        for family in velox.ENDPOINT_GPT_6_MODEL_TYPES:
+            for provider in ('openai', 'vllm', 'novita', 'custom'):
+                with self.subTest(family=family, provider=provider):
+                    profile = velox.default_endpoint_profile('custom', 'Custom', timeout_seconds=900,
+                        model_type=family, provider=provider)
+                    self.assertEqual(profile['image_analysis_context'], 'inline' if provider in ('openai', 'vllm') else 'separate')
+
+    def test_explicit_saved_separate_survives_reload_and_editor_roundtrip(self) -> None:
+        cfg = self.storage.load_config()
+        for profile in cfg['llm']['endpoint_profiles']:
+            if profile['model_type'] in velox.ENDPOINT_GPT_6_MODEL_TYPES:
+                profile['image_analysis_context'] = 'separate'
+        self.storage.write_config(cfg); before = self.paths.app_json_path.read_bytes()
+        loaded = velox.Storage(self.paths).load_config()
+        panel = object.__new__(velox.Panels)
+        for profile in loaded['llm']['endpoint_profiles']:
+            if profile['model_type'] not in velox.ENDPOINT_GPT_6_MODEL_TYPES: continue
+            draft = panel._endpoint_profile_editor_draft(profile)
+            result = panel._endpoint_profile_from_editor_draft(draft)
+            self.assertEqual(result['image_analysis_context'], 'separate')
+        self.assertEqual(self.paths.app_json_path.read_bytes(), before)
+
+    def test_switching_editor_from_custom_openai_to_gpt6_updates_default(self) -> None:
+        for family in velox.ENDPOINT_GPT_6_MODEL_TYPES:
+            profile = velox.default_endpoint_profile('new', 'New', timeout_seconds=900, provider='openai')
+            self.assertEqual(profile['image_analysis_context'], 'separate')
+            velox.Panels._apply_endpoint_model_type_to_editor_draft(profile, family)
+            self.assertEqual(profile['image_analysis_context'], 'inline')
+
+    def test_reapplying_family_keeps_saved_separate_choice(self) -> None:
+        for profile in velox.default_endpoint_profiles():
+            if profile['model_type'] not in velox.ENDPOINT_GPT_6_MODEL_TYPES: continue
+            profile['image_analysis_context'] = 'separate'
+            velox.Panels._apply_endpoint_model_type_to_editor_draft(profile, profile['model_type'])
+            self.assertEqual(profile['image_analysis_context'], 'separate')
+
+    def test_other_hosted_models_retain_separate_default(self) -> None:
+        for family in (velox.ENDPOINT_MODEL_TYPE_CUSTOM, velox.ENDPOINT_MODEL_TYPE_KIMI_K3, velox.ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH):
+            for provider in ('openai', 'novita'):
+                self.assertEqual(velox.endpoint_default_image_analysis_context(provider, family), 'separate')
+
+
+class ChecklistTreeAlignmentTests(unittest.TestCase):
+    def render(self, char_w: int = 8, line_h: int = 20):
+        w = ChecklistRenderingTests.widgets(); w.font.char_w = char_w; w.font.line_h = line_h
+        rows = velox.Panels._expert_mode_table_rows(ConnectedChecklistTreeTests.fixture())
+        with mock.patch.object(w, '_draw_table_tree_connector', wraps=w._draw_table_tree_connector) as branches, \
+             mock.patch.object(w, '_draw_table_status_icon', wraps=w._draw_table_status_icon) as marks, \
+             mock.patch.object(w, 'clipped_text', wraps=w.clipped_text) as texts:
+            w.table_view('aligned-tree', velox.Rect(0, 0, 1000, 600), velox.Panels._expert_mode_table_columns(), rows)
+        return w, branches.call_args_list, marks.call_args_list, texts.call_args_list
+
+    def test_trunk_uses_font_boundary_between_parent_c_and_number(self) -> None:
+        for width in (7, 10, 15, 22):
+            with self.subTest(char_width=width):
+                w, branches, marks, texts = self.render(width, width * 2)
+                rects = {c.args[1]: c.args[0] for c in texts}
+                parent_x = rects['C1'].x
+                expected = parent_x + width
+                lines = [a for name, a, k in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted2]
+                for call in branches:
+                    cell, indent, value = call.args
+                    if value.get('tree_branch'):
+                        self.assertTrue(any(a[0] == a[2] == expected and a[1] == cell.y for a in lines))
+                    else:
+                        self.assertIn((expected, cell.y + cell.h - 5, expected, cell.y + cell.h, velox.Palette.muted2), lines)
+
+    def test_arrow_gap_and_minimum_branch_length_survive_large_fonts(self) -> None:
+        for width in (7, 12, 18, 24):
+            w, branches, marks, texts = self.render(width, width * 2)
+            rects = {c.args[1]: c.args[0] for c in texts}
+            lines = [a for n, a, k in w.renderer.drawn if n == 'draw_line' and a[-1] == velox.Palette.muted2]
+            for call in branches:
+                cell, indent, value = call.args
+                if not value.get('tree_branch'): continue
+                tip = rects[value['label']].x - 8
+                self.assertGreaterEqual(tip - (cell.x + 10 + width), 6)
+                self.assertIn((tip - 4, cell.y + cell.h // 2 - 3, tip, cell.y + cell.h // 2, velox.Palette.muted2), lines)
+
+    def test_step_marks_are_shifted_exactly_ten_pixels_and_stay_in_status_column(self) -> None:
+        w, branches, marks, texts = self.render()
+        self.assertEqual([c.args[3] for c in marks], [0, 10, 10, 10, 0, 10])
+        lines = [a for n, a, k in w.renderer.drawn if n == 'draw_line' and a[-1] == velox.Palette.ok]
+        self.assertEqual(lines[4][0] - lines[0][0], 10)
+        for call in marks:
+            cell = call.args[0]
+            strokes = [a for a in lines if cell.y <= a[1] < cell.y + cell.h]
+            self.assertEqual(len(strokes), 4)
+            for x0, y0, x1, y1, color in strokes:
+                self.assertGreaterEqual(min(x0, x1), cell.x)
+                self.assertLess(max(x0, x1), cell.x + cell.w)
+
+    def test_connector_gray_matches_step_ids_not_brighter_parent(self) -> None:
+        w, branches, marks, texts = self.render()
+        colors = {c.args[1]: c.args[2] for c in texts}
+        self.assertEqual(colors['C1.1'], velox.Palette.muted2)
+        self.assertEqual(colors['C1'], velox.Palette.text)
+        for cell, indent, value in [c.args for c in branches]:
+            w.renderer.drawn.clear(); w._draw_table_tree_connector(cell, indent, value)
+            self.assertTrue(all(a[-1] == colors['C1.1'] for n, a, k in w.renderer.drawn if n == 'draw_line'))
+
+    def test_narrow_status_cells_clamp_requested_indent_for_checks_and_dots(self) -> None:
+        for width in (6, 12, 20, 34):
+            for icon in ('check', 'dot'):
+                w = ChecklistRenderingTests.widgets(); cell = velox.Rect(10, 10, width, 40)
+                w._draw_table_status_icon(cell, icon, velox.Palette.ok, 10)
+                for name, args, kwargs in w.renderer.drawn:
+                    if name == 'draw_line':
+                        self.assertTrue(cell.x <= args[0] < cell.x + cell.w)
+                        self.assertTrue(cell.x <= args[2] < cell.x + cell.w)
+                    if name == 'draw_round_rect':
+                        self.assertGreaterEqual(args[0].x, cell.x)
+                        self.assertLessEqual(args[0].x + args[0].w, cell.x + cell.w)
+
+
+class RunnerPortabilityRegressionTests(_StorageFixture):
+    def test_prompt_budget_is_independent_of_temp_root_length(self) -> None:
+        short = _normalized_prompt_budget_sample(self.storage, self.cid)
+        longer = _make_test_storage(self.paths.root_dir / 'runner_checkout_with_a_long_workspace_path')
+        try:
+            chat_id = velox.ChatStore(longer).create_chat('Prompt length')['chat_id']
+            long = _normalized_prompt_budget_sample(longer, chat_id)
+            self.assertEqual(len(short), len(long))
+            self.assertLess(len(short), 13_500)
+            self.assertIn('every requested requirement', long)
+            self.assertNotIn(str(longer.paths.root_dir), long)
+        finally:
+            _drain_storage_log_writer(longer)
+
+    def test_prompt_budget_still_detects_added_static_instructions(self) -> None:
+        original = velox.ContextAssembler.assemble_chat_context
+        def bloated(assembler, *args, **kwargs):
+            rows = original(assembler, *args, **kwargs)
+            rows[0]['content'] += '\n' + 'New instruction. ' * 1000
+            return rows
+        with mock.patch.object(velox.ContextAssembler, 'assemble_chat_context', bloated):
+            self.assertGreater(len(_normalized_prompt_budget_sample(self.storage, self.cid)), 13_500)
+
+    def test_prompt_budget_uses_fixed_host_facts_instead_of_live_machine_inventory(self) -> None:
+        prompt = _normalized_prompt_budget_sample(self.storage, self.cid)
+        self.assertIn('OS: TestOS', prompt)
+        self.assertIn('CPU: Test CPU', prompt)
+        self.assertIn('/VELOX_TEST_ROOT', prompt)
+        self.assertNotIn(str(self.paths.root_dir), prompt)
+
+    def test_stop_fixture_waits_for_persistence_before_removing_data_root(self) -> None:
+        case = StallAndProgressTests('test_chat_stop_immediately_stops_status_and_stale_stream_fallback')
+        original = velox.ChatStore.set_agent_reports_suspended
+        entered = threading.Event(); completed = threading.Event()
+        def persist(store, *args, **kwargs):
+            entered.set()
+            try: return original(store, *args, **kwargs)
+            finally: completed.set()
+        with mock.patch.object(velox.ChatStore, 'set_agent_reports_suspended', persist):
+            result = unittest.TestResult(); case.run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors or result.failures)
+        self.assertTrue(entered.is_set()); self.assertTrue(completed.is_set())
+
+
+class RunnerFailureDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def failure_result() -> unittest.TestResult:
+        class FailureFixture(unittest.TestCase):
+            def test_actual_assertion(self): self.assertLess(13619, 13500, 'fixture prompt budget')
+        result = unittest.TestResult(); FailureFixture('test_actual_assertion').run(result)
+        return result
+
+    def test_failure_details_preserve_assertion_and_do_not_publish_success(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / 'result.ok'
+            with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'launch-token'}):
+                result = self.failure_result()
+                _publish_test_result(result, 1); _publish_test_failure_details(result, 1)
+            text = _read_test_failure_details(marker, os.getpid(), 'launch-token', 1)
+            self.assertIn('test_actual_assertion', text)
+            self.assertIn('13619 not less than 13500', text)
+            self.assertFalse(_test_result_matches(marker, os.getpid(), 1))
+            self.assertFalse(marker.exists())
+
+    def test_failure_diagnostics_reject_other_launches_counts_and_corrupt_files(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / 'result.ok'
+            with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'token'}):
+                _publish_test_failure_details(self.failure_result(), 1)
+            for pid, token, count in ((os.getpid()+1,'token',1), (os.getpid(),'wrong',1), (os.getpid(),'token',2), (os.getpid(),'',1)):
+                self.assertEqual(_read_test_failure_details(marker, pid, token, count), '')
+            path = _failure_details_path(marker)
+            for raw in (b'not-json', b'[]', b'x' * 131073):
+                path.write_bytes(raw)
+                self.assertEqual(_read_test_failure_details(marker, os.getpid(), 'token', 1), '')
+
+    def test_success_has_no_failure_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / 'result.ok'; result = unittest.TestResult(); result.testsRun = 1
+            with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'token'}):
+                _publish_test_result(result, 1); _publish_test_failure_details(result, 1)
+            self.assertTrue(_test_result_matches(marker, os.getpid(), 1))
+            self.assertFalse(_failure_details_path(marker).exists())
+
+    def test_parent_summary_repeats_failed_test_id_and_cleans_all_sidecars(self) -> None:
+        class FailureFixture(unittest.TestCase):
+            def test_actual_assertion(self): self.fail('fixture failure')
+        inventory = unittest.TestSuite([unittest.TestSuite([FailureFixture('test_actual_assertion')])])
+        paths = []
+        def launch(*args, **kwargs):
+            env = kwargs['env']; marker = Path(env['VELOX_TEST_SUCCESS_MARKER']); paths.append(marker)
+            with mock.patch.dict(os.environ, env):
+                _write_child_identity(env['VELOX_TEST_RUN_TOKEN'], 1)
+                _publish_test_failure_details(self.failure_result(), 1)
+            return SimpleNamespace(pid=os.getpid(), poll=lambda: 1)
+        with mock.patch.object(unittest.defaultTestLoader, 'loadTestsFromModule', return_value=inventory), \
+             mock.patch.object(subprocess, 'Popen', side_effect=launch), \
+             mock.patch(f'{__name__}._raw_test_status_write') as status:
+            code = run_test_suite()
+        text = '\n'.join(str(c.args[0]) for c in status.call_args_list)
+        self.assertEqual(code, 1)
+        self.assertIn('FAILED (groups:', text)
+        self.assertIn('test_actual_assertion', text)
+        self.assertIn('13619 not less than 13500', text)
+        for marker in paths:
+            for path in (marker, _child_identity_path(marker), _failure_details_path(marker)):
+                self.assertFalse(path.exists())
+
+    def test_failure_details_bound_large_tracebacks_and_include_unexpected_success(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / 'result.ok'; result = self.failure_result()
+            test, trace = result.failures[0]
+            result.failures = [(test, 'x' * 10000 + 'last assertion') for _ in range(20)]
+            result.testsRun = 20
+            with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'token'}):
+                _publish_test_failure_details(result, 20)
+            text = _read_test_failure_details(marker, os.getpid(), 'token', 20)
+            self.assertLess(len(text), 32000); self.assertEqual(text.count('last assertion'), 12)
+            result.failures = []; result.unexpectedSuccesses = [test]; result.testsRun = 1
+            with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'token'}):
+                _publish_test_failure_details(result, 1)
+            self.assertIn('UNEXPECTED SUCCESS', _read_test_failure_details(marker, os.getpid(), 'token', 1))
+
 
 
 def main() -> None:
