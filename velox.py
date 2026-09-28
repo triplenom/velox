@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 313
+CURRENT_VERSION = 314
 BACKWARD_COMPATIBLE_VERSION = 311
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -379,6 +379,8 @@ CONTEXT_DOC_UPDATE_FREQUENCIES: tuple[str, ...] = ("hourly", "daily")
 CONTEXT_DOC_AUTOSAVE_DELAY_SECONDS = 0.35
 SCHEDULED_TASK_POLL_SECONDS = 0.5
 CONTEXT_DOC_FREQUENCY_MINUTES: dict[str, int] = {"hourly": 60, "daily": 24 * 60}
+# Stored record vocabulary is retained for archival records in compatible roots.
+# Only VAULT_SOURCE_ORDER exposes active connectors; archived records never sync.
 VAULT_SOURCE_TYPES: tuple[str, ...] = ("google_calendar", "google_drive", "gmail", "slack")
 VAULT_CONNECTION_STATES: tuple[str, ...] = (
     "not_configured", "connected", "syncing", "error", "disabled",
@@ -406,36 +408,31 @@ VAULT_CURSOR_TYPES: tuple[str, ...] = (
 VAULT_LOCAL_TIMEZONE_DEFAULT = "system"
 VAULT_CACHE_EXTERNAL_POLL_SECONDS = 1.0
 VAULT_RAW_PAYLOAD_MAX_BYTES = 16 * 1024 * 1024
-VAULT_SOURCE_ORDER: tuple[str, ...] = ("google_calendar", "google_drive", "gmail", "slack")
+VAULT_SOURCE_ORDER: tuple[str, ...] = ("google_calendar", "google_drive", "gmail")
 VAULT_SOURCE_LABELS: dict[str, str] = {
     "google_calendar": "Google Calendar",
     "google_drive": "Google Drive",
     "gmail": "Gmail",
-    "slack": "Slack",
 }
 VAULT_SOURCE_SHORT_LABELS: dict[str, str] = {
     "google_calendar": "GCalendar",
     "google_drive": "GDrive",
     "gmail": "GMail",
-    "slack": "Slack",
 }
 VAULT_SEARCH_PLACEHOLDERS: dict[str, str] = {
     "google_calendar": "Search events...",
     "google_drive": "Search Drive on demand with drive_search...",
     "gmail": "Search email...",
-    "slack": "Search messages...",
 }
 VAULT_LEFT_HEADERS: dict[str, str] = {
     "google_calendar": "DAYS",
     "google_drive": "FILES",
     "gmail": "MESSAGES",
-    "slack": "CHANNELS",
 }
 VAULT_RIGHT_HEADERS: dict[str, str] = {
     "google_calendar": "EVENTS",
     "google_drive": "FILE",
     "gmail": "EMAIL",
-    "slack": "MESSAGES AND THREADS",
 }
 VAULT_SEARCH_DEBOUNCE_SECONDS = 0.25
 VAULT_DIVIDER_DEFAULT_FRACTION = 0.35
@@ -447,9 +444,6 @@ VAULT_TOOLBAR_GAP = 8
 VAULT_CALENDAR_ROW_H = 46
 VAULT_GOOGLE_DRIVE_ROW_H = 78
 VAULT_GMAIL_ROW_H = 78
-VAULT_SLACK_CHANNEL_ROW_H = 58
-VAULT_SLACK_DYNAMIC_LAYOUT_MAX_ROWS = 5_000
-VAULT_SLACK_FIXED_ROW_H = 128
 VAULT_MAX_DETAIL_MARKDOWN_CHARS = 2_000_000
 GOOGLE_CALENDAR_SOURCE_TYPE = "google_calendar"
 GOOGLE_CALENDAR_SCOPES: tuple[str, ...] = ("https://www.googleapis.com/auth/calendar.readonly",)
@@ -581,30 +575,6 @@ GMAIL_DRAFT_LABELS = frozenset({"\\draft", "\\drafts", "draft", "drafts"})
 GMAIL_SPAM_LABELS = frozenset({"\\spam", "spam"})
 GMAIL_TRASH_LABELS = frozenset({"\\trash", "trash"})
 
-SLACK_SOURCE_TYPE = "slack"
-SLACK_API_BASE_URL = "https://slack.com/api"
-SLACK_OAUTH_AUTHORIZE_URL = "https://slack.com/oauth/v2/authorize"
-SLACK_OAUTH_ACCESS_URL = "https://slack.com/api/oauth.v2.access"
-SLACK_APPS_URL = "https://api.slack.com/apps"
-SLACK_USER_SCOPES: tuple[str, ...] = (
-    "channels:read", "channels:history", "groups:read", "groups:history",
-    "im:read", "im:history", "mpim:read", "mpim:history", "users:read",
-    "reactions:read", "files:read",
-)
-SLACK_REQUIRED_USER_SCOPES: tuple[str, ...] = SLACK_USER_SCOPES[:9]
-SLACK_REDIRECT_URI_DEFAULT = "http://127.0.0.1:8765/slack/oauth/callback"
-SLACK_NETWORK_TIMEOUT_SECONDS = 45
-SLACK_PAGE_SIZE = 200
-SLACK_HISTORY_PAGE_SIZE = 200
-SLACK_INITIAL_HISTORY_DAYS_DEFAULT = 180
-SLACK_SYNC_INTERVAL_MINUTES_DEFAULT = 10
-SLACK_INCREMENTAL_OVERLAP_SECONDS = 48 * 60 * 60
-SLACK_USER_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
-SLACK_CREDENTIAL_ACCOUNT = "slack"
-SLACK_GLOBAL_AUTH_ERRORS = frozenset({
-    "not_authed", "invalid_auth", "token_revoked", "account_inactive",
-    "missing_scope", "no_permission", "team_access_not_granted",
-})
 CONNECTOR_STARTUP_DELAY_SECONDS = 5.0
 CONNECTOR_TRANSIENT_RETRY_COUNT = 2
 CONNECTOR_MAX_STATUS_EVENTS = 120
@@ -2995,11 +2965,11 @@ Keep progress concise and evidence-based, with a concrete next action. Emit term
 DEFAULT_PERSONAL_ASSISTANT_AGENT_SKILL_NAME = "Personal Assistant"
 DEFAULT_PERSONAL_ASSISTANT_AGENT_SKILL_MARKDOWN = r"""Use this skill for the scheduled Personal Assistant agent supporting the user's daily work.
 
-Review cached Gmail/Slack through vault_search/vault_get and local Calendar Events/Items. Access Google Drive ad hoc: drive_list_drives/drive_list_root, bounded drive_list_children/search, then read/download a concrete file. Identify commitments, deadlines, meeting preparation, unanswered questions, risks and useful local work.
+Review cached Gmail through vault_search/vault_get and local Calendar Events/Items. Access Google Drive ad hoc: drive_list_drives/drive_list_root, bounded drive_list_children/search, then read/download a concrete file. Identify commitments, deadlines, meeting preparation, unanswered questions, risks and useful local work.
 
 Create/update existing Items with factual dates, Event/Context Links, P1/P2/P3 and the five established states. Check prior PA reports and current Items before adding or delegating work. Delegate clear local deliverables to General Agents with exclusive absolute write scopes (or explicit read-only); wait for automatic returns while working on disjoint resources.
 
-Draft communications and artifacts for review. Email, Slack, Google Calendar and Drive are read-only in this role. Finish with a concise daily report of sources reviewed, material changes, Items/Agents, produced artifacts, blockers and next actions."""
+Draft communications and artifacts for review. Email, Google Calendar and Drive are read-only in this role. Finish with a concise daily report of sources reviewed, material changes, Items/Agents, produced artifacts, blockers and next actions."""
 
 
 DEFAULT_COMFYUI_SKILL_NAME = "ComfyUI"
@@ -4517,82 +4487,176 @@ def token_cost_tooltip(
     return "\n".join(lines)
 
 
-class TokenCostLedger:
-    """Small, append-only daily usage ledger. Repeated final events replace, not add.
+DASHBOARD_COST_PERIODS = {
+    "1 hour": 3600,
+    "24 hours": 86400,
+    "30 days": 30 * 86400,
+    "90 days": 90 * 86400,
+    "1 year": 365 * 86400,
+}
 
-    Only the rolling two UTC day files are loaded. Prices and usage are frozen per
-    physical request; deleting Dashboard rows never deletes recorded usage. No
-    prompts, URLs, credentials, or prior-format migration are involved.
+
+class TokenCostLedger:
+    """Append-only daily accounting with cached daily aggregates and rolling windows.
+
+    Queries run on the Dashboard's background worker. Whole historical days retain
+    only endpoint aggregates, not a year's raw requests. Boundary days retain the
+    events needed for exact rolling cutoffs. Request completion writes one event;
+    it never scans historical files. No prompts or credentials enter this ledger.
     """
     def __init__(self, root: Path):
         self.directory = Path(root) / "usage_costs"
         self._lock = threading.RLock()
-        self._days: tuple[str, ...] = ()
+        self._query_lock = threading.Lock()
         self._events: dict[str, dict[str, Any]] = {}
+        self._unsaved: dict[str, dict[str, Any]] = {}
+        self._day_cache: dict[str, dict[str, Any]] = {}
+        self._day_revisions: collections.Counter[str] = collections.Counter()
         self.error = ""
 
-    def _load_days(self, epoch: float) -> None:
-        today = datetime.fromtimestamp(epoch, timezone.utc).date()
-        days = tuple((today - timedelta(days=n)).isoformat() for n in (1, 0))
-        if days == self._days:
-            return
-        self._days = days
-        retained = {k: v for k, v in self._events.items() if float(v.get("epoch") or 0) >= epoch - 86400}
-        for day in days:
-            path = self.directory / (day + ".jsonl")
-            if not path.exists():
-                continue
-            try:
-                for event in iter_jsonl(path):
-                    if (not isinstance(event, dict) or event.get("schema") != data_schema("token_cost")
-                            or set(event) != {"schema", "event_id", "epoch", "pricing", "cost"}
-                            or not isinstance(event.get("event_id"), str)
-                            or not isinstance(event.get("pricing"), dict) or not isinstance(event.get("cost"), dict)
-                            or not isinstance(event.get("epoch"), (int, float)) or not math.isfinite(event["epoch"])
-                            or any(not isinstance(event["cost"].get(key), (int, float))
-                                   or not math.isfinite(event["cost"][key]) or event["cost"][key] < 0 for key in TOKEN_COST_SUM_FIELDS)):
-                        self.error = "Some cost ledger records are invalid or unsupported; totals may be incomplete."
-                        continue
-                    retained[event["event_id"]] = event
-            except (OSError, ValueError) as exc:
-                self.error = "Cannot read cost ledger; totals may be incomplete: " + type(exc).__name__
-        self._events = retained
+    @staticmethod
+    def _valid_event(event: Any) -> bool:
+        return (isinstance(event, dict) and event.get("schema") == data_schema("token_cost")
+                and set(event) == {"schema", "event_id", "epoch", "pricing", "cost"}
+                and isinstance(event.get("event_id"), str) and bool(event["event_id"])
+                and isinstance(event.get("pricing"), dict) and isinstance(event.get("cost"), dict)
+                and type(event.get("epoch")) in (int, float) and math.isfinite(event["epoch"])
+                and all(type(event["cost"].get(key)) in (int, float)
+                        and math.isfinite(event["cost"][key]) and event["cost"][key] >= 0
+                        for key in TOKEN_COST_SUM_FIELDS))
+
+    @staticmethod
+    def _day(epoch: float) -> str:
+        return datetime.fromtimestamp(epoch, timezone.utc).date().isoformat()
+
+    @staticmethod
+    def _group(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        labels: dict[str, str] = {}
+        for event in events:
+            prices = event["pricing"]
+            key = str(prices.get("endpoint_type") or "unpriced")
+            grouped.setdefault(key, []).append(event["cost"])
+            labels[key] = str(prices.get("type_label") or key)
+        return [{"endpoint_type": key, "label": labels[key], **sum_token_costs(costs)}
+                for key, costs in grouped.items()]
 
     def record(self, event: dict[str, Any]) -> None:
+        if not self._valid_event(event):
+            raise ValueError("Invalid cost ledger event")
+        day = self._day(event["epoch"])
         with self._lock:
-            self._load_days(time.time())
             key = event["event_id"]
-            old = self._events.get(key)
-            if old == event:
+            if self._events.get(key) == event and key not in self._unsaved:
                 return
-            day = datetime.fromtimestamp(event["epoch"], timezone.utc).date().isoformat()
             try:
                 append_jsonl(self.directory / (day + ".jsonl"), event)
+                self._unsaved.pop(key, None)
             except OSError as exc:
                 self.error = "Cost ledger could not be saved; totals are not durable: " + type(exc).__name__
+                self._unsaved[key] = copy.deepcopy(event)
             self._events[key] = copy.deepcopy(event)
+            self._day_revisions[day] += 1
+            # A bounded duplicate-write cache, not a second lifetime history.
+            if len(self._events) > 4096:
+                self._events.pop(next(iter(self._events)))
 
-    def summary(self, live: Iterable[dict[str, Any]] = (), *, now: float | None = None) -> dict[str, Any]:
-        epoch = time.time() if now is None else float(now)
+    def _read_day(self, day: str, *, raw: bool) -> dict[str, Any]:
+        path = self.directory / (day + ".jsonl")
         with self._lock:
-            self._load_days(epoch)
-            events = dict(self._events)
-            for event in live:
-                events[event["event_id"]] = event
-            grouped: dict[str, dict[str, Any]] = {}
-            total = {key: 0 for key in TOKEN_COST_SUM_FIELDS}
-            for event in events.values():
-                if not epoch - 86400 < float(event["epoch"]) <= epoch:
+            revision = self._day_revisions[day]
+            unsaved = {k: copy.deepcopy(v) for k, v in self._unsaved.items()
+                       if self._day(v["epoch"]) == day}
+        try:
+            st = path.stat()
+            signature = (st.st_mtime_ns, st.st_size, getattr(st, "st_ino", 0), revision)
+        except FileNotFoundError:
+            signature = (0, 0, 0, revision)
+        except OSError as exc:
+            self.error = "Cannot read cost ledger; totals may be incomplete: " + type(exc).__name__
+            signature = None
+        cached = self._day_cache.get(day)
+        if signature is not None and cached and cached["signature"] == signature:
+            if not raw or cached.get("events") is not None:
+                return cached
+        events: dict[str, dict[str, Any]] = {}
+        try:
+            for event in iter_jsonl(path):
+                if not self._valid_event(event) or self._day(event["epoch"]) != day:
+                    self.error = "Some cost ledger records are invalid or unsupported; totals may be incomplete."
                     continue
-                prices, cost = event["pricing"], event["cost"]
-                key = str(prices.get("endpoint_type") or "unpriced")
-                bucket = grouped.setdefault(key, {"endpoint_type": key, "label": str(prices.get("type_label") or key),
-                                                 **{field: 0 for field in TOKEN_COST_SUM_FIELDS}})
-                for field in TOKEN_COST_SUM_FIELDS:
-                    bucket[field] += cost.get(field, 0)
-                    total[field] += cost.get(field, 0)
-            ranked = sorted(grouped.values(), key=lambda row: (-row["total_usd"], row["label"]))
-            return {**total, "top_endpoints": ranked[:5], "endpoint_count": len(ranked), "error": self.error}
+                events[event["event_id"]] = event
+        except (OSError, ValueError, OverflowError) as exc:
+            self.error = "Cannot read cost ledger; totals may be incomplete: " + type(exc).__name__
+        events.update(unsaved)
+        result = {"signature": signature, "buckets": self._group(events.values()),
+                  "events": events if raw else None}
+        self._day_cache[day] = result
+        return result
+
+    def summary(self, live: Iterable[dict[str, Any]] = (), *, now: float | None = None,
+                window_seconds: int = 86400) -> dict[str, Any]:
+        epoch = time.time() if now is None else float(now)
+        if not math.isfinite(epoch) or type(window_seconds) is not int or not 0 < window_seconds <= 365 * 86400:
+            raise ValueError("Cost window must be 1 second through 365 days, with a finite end time")
+        cutoff = epoch - window_seconds
+        first = datetime.fromtimestamp(cutoff, timezone.utc).date()
+        last = datetime.fromtimestamp(epoch, timezone.utc).date()
+        live_by_day: dict[str, dict[str, dict[str, Any]]] = {}
+        for event in live:
+            if self._valid_event(event) and cutoff < event["epoch"] <= epoch:
+                live_by_day.setdefault(self._day(event["epoch"]), {})[event["event_id"]] = event
+        with self._query_lock:
+            buckets: dict[str, list[dict[str, Any]]] = {}
+            labels: dict[str, str] = {}
+            days = {(first + timedelta(days=n)).isoformat() for n in range((last - first).days + 1)}
+            for day in sorted(days):
+                boundary = day in (first.isoformat(), last.isoformat())
+                raw = boundary or day in live_by_day
+                cached = self._read_day(day, raw=raw)
+                if raw:
+                    # Durable final usage wins over a stale in-flight UI snapshot.
+                    events = dict(live_by_day.get(day, {}))
+                    events.update(cached["events"] or {})
+                    rows = self._group(event for event in events.values() if cutoff < event["epoch"] <= epoch)
+                else:
+                    rows = cached["buckets"]
+                for row in rows:
+                    key = row["endpoint_type"]
+                    labels[key] = row["label"]
+                    buckets.setdefault(key, []).append(row)
+                if not raw:
+                    cached["events"] = None
+            # Changing the selection cannot retain raw records for 365 days.
+            self._day_cache = {day: cached for day, cached in self._day_cache.items() if day in days}
+            ranked = sorted(({"endpoint_type": key, "label": labels[key], **sum_token_costs(rows)}
+                             for key, rows in buckets.items()),
+                            key=lambda row: (-row["total_usd"], row["label"], row["endpoint_type"]))
+            return {**sum_token_costs(ranked), "top_endpoints": ranked[:5], "endpoints": ranked,
+                    "endpoint_count": len(ranked), "window_seconds": window_seconds, "error": self.error}
+
+
+def endpoint_cost_bar_tooltip(endpoint: dict[str, Any], period: str) -> str:
+    """Token counts are explicit: input includes cached input, never adds it twice."""
+    inp = max(0, int(endpoint.get("input_tokens") or 0))
+    cached = min(inp, max(0, int(endpoint.get("cached_input_tokens") or 0)))
+    out = max(0, int(endpoint.get("output_tokens") or 0))
+    money = lambda key: token_cost_label({"total_usd": endpoint.get(key, 0)})
+    lines = [str(endpoint.get("label") or "Unknown endpoint"), "Last " + period,
+             "Cost (USD): " + token_cost_label(endpoint),
+             f"Input: {inp:,} tokens total",
+             f"Uncached input: {inp - cached:,} tokens | {money('input_usd')}",
+             f"Cached input: {cached:,} tokens | {money('cached_input_usd')}",
+             f"Output: {out:,} tokens | {money('output_usd')}"]
+    if endpoint.get("cache_write_premium_usd"):
+        lines.append("Cache writes: " + money("cache_write_premium_usd"))
+    if endpoint.get("unpriced_requests"):
+        lines.append(f"{int(endpoint['unpriced_requests']):,} requests have missing prices")
+    if endpoint.get("unknown_cache_requests"):
+        lines.append("Cache counts missing for some requests; those inputs use the uncached rate")
+    if endpoint.get("estimated_requests"):
+        lines.append("Includes locally estimated token counts")
+    return "\n".join(lines)
 
 
 ENDPOINT_PROFILE_USER_FIELDS = (
@@ -9490,7 +9554,15 @@ def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, locati
     actual = set(value)
     optional = {"default_chat_subagent_profile_id"} if location in {"settings.llm", "app.json.settings.llm"} else set()
     missing = sorted(str(key) for key in expected.difference(actual).difference(optional))
-    extra = sorted(str(key) for key in actual.difference(expected))
+    # Archived connector settings remain inert and untouched in compatible roots.
+    # They are not part of defaults, the scheduler, credentials, tools or the UI.
+    archived = (set(VAULT_SOURCE_TYPES) - set(VAULT_SOURCE_ORDER)) if location in {
+        "settings.vault", "app.json.settings.vault",
+    } else set()
+    for key in actual.intersection(archived):
+        if not isinstance(value[key], dict):
+            raise UnsupportedDataVersionError(f"{location}.{key} must be a JSON object")
+    extra = sorted(str(key) for key in actual.difference(expected).difference(archived))
     if missing or extra:
         details: list[str] = []
         if missing:
@@ -10855,11 +10927,11 @@ def normalize_vault_timestamp(
         return ""
     if allow_date and ISO_DATE_PATTERN.fullmatch(raw):
         return normalize_iso_date(raw, field_name=field_name)
-    # Slack timestamps are decimal Unix seconds.
+    # Numeric timestamps may contain fractional Unix seconds.
     if re.fullmatch(r"\d+(?:\.\d+)?", raw):
         try:
             numeric = float(raw)
-            # Gmail internalDate values are Unix milliseconds; Slack ts values
+            # Gmail internalDate values are Unix milliseconds; fractional values
             # are Unix seconds. Their magnitudes make the formats unambiguous.
             if abs(numeric) >= 100_000_000_000:
                 numeric /= 1000.0
@@ -10992,8 +11064,8 @@ def normalize_vault_data_source(value: Any, *, existing: dict[str, Any] | None =
     if not isinstance(value, dict):
         raise ValueError("Vault data source must be an object")
     source_type = str(value.get("source_type") or (existing or {}).get("source_type") or "").strip().lower()
-    if source_type not in VAULT_SOURCE_TYPES:
-        raise ValueError("Vault source_type must be google_calendar, google_drive, gmail, or slack")
+    if source_type not in VAULT_SOURCE_ORDER:
+        raise ValueError("Vault source_type must be google_calendar, google_drive, or gmail")
     now = now_iso()
     record = copy.deepcopy(existing) if isinstance(existing, dict) else {
         "schema": VAULT_DATA_SOURCE_SCHEMA,
@@ -11616,114 +11688,6 @@ def gmail_message_to_vault_item(payload: dict[str, Any], source_id: str, contain
     })
 
 
-def slack_message_external_id(conversation_id: str, timestamp: str) -> str:
-    conversation = str(conversation_id or "").strip()
-    ts = str(timestamp or "").strip()
-    if not conversation or not re.fullmatch(r"\d+(?:\.\d+)?", ts):
-        raise ValueError("Slack message requires a conversation ID and message timestamp")
-    return f"{conversation}:{ts}"
-
-
-def slack_message_to_vault_item(
-    payload: dict[str, Any],
-    source_id: str,
-    container_id: str,
-    *,
-    parent_item_id: str | None = None,
-) -> dict[str, Any]:
-    """Normalize one read-only Slack message or reply for Vault storage."""
-    if not isinstance(payload, dict):
-        raise ValueError("Slack payload must be an object")
-    conversation_id = str(payload.get("conversation_id") or payload.get("channel") or "").strip()
-    timestamp = str(payload.get("message_timestamp") or payload.get("ts") or "").strip()
-    external_id = slack_message_external_id(conversation_id, timestamp)
-    thread_ts = str(payload.get("thread_timestamp") or payload.get("thread_ts") or "").strip()
-    is_reply = bool(thread_ts and thread_ts != timestamp)
-    author_id = str(payload.get("user_id") or payload.get("user") or payload.get("bot_id") or "").strip()
-    author_name = str(payload.get("author_display_name") or payload.get("resolved_author_name") or author_id).strip()
-    is_bot = bool(payload.get("bot_id") or payload.get("is_bot"))
-    edited = payload.get("edited") if isinstance(payload.get("edited"), dict) else {}
-    parent_timestamp = str(payload.get("parent_message_timestamp") or (thread_ts if is_reply else ""))
-    files = copy.deepcopy(payload.get("files") if isinstance(payload.get("files"), list) else [])
-    reactions = copy.deepcopy(payload.get("reactions") if isinstance(payload.get("reactions"), list) else [])
-    links = copy.deepcopy(payload.get("links") if isinstance(payload.get("links"), list) else [])
-    blocks = copy.deepcopy(payload.get("blocks") if isinstance(payload.get("blocks"), list) else [])
-    reply_users = [str(row) for row in payload.get("reply_users", [])] if isinstance(payload.get("reply_users"), list) else []
-    metadata = {
-        "workspace_id": str(payload.get("workspace_id") or ""),
-        "conversation_id": conversation_id,
-        "conversation_type": str(payload.get("conversation_type") or ""),
-        "message_timestamp": timestamp,
-        "thread_timestamp": thread_ts,
-        "parent_message_timestamp": parent_timestamp,
-        "parent_external_id": slack_message_external_id(conversation_id, parent_timestamp) if parent_timestamp else "",
-        "edited_timestamp": str(payload.get("edited_timestamp") or edited.get("ts") or ""),
-        "subtype": str(payload.get("subtype") or ""),
-        "reply_count": _vault_nonnegative_int(payload.get("reply_count")),
-        "latest_reply_timestamp": str(payload.get("latest_reply_timestamp") or payload.get("latest_reply") or ""),
-        "reply_users": reply_users,
-        "reactions": reactions,
-        "links": links,
-        "files": files,
-        "blocks": blocks,
-        "raw_text": str(payload.get("raw_text") or payload.get("text") or ""),
-        "bot_id": str(payload.get("bot_id") or ""),
-        "username": str(payload.get("username") or ""),
-    }
-    attachments = []
-    for file_row in files:
-        if not isinstance(file_row, dict):
-            continue
-        attachments.append({
-            "external_id": str(file_row.get("id") or ""),
-            "filename": str(file_row.get("name") or file_row.get("title") or ""),
-            "mime_type": str(file_row.get("mimetype") or ""),
-            "size_bytes": _vault_nonnegative_int(file_row.get("size")),
-            "source_url": str(file_row.get("permalink") or file_row.get("url_private") or ""),
-            "is_inline": False,
-            "content_id": "",
-            "metadata": {
-                "title": str(file_row.get("title") or ""),
-                "thumb": str(file_row.get("thumb_360") or file_row.get("thumb_160") or ""),
-            },
-        })
-    return normalize_vault_item({
-        "id": stable_uuid_v4("velox-vault-item", f"{source_id}|{external_id}"),
-        "source_id": source_id,
-        "container_id": container_id,
-        "external_id": external_id,
-        "item_type": "slack_thread_reply" if is_reply else "slack_message",
-        "thread_id": slack_message_external_id(conversation_id, thread_ts) if thread_ts else "",
-        "parent_item_id": parent_item_id,
-        "title": "",
-        "summary": "",
-        "body_text": str(payload.get("body_text") or payload.get("text") or ""),
-        "body_html": "",
-        "primary_timestamp": timestamp,
-        "created_timestamp": timestamp,
-        "updated_timestamp": metadata["edited_timestamp"],
-        "author_id": author_id,
-        "author_display_name": author_name,
-        "source_url": str(payload.get("source_permalink") or payload.get("permalink") or ""),
-        "is_unread": bool(payload.get("is_unread", False)),
-        "is_deleted": bool(payload.get("is_deleted", False)),
-        "is_all_day": False,
-        "participants": [{
-            "participant_type": "bot" if is_bot else "user",
-            "external_id": author_id,
-            "display_name": author_name,
-            "email": "",
-            "role": "slack_bot" if is_bot else "slack_user",
-            "response_status": "",
-            "metadata": {},
-        }],
-        "attachments": attachments,
-        "metadata": metadata,
-        "raw_payload_reference": str(payload.get("raw_payload_reference") or ""),
-        "last_seen_sync_generation": _vault_nonnegative_int(payload.get("last_seen_sync_generation")),
-    })
-
-
 class VaultConnectorContract:
     """Common synchronization interface for account-data connectors."""
 
@@ -11906,33 +11870,6 @@ def gmail_payload_to_vault_item(
     return item
 
 
-def slack_vault_external_id(conversation_id: str, timestamp: str) -> str:
-    return slack_message_external_id(conversation_id, timestamp)
-
-
-def slack_payload_to_vault_item(
-    payload: dict[str, Any],
-    source_id: str,
-    container_id: str,
-    *,
-    sync_generation: int = 0,
-    existing_item_id: str | None = None,
-    parent_item_id: str = "",
-) -> dict[str, Any]:
-    source_payload = copy.deepcopy(payload)
-    source_payload["last_seen_sync_generation"] = _vault_nonnegative_int(sync_generation)
-    item = slack_message_to_vault_item(
-        source_payload, source_id, container_id, parent_item_id=parent_item_id or None,
-    )
-    if existing_item_id:
-        item["id"] = str(existing_item_id)
-        for attachment in item["attachments"]:
-            attachment["item_id"] = item["id"]
-        item["content_hash"] = vault_item_content_hash(item)
-        validate_vault_item(item)
-    return item
-
-
 # =============================================================================
 # Default schemas and first-run data
 # =============================================================================
@@ -11984,16 +11921,6 @@ def default_config() -> dict[str, Any]:
                 "sync_interval_minutes": GMAIL_SYNC_INTERVAL_MINUTES_DEFAULT,
                 "include_spam": False,
                 "include_trash": False,
-            },
-            "slack": {
-                "enabled": False,
-                "redirect_uri": SLACK_REDIRECT_URI_DEFAULT,
-                "initial_history_days": SLACK_INITIAL_HISTORY_DAYS_DEFAULT,
-                "sync_interval_minutes": SLACK_SYNC_INTERVAL_MINUTES_DEFAULT,
-                "include_public_channels": True,
-                "include_private_channels": True,
-                "include_direct_messages": True,
-                "include_group_direct_messages": True,
             },
         },
         "agents": {
@@ -13060,8 +12987,6 @@ class AppPaths:
     def gmail_credentials_file(self) -> Path:
         return self.credentials_dir() / "gmail.cred"
 
-    def slack_credentials_file(self) -> Path:
-        return self.credentials_dir() / "slack.cred"
 
     def calendar_dir(self) -> Path:
         return self.root_dir / "calendar"
@@ -13314,11 +13239,6 @@ class CredentialStore:
         GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT: {"client_id": "", "client_secret": "", "token": None},
         GOOGLE_DRIVE_CREDENTIAL_ACCOUNT: {"client_id": "", "client_secret": "", "token": None},
         GMAIL_CREDENTIAL_ACCOUNT: {"email_address": "", "app_password": ""},
-        SLACK_CREDENTIAL_ACCOUNT: {
-            "client_id": "", "client_secret": "", "access_token": "",
-            "workspace_id": "", "authenticated_user_id": "", "team_name": "",
-            "scopes": [],
-        },
     }
 
     def __init__(self, paths: AppPaths):
@@ -13343,8 +13263,6 @@ class CredentialStore:
             return self.paths.google_drive_credentials_file()
         if key == GMAIL_CREDENTIAL_ACCOUNT:
             return self.paths.gmail_credentials_file()
-        if key == SLACK_CREDENTIAL_ACCOUNT:
-            return self.paths.slack_credentials_file()
         raise ValueError(f"Unsupported credential account: {account}")
 
     @staticmethod
@@ -13372,20 +13290,6 @@ class CredentialStore:
             return {
                 "email_address": str(values["email_address"]).strip(),
                 "app_password": str(values["app_password"]),
-            }
-        if account == SLACK_CREDENTIAL_ACCOUNT:
-            text_fields = (
-                "client_id", "client_secret", "access_token", "workspace_id",
-                "authenticated_user_id", "team_name",
-            )
-            if not all(isinstance(values.get(key), str) for key in text_fields):
-                raise ValueError("Malformed Slack credentials")
-            scopes = values.get("scopes")
-            if not isinstance(scopes, list) or not all(isinstance(row, str) for row in scopes):
-                raise ValueError("Malformed Slack OAuth scopes")
-            return {
-                **{key: str(values[key]) for key in text_fields},
-                "scopes": sorted({str(row).strip() for row in scopes if str(row).strip()}),
             }
         if not isinstance(values.get("client_id"), str) or not isinstance(values.get("client_secret"), str):
             raise ValueError("Malformed Google OAuth client credentials")
@@ -13532,41 +13436,6 @@ class CredentialStore:
             lambda current: current.__setitem__("app_password", ""),
         )
 
-    def load_slack(self) -> dict[str, Any]:
-        return self._load(SLACK_CREDENTIAL_ACCOUNT)
-
-    def save_slack_oauth_client(self, client_id: str, client_secret: str) -> dict[str, Any]:
-        def update(current: dict[str, Any]) -> None:
-            current["client_id"] = str(client_id or "").strip()
-            current["client_secret"] = str(client_secret or "").strip()
-        return self._mutate(SLACK_CREDENTIAL_ACCOUNT, update)
-
-    def save_slack_token(
-        self,
-        access_token: str,
-        *,
-        workspace_id: str = "",
-        authenticated_user_id: str = "",
-        team_name: str = "",
-        scopes: Iterable[str] = (),
-    ) -> dict[str, Any]:
-        def update(current: dict[str, Any]) -> None:
-            current.update({
-                "access_token": str(access_token or "").strip(),
-                "workspace_id": str(workspace_id or "").strip(),
-                "authenticated_user_id": str(authenticated_user_id or "").strip(),
-                "team_name": str(team_name or "").strip(),
-                "scopes": sorted({str(row).strip() for row in scopes if str(row).strip()}),
-            })
-        return self._mutate(SLACK_CREDENTIAL_ACCOUNT, update)
-
-    def clear_slack_token(self) -> dict[str, Any]:
-        def update(current: dict[str, Any]) -> None:
-            current.update({
-                "access_token": "", "workspace_id": "", "authenticated_user_id": "",
-                "team_name": "", "scopes": [],
-            })
-        return self._mutate(SLACK_CREDENTIAL_ACCOUNT, update)
 
     def validate_all(self) -> None:
         self.ensure_directory()
@@ -16076,7 +15945,7 @@ def vault_record_cache_for_root(root_dir: Path) -> VaultRecordCache:
 
 
 class VaultStore:
-    """Normalized account-data storage shared by Calendar, Gmail and Slack.
+    """Normalized account-data storage shared by Calendar, Gmail.
 
     Calendar events retain their calendar-specific records and are also mirrored
     into this store. Query and UI code consume the common item model rather than
@@ -16747,31 +16616,6 @@ class VaultStore:
         )
         return self.upsert_item(item)
 
-    def upsert_slack_message(
-        self,
-        source_id: str,
-        container_id: str,
-        payload: dict[str, Any],
-        *,
-        sync_generation: int = 0,
-    ) -> dict[str, Any]:
-        conversation_id = str(payload.get("conversation_id") or payload.get("channel") or "").strip()
-        message_ts = str(payload.get("message_timestamp") or payload.get("ts") or "").strip()
-        external_id = slack_vault_external_id(conversation_id, message_ts)
-        existing = self.find_item(source_id, external_id)
-        thread_ts = str(payload.get("thread_timestamp") or payload.get("thread_ts") or "").strip()
-        parent = None
-        if thread_ts and thread_ts != message_ts:
-            parent = self.find_item(source_id, slack_vault_external_id(conversation_id, thread_ts))
-        item = slack_payload_to_vault_item(
-            payload,
-            source_id,
-            container_id,
-            sync_generation=sync_generation,
-            existing_item_id=existing["id"] if existing else None,
-            parent_item_id=parent["id"] if parent else "",
-        )
-        return self.upsert_item(item)
 
     def list_sync_states(self, source_id: str | None = None) -> list[dict[str, Any]]:
         self._ensure_cache()
@@ -17015,9 +16859,6 @@ class VaultQueryService:
             for participant in item["participants"]:
                 if participant["role"] in {"sender", "recipient", "cc"}:
                     fields.extend([participant["display_name"], participant["email"]])
-        elif item["item_type"] in {"slack_message", "slack_thread_reply"}:
-            if container is not None:
-                fields.extend([container["name"], container["display_name"]])
         return "\n".join(str(field or "") for field in fields).casefold()
 
     def _filtered_items(
@@ -17131,103 +16972,6 @@ class VaultQueryService:
         return item
 
 
-    def list_slack_channels(
-        self,
-        source_id: str,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        search_text: str = "",
-    ) -> list[dict[str, Any]]:
-        rows = self._filtered_items(
-            source_id,
-            {"slack_message", "slack_thread_reply"},
-            start_date,
-            end_date,
-            search_text,
-        )
-        aggregates: dict[str, dict[str, Any]] = {}
-        containers = {row["id"]: row for row in self.store.list_containers(source_id)}
-        for item in rows:
-            container = containers.get(item["container_id"])
-            if container is None or container["is_archived"] or container["is_hidden"]:
-                continue
-            current = aggregates.get(item["container_id"])
-            if current is None:
-                current = copy.deepcopy(container)
-                current.update({
-                    "matching_message_count": 0,
-                    "latest_matching_message_timestamp": "",
-                })
-                aggregates[item["container_id"]] = current
-            current["matching_message_count"] += 1
-            current["latest_matching_message_timestamp"] = max(
-                current["latest_matching_message_timestamp"], item["primary_timestamp"],
-            )
-        result = list(aggregates.values())
-        result.sort(key=lambda row: (
-            -_parse_iso_datetime(row["latest_matching_message_timestamp"], field_name="Slack latest timestamp").timestamp(),
-            row["display_name"].casefold(),
-            row["id"],
-        ))
-        return result
-
-    def list_slack_messages(
-        self,
-        source_id: str,
-        channel_id: str,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        search_text: str = "",
-    ) -> list[dict[str, Any]]:
-        self.store.get_container(channel_id)
-        rows = self._filtered_items(
-            source_id,
-            {"slack_message", "slack_thread_reply"},
-            start_date,
-            end_date,
-            search_text,
-            container_id=channel_id,
-        )
-        visible_ids = {row["id"] for row in rows}
-        normalized: list[dict[str, Any]] = []
-        for item in rows:
-            row = copy.deepcopy(item)
-            row["indentation_depth"] = 1 if row["item_type"] == "slack_thread_reply" else 0
-            row["parent_outside_range"] = bool(
-                row["parent_item_id"] and row["parent_item_id"] not in visible_ids
-            )
-            normalized.append(row)
-
-        # Present visible replies immediately under their visible parent while
-        # keeping parent groups and orphan replies chronologically ordered. A
-        # reply whose parent is outside the current filter remains a standalone
-        # indented row with parent_outside_range=True.
-        parents = [row for row in normalized if row["item_type"] != "slack_thread_reply"]
-        replies_by_parent: dict[str, list[dict[str, Any]]] = {}
-        orphan_replies: list[dict[str, Any]] = []
-        parent_ids = {row["id"] for row in parents}
-        for row in normalized:
-            if row["item_type"] != "slack_thread_reply":
-                continue
-            parent_id = str(row.get("parent_item_id") or "")
-            if parent_id and parent_id in parent_ids:
-                replies_by_parent.setdefault(parent_id, []).append(row)
-            else:
-                orphan_replies.append(row)
-        for reply_rows in replies_by_parent.values():
-            reply_rows.sort(key=lambda item: (item["primary_timestamp"], item["id"]))
-
-        blocks: list[tuple[str, str, list[dict[str, Any]]]] = []
-        for parent in parents:
-            blocks.append((
-                str(parent["primary_timestamp"]), str(parent["id"]),
-                [parent, *replies_by_parent.get(str(parent["id"]), [])],
-            ))
-        for reply in orphan_replies:
-            blocks.append((str(reply["primary_timestamp"]), str(reply["id"]), [reply]))
-        blocks.sort(key=lambda block: (block[0], block[1]))
-        return [row for _timestamp, _row_id, block in blocks for row in block]
-
     def get_visible_item_count(
         self,
         source_id: str,
@@ -17238,8 +16982,7 @@ class VaultQueryService:
     ) -> int:
         """Return the source-specific count shown in the data browser.
 
-        Count days for Calendar, messages for Gmail, and conversations for Slack.
-        Within a selected Slack container, count its messages and replies."""
+        Count days for Calendar, files for Drive, and messages for Gmail."""
         source = self.store.get_data_source(source_id)
         source_type = source["source_type"]
         if source_type == "google_calendar":
@@ -17262,16 +17005,6 @@ class VaultQueryService:
                 search_text,
                 container_id=container_id,
             ))
-        if source_type == "slack" and container_id:
-            return len(self.list_slack_messages(
-                source_id,
-                container_id,
-                start_date,
-                end_date,
-                search_text,
-            ))
-        if source_type == "slack":
-            return len(self.list_slack_channels(source_id, start_date, end_date, search_text))
         raise ValueError(f"Unsupported Vault source type: {source_type}")
 
 def normalize_vault_divider_fraction(value: Any) -> float:
@@ -17286,25 +17019,21 @@ def normalize_vault_divider_fraction(value: Any) -> float:
 
 
 def validate_vault_connector_settings(vault_config: Any) -> dict[str, Any]:
-    """Validate strict Google Drive, Gmail, and Slack connector settings."""
+    """Validate the active connector settings without rewriting unused keys."""
     if not isinstance(vault_config, dict):
         raise ValueError("Vault settings must be an object")
     calendar = vault_config.get("google_calendar")
     drive = vault_config.get("google_drive")
     gmail = vault_config.get("gmail")
-    slack = vault_config.get("slack")
     expected_calendar = set(default_config()["vault"]["google_calendar"])
     expected_drive = set(default_config()["vault"]["google_drive"])
     expected_gmail = set(default_config()["vault"]["gmail"])
-    expected_slack = set(default_config()["vault"]["slack"])
     if not isinstance(calendar, dict) or set(calendar) != expected_calendar:
         raise ValueError("Google Calendar connector settings do not match the current model")
     if not isinstance(drive, dict) or set(drive) != expected_drive:
         raise ValueError("Google Drive connector settings do not match the current model")
     if not isinstance(gmail, dict) or set(gmail) != expected_gmail:
         raise ValueError("Gmail connector settings do not match the current model")
-    if not isinstance(slack, dict) or set(slack) != expected_slack:
-        raise ValueError("Slack connector settings do not match the current model")
     sync_window_days = calendar.get("sync_window_days")
     if (
         isinstance(sync_window_days, bool) or not isinstance(sync_window_days, int)
@@ -17320,24 +17049,12 @@ def validate_vault_connector_settings(vault_config: Any) -> dict[str, Any]:
     for key in ("enabled", "include_spam", "include_trash"):
         if not isinstance(gmail.get(key), bool):
             raise ValueError(f"Gmail connector setting {key} must be a boolean")
-    for key in (
-        "enabled", "include_public_channels", "include_private_channels",
-        "include_direct_messages", "include_group_direct_messages",
-    ):
-        if not isinstance(slack.get(key), bool):
-            raise ValueError(f"Slack connector setting {key} must be a boolean")
     for label, value, minimum in (
         ("Gmail initial history days", gmail.get("initial_history_days"), 0),
         ("Gmail sync interval minutes", gmail.get("sync_interval_minutes"), 1),
-        ("Slack initial history days", slack.get("initial_history_days"), 0),
-        ("Slack sync interval minutes", slack.get("sync_interval_minutes"), 1),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(f"{label} must be an integer of at least {minimum}")
-    redirect_uri = str(slack.get("redirect_uri") or "").strip()
-    parsed = urllib.parse.urlparse(redirect_uri)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
-        raise ValueError("Slack redirect URI must be an http://127.0.0.1 or localhost URL with a port")
     return vault_config
 
 
@@ -17662,8 +17379,6 @@ class VaultUIController:
             return self.query.list_google_drive_files(source_id, start_date, end_date, search_text)
         if source_type == "gmail":
             return self.query.list_gmail_messages(source_id, start_date, end_date, search_text)
-        if source_type == "slack":
-            return self.query.list_slack_channels(source_id, start_date, end_date, search_text)
         return []
 
     def _right_query(self, source_type: str, source_id: str, selected_id: str, start_date: str | None, end_date: str | None, search_text: str) -> list[dict[str, Any]]:
@@ -17682,8 +17397,6 @@ class VaultUIController:
                 return [self.query.get_gmail_message(selected_id)]
             except FileNotFoundError:
                 return []
-        if source_type == "slack":
-            return self.query.list_slack_messages(source_id, selected_id, start_date, end_date, search_text)
         return []
 
     def load(
@@ -17819,23 +17532,12 @@ def calendar_record_cache_for_root(root_dir: Path) -> CalendarRecordCache:
 
 
 # =============================================================================
-# Read-only Gmail and Slack connectors
+# Read-only Gmail connector
 # =============================================================================
 
 
 class ConnectorCancelledError(RuntimeError):
     pass
-
-
-class SlackAPIError(RuntimeError):
-    def __init__(self, error: str, *, status: int = 0, missing_scope: str = ""):
-        self.error = str(error or "unknown_error")
-        self.status = int(status or 0)
-        self.missing_scope = str(missing_scope or "")
-        message = self.error
-        if self.missing_scope:
-            message += f" (missing scope: {self.missing_scope})"
-        super().__init__(message)
 
 
 def _connector_now() -> str:
@@ -19616,1212 +19318,6 @@ def _http_header_value(headers: Any, name: str, default: str = "") -> str:
     return str(default)
 
 
-def slack_granted_scopes(payload: Any, stored_scopes: Iterable[Any] = ()) -> set[str]:
-    """Collect granted Slack user scopes from saved OAuth state and API headers."""
-    scopes = {str(row or "").strip() for row in stored_scopes if str(row or "").strip()}
-    raw = payload if isinstance(payload, dict) else {}
-    for key in ("scope", "scopes"):
-        value = raw.get(key)
-        values = value if isinstance(value, list) else str(value or "").split(",")
-        scopes.update(str(row or "").strip() for row in values if str(row or "").strip())
-    headers = raw.get("_response_headers") if isinstance(raw.get("_response_headers"), dict) else {}
-    header_value = _http_header_value(headers, "x-oauth-scopes")
-    scopes.update(row.strip() for row in header_value.split(",") if row.strip())
-    return scopes
-
-
-class SlackWebAPIClient:
-    """Small read-only Slack Web API client with pagination-safe retries."""
-
-    def __init__(
-        self,
-        access_token: str,
-        *,
-        opener: Callable[..., Any] = urllib.request.urlopen,
-        sleep: Callable[[float], None] = time.sleep,
-        cancel_event: threading.Event | None = None,
-    ):
-        self.access_token = str(access_token or "").strip()
-        self.opener = opener
-        self.sleep = sleep
-        self.cancel_event = cancel_event or threading.Event()
-
-    def _wait(self, seconds: float) -> None:
-        delay = max(0.0, float(seconds))
-        if self.cancel_event.is_set():
-            raise ConnectorCancelledError("Slack synchronization cancelled")
-        if delay <= 0.0:
-            self.sleep(0.0)
-            return
-        deadline = time.monotonic() + delay
-        while time.monotonic() < deadline:
-            if self.cancel_event.is_set():
-                raise ConnectorCancelledError("Slack synchronization cancelled")
-            self.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-
-    @staticmethod
-    def _header(headers: dict[str, Any], name: str, default: str = "") -> str:
-        target = str(name).casefold()
-        for key, value in headers.items():
-            if str(key).casefold() == target:
-                return str(value)
-        return default
-
-    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        if not self.access_token:
-            raise SlackAPIError("not_authed")
-        encoded_params: dict[str, str] = {}
-        for key, value in (params or {}).items():
-            if value is None:
-                continue
-            if isinstance(value, bool):
-                encoded_params[str(key)] = "true" if value else "false"
-            else:
-                encoded_params[str(key)] = str(value)
-        body = urllib.parse.urlencode(encoded_params).encode("utf-8")
-        request = urllib.request.Request(
-            f"{SLACK_API_BASE_URL}/{str(method).strip()}",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                "User-Agent": CONNECTOR_USER_AGENT,
-            },
-        )
-        last_error: BaseException | None = None
-        for attempt in range(CONNECTOR_TRANSIENT_RETRY_COUNT + 1):
-            if self.cancel_event.is_set():
-                raise ConnectorCancelledError("Slack synchronization cancelled")
-            status = 0
-            headers: dict[str, Any] = {}
-            raw = b""
-            try:
-                with self.opener(request, timeout=SLACK_NETWORK_TIMEOUT_SECONDS) as response:
-                    status = int(getattr(response, "status", 200) or 200)
-                    headers = dict(getattr(response, "headers", {}) or {})
-                    raw = response.read()
-            except urllib.error.HTTPError as exc:
-                status = int(exc.code or 0)
-                headers = dict(exc.headers or {})
-                raw = exc.read() if hasattr(exc, "read") else b""
-                last_error = exc
-            except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-                last_error = exc
-                if attempt < CONNECTOR_TRANSIENT_RETRY_COUNT:
-                    self._wait(0.5 * (attempt + 1))
-                    continue
-                raise SlackAPIError(f"network_error: {exc}") from exc
-
-            retry_after = float(self._header(headers, "Retry-After", "1") or 1)
-            if status == 429:
-                if attempt < CONNECTOR_TRANSIENT_RETRY_COUNT:
-                    self._wait(retry_after)
-                    continue
-                raise SlackAPIError("ratelimited", status=status)
-            if status >= 500 and attempt < CONNECTOR_TRANSIENT_RETRY_COUNT:
-                self._wait(0.5 * (attempt + 1))
-                continue
-
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except Exception as exc:
-                if status >= 500 and attempt < CONNECTOR_TRANSIENT_RETRY_COUNT:
-                    self._wait(0.5 * (attempt + 1))
-                    continue
-                error_name = f"http_{status}" if status else "malformed_response"
-                raise SlackAPIError(error_name, status=status) from exc
-            if not isinstance(payload, dict):
-                raise SlackAPIError("malformed_response", status=status)
-            if not bool(payload.get("ok")):
-                error = str(payload.get("error") or (f"http_{status}" if status else "unknown_error"))
-                missing_scope = str(payload.get("needed") or payload.get("missing_scope") or "")
-                if (
-                    error in {"ratelimited", "internal_error", "fatal_error", "request_timeout", "service_unavailable"}
-                    and attempt < CONNECTOR_TRANSIENT_RETRY_COUNT
-                ):
-                    self._wait(retry_after if error == "ratelimited" else 0.5 * (attempt + 1))
-                    continue
-                raise SlackAPIError(error, status=status, missing_scope=missing_scope)
-            if status >= 400:
-                raise SlackAPIError(f"http_{status}", status=status)
-            payload["_response_headers"] = {str(k): str(v) for k, v in headers.items()}
-            return payload
-        if last_error is not None:
-            raise SlackAPIError(f"network_error: {last_error}") from last_error
-        raise SlackAPIError("retry_exhausted")
-
-
-def normalize_slack_text(
-    value: Any,
-    *,
-    users: dict[str, dict[str, Any]] | None = None,
-    channels: dict[str, dict[str, Any]] | None = None,
-) -> tuple[str, list[dict[str, str]]]:
-    text = html.unescape(str(value or ""))
-    user_map = users or {}
-    channel_map = channels or {}
-    links: list[dict[str, str]] = []
-
-    def replace_token(match: re.Match[str]) -> str:
-        inner = match.group(1)
-        if inner.startswith("@"):
-            user_id = inner[1:]
-            row = user_map.get(user_id, {})
-            name = str(row.get("display_name") or row.get("real_name") or user_id)
-            return "@" + name
-        if inner.startswith("#"):
-            body = inner[1:]
-            channel_id, _, supplied = body.partition("|")
-            row = channel_map.get(channel_id, {})
-            name = supplied or str(row.get("name") or row.get("display_name") or channel_id)
-            return "#" + name.lstrip("#")
-        if inner.startswith("!"):
-            return "@" + inner[1:].split("^", 1)[0]
-        target, separator, label = inner.partition("|")
-        if target.startswith(("http://", "https://", "mailto:")):
-            clean_label = label or target
-            links.append({"url": target, "label": clean_label})
-            return f"{clean_label} ({target})" if clean_label != target else target
-        return match.group(0)
-
-    text = re.sub(r"<([^>]+)>", replace_token, text)
-    return text, links
-
-
-def slack_blocks_text(blocks: Any) -> str:
-    if not isinstance(blocks, list):
-        return ""
-    rows: list[str] = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        block_type = str(block.get("type") or "")
-        text_obj = block.get("text")
-        if isinstance(text_obj, dict) and str(text_obj.get("text") or "").strip():
-            rows.append(str(text_obj["text"]))
-        if block_type == "rich_text":
-            for element in block.get("elements") or []:
-                if not isinstance(element, dict):
-                    continue
-                for child in element.get("elements") or []:
-                    if isinstance(child, dict) and str(child.get("text") or "").strip():
-                        rows.append(str(child["text"]))
-    return "\n".join(rows).strip()
-
-
-def _slack_user_row(raw: dict[str, Any]) -> dict[str, Any]:
-    profile = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
-    return {
-        "id": str(raw.get("id") or ""),
-        "display_name": str(profile.get("display_name") or profile.get("real_name") or raw.get("real_name") or raw.get("name") or raw.get("id") or ""),
-        "real_name": str(profile.get("real_name") or raw.get("real_name") or ""),
-        "email": str(profile.get("email") or ""),
-        "deleted": bool(raw.get("deleted")),
-        "is_bot": bool(raw.get("is_bot")),
-        "avatar_url": str(profile.get("image_72") or profile.get("image_48") or ""),
-        "updated": str(raw.get("updated") or ""),
-    }
-
-
-def _slack_conversation_type(raw: dict[str, Any]) -> str:
-    if raw.get("is_im"):
-        return "slack_direct_message"
-    if raw.get("is_mpim"):
-        return "slack_group_message"
-    if raw.get("is_private"):
-        return "slack_private_channel"
-    return "slack_public_channel"
-
-
-def _slack_conversation_name(raw: dict[str, Any], users: dict[str, dict[str, Any]]) -> str:
-    if raw.get("is_im"):
-        user_id = str(raw.get("user") or "")
-        row = users.get(user_id, {})
-        return str(row.get("display_name") or row.get("real_name") or user_id or raw.get("id") or "Direct message")
-    if raw.get("is_mpim"):
-        members = [str(row) for row in raw.get("members", []) if str(row)]
-        names = [str(users.get(user_id, {}).get("display_name") or user_id) for user_id in members]
-        return ", ".join(names) or str(raw.get("name") or raw.get("id") or "Group message")
-    name = str(raw.get("name") or raw.get("name_normalized") or raw.get("id") or "channel")
-    return "#" + name.lstrip("#")
-
-
-class SlackConnector(BaseVaultConnector):
-    """Read-only Slack Web API connector using a user OAuth token."""
-
-    connector_type = SLACK_SOURCE_TYPE
-
-    def __init__(
-        self,
-        storage: Storage,
-        vault: VaultStore,
-        credentials: CredentialStore,
-        *,
-        api_client_factory: Callable[..., Any] = SlackWebAPIClient,
-        oauth_code_provider: Callable[..., Any] | None = None,
-        oauth_opener: Callable[..., Any] = urllib.request.urlopen,
-        browser_open: Callable[[str], Any] = webbrowser.open,
-        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
-        data_changed_callback: Callable[[str], None] | None = None,
-    ):
-        super().__init__(
-            storage, vault, credentials,
-            progress_callback=progress_callback,
-            data_changed_callback=data_changed_callback,
-        )
-        self.api_client_factory = api_client_factory
-        self.oauth_code_provider = oauth_code_provider
-        self.oauth_opener = oauth_opener
-        self.browser_open = browser_open
-
-    def _settings(self) -> dict[str, Any]:
-        config = self.storage.load_config()
-        validate_vault_connector_settings(config["vault"])
-        return copy.deepcopy(config["vault"]["slack"])
-
-    @staticmethod
-    def _scope_rows(values: Any) -> list[str]:
-        rows = values if isinstance(values, list) else str(values or "").split(",")
-        return sorted({str(row or "").strip() for row in rows if str(row or "").strip()})
-
-    def validate_configuration(self) -> dict[str, Any]:
-        values = self.credentials.load_slack()
-        client_id = str(values.get("client_id") or "").strip()
-        client_secret = str(values.get("client_secret") or "").strip()
-        token = str(values.get("access_token") or "").strip()
-        scopes = self._scope_rows(values.get("scopes"))
-        missing_scopes = [scope for scope in SLACK_REQUIRED_USER_SCOPES if scopes and scope not in scopes]
-        errors: list[str] = []
-        if not client_id:
-            errors.append("Enter the Slack client ID.")
-        if not client_secret:
-            errors.append("Enter the Slack client secret.")
-        if token and not token.startswith("xoxp-"):
-            errors.append("Slack requires a user access token with the xoxp- prefix.")
-        if missing_scopes:
-            errors.append("Slack authorization is missing read scopes: " + ", ".join(missing_scopes))
-        return {
-            "configured": bool(client_id and client_secret),
-            "token_present": bool(token),
-            "token_valid_shape": bool(not token or token.startswith("xoxp-")),
-            "client_id": client_id,
-            "workspace_id": str(values.get("workspace_id") or ""),
-            "authenticated_user_id": str(values.get("authenticated_user_id") or ""),
-            "team_name": str(values.get("team_name") or ""),
-            "scopes": scopes,
-            "missing_scopes": missing_scopes,
-            "read_only": True,
-            "errors": errors,
-        }
-
-    def _require_read_scopes(self, payload: dict[str, Any] | None = None) -> list[str]:
-        values = self.credentials.load_slack()
-        granted = slack_granted_scopes(payload or {}, values.get("scopes") or [])
-        if granted:
-            missing = [scope for scope in SLACK_REQUIRED_USER_SCOPES if scope not in granted]
-            if missing:
-                raise SlackAPIError("missing_scope", missing_scope=", ".join(missing))
-        return sorted(granted)
-
-    def _client(self) -> Any:
-        values = self.credentials.load_slack()
-        token = str(values.get("access_token") or "").strip()
-        if not token:
-            raise SlackAPIError("not_authed")
-        if not token.startswith("xoxp-"):
-            raise SlackAPIError("invalid_auth")
-        scopes = self._scope_rows(values.get("scopes"))
-        missing = [scope for scope in SLACK_REQUIRED_USER_SCOPES if scopes and scope not in scopes]
-        if missing:
-            raise SlackAPIError("missing_scope", missing_scope=", ".join(missing))
-        try:
-            return self.api_client_factory(token, cancel_event=self._cancel_event)
-        except TypeError:
-            return self.api_client_factory(token)
-
-    @staticmethod
-    def _next_cursor(payload: dict[str, Any]) -> str:
-        metadata = payload.get("response_metadata") if isinstance(payload.get("response_metadata"), dict) else {}
-        return str(metadata.get("next_cursor") or "").strip()
-
-    def _paged(
-        self,
-        client: Any,
-        method: str,
-        params: dict[str, Any],
-        key: str,
-    ) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        cursor = ""
-        seen_cursors: set[str] = set()
-        while True:
-            self._check_cancelled()
-            request = dict(params)
-            if cursor:
-                request["cursor"] = cursor
-            payload = client.call(method, request)
-            page_rows = payload.get(key)
-            if not isinstance(page_rows, list):
-                raise SlackAPIError("malformed_response")
-            rows.extend(row for row in page_rows if isinstance(row, dict))
-            next_cursor = self._next_cursor(payload)
-            if not next_cursor:
-                return rows
-            if next_cursor in seen_cursors or next_cursor == cursor:
-                raise SlackAPIError("repeated_cursor")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-
-    def _run_oauth_callback(
-        self,
-        client_id: str,
-        redirect_uri: str,
-        scopes: tuple[str, ...],
-    ) -> str:
-        if self.oauth_code_provider is not None:
-            result = self.oauth_code_provider(client_id, redirect_uri, scopes, self._cancel_event)
-            if asyncio.iscoroutine(result):
-                result = asyncio.run(result)
-            if isinstance(result, dict):
-                error = str(result.get("error") or "").strip()
-                if error:
-                    raise RuntimeError("Slack authorization was denied: " + error)
-                result = result.get("code")
-            code = str(result or "").strip()
-            if not code:
-                raise RuntimeError("Slack OAuth callback did not include an authorization code")
-            return code
-
-        parsed = urllib.parse.urlparse(redirect_uri)
-        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
-            raise ValueError("Slack redirect URI must be a localhost HTTP URL with an explicit port")
-        state_value = secrets.token_urlsafe(24)
-        captured: dict[str, str] = {}
-        expected_path = parsed.path or "/"
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self) -> None:  # type: ignore[override]
-                request_url = urllib.parse.urlparse(self.path)
-                if request_url.path != expected_path:
-                    self.send_error(404)
-                    return
-                query = urllib.parse.parse_qs(request_url.query)
-                captured["state"] = str((query.get("state") or [""])[0])
-                captured["code"] = str((query.get("code") or [""])[0])
-                captured["error"] = str((query.get("error") or [""])[0])
-                success = not captured["error"]
-                body = (
-                    b"<html><body><h2>Slack connected to Velox.</h2><p>You can close this window.</p></body></html>"
-                    if success else
-                    b"<html><body><h2>Slack authorization was not completed.</h2><p>You can close this window.</p></body></html>"
-                )
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, _format: str, *_args: Any) -> None:
-                return
-
-        server = http.server.HTTPServer((str(parsed.hostname), int(parsed.port)), Handler)
-        server.timeout = 0.25
-        query = urllib.parse.urlencode({
-            "client_id": client_id,
-            "user_scope": ",".join(scopes),
-            "redirect_uri": redirect_uri,
-            "state": state_value,
-        })
-        self.browser_open(SLACK_OAUTH_AUTHORIZE_URL + "?" + query)
-        deadline = time.monotonic() + 300.0
-        try:
-            while time.monotonic() < deadline and not captured:
-                self._check_cancelled()
-                server.handle_request()
-        finally:
-            server.server_close()
-        if not captured:
-            raise TimeoutError("Slack OAuth browser sign-in timed out")
-        if captured.get("state") != state_value:
-            raise RuntimeError("Slack OAuth callback state did not match")
-        if captured.get("error"):
-            raise RuntimeError("Slack authorization was denied: " + captured["error"])
-        if not captured.get("code"):
-            raise RuntimeError("Slack OAuth callback did not include an authorization code")
-        return captured["code"]
-
-    def _exchange_oauth_code(
-        self,
-        client_id: str,
-        client_secret: str,
-        code: str,
-        redirect_uri: str,
-    ) -> dict[str, Any]:
-        body = urllib.parse.urlencode({
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            SLACK_OAUTH_ACCESS_URL,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-                "User-Agent": CONNECTOR_USER_AGENT,
-            },
-        )
-        try:
-            with self.oauth_opener(request, timeout=SLACK_NETWORK_TIMEOUT_SECONDS) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            raw = exc.read() if hasattr(exc, "read") else b""
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except Exception:
-                payload = {}
-            raise SlackAPIError(
-                str(payload.get("error") or f"http_{int(exc.code or 0)}"),
-                status=int(exc.code or 0),
-            ) from exc
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except Exception as exc:
-            raise SlackAPIError("malformed_response") from exc
-        if not isinstance(payload, dict) or not payload.get("ok"):
-            raise SlackAPIError(
-                str(payload.get("error") if isinstance(payload, dict) else "malformed_response"),
-                missing_scope=str(payload.get("needed") or "") if isinstance(payload, dict) else "",
-            )
-        return payload
-
-    def _ensure_source(self, auth: dict[str, Any], *, connected: bool) -> dict[str, Any]:
-        credentials = self.credentials.load_slack()
-        workspace_id = str(
-            auth.get("team_id") or auth.get("workspace_id")
-            or credentials.get("workspace_id") or "slack"
-        )
-        team_name = str(
-            auth.get("team") or auth.get("team_name")
-            or credentials.get("team_name") or "Slack"
-        )
-        user_id = str(
-            auth.get("user_id") or auth.get("authenticated_user_id")
-            or credentials.get("authenticated_user_id") or ""
-        )
-        existing = self.vault.find_data_source(SLACK_SOURCE_TYPE, workspace_id)
-        metadata = copy.deepcopy(existing.get("metadata", {})) if existing else {}
-        metadata.update({
-            "provider": "slack_web_api",
-            "read_only": True,
-            "authenticated_user_id": user_id,
-        })
-        return self.vault.upsert_data_source(
-            SLACK_SOURCE_TYPE,
-            team_name or "Slack",
-            workspace_id,
-            enabled=bool(self._settings().get("enabled")),
-            connection_state="connected" if connected else "not_configured",
-            credential_reference="credentials/slack.cred",
-            metadata=metadata,
-            source_id=existing["id"] if existing else None,
-        )
-
-    async def test_connection(self) -> dict[str, Any]:
-        self._begin("test")
-        self._progress("Connecting...")
-        try:
-            client = self._client()
-            auth = await asyncio.to_thread(client.call, "auth.test", {})
-            granted = self._require_read_scopes(auth)
-            self._finish("Connection test succeeded")
-            return {"ok": True, "granted_scopes": granted, **auth}
-        except Exception as exc:
-            self._fail(exc)
-            raise
-
-    def _connect_lifecycle_blocking(self) -> dict[str, Any]:
-        values = self.credentials.load_slack()
-        client_id = str(values.get("client_id") or "").strip()
-        client_secret = str(values.get("client_secret") or "").strip()
-        if not client_id or not client_secret:
-            raise ValueError("Slack client ID and client secret are required")
-        redirect_uri = str(self._settings().get("redirect_uri") or SLACK_REDIRECT_URI_DEFAULT)
-        code = self._run_oauth_callback(client_id, redirect_uri, SLACK_USER_SCOPES)
-        oauth = self._exchange_oauth_code(client_id, client_secret, code, redirect_uri)
-        authed_user = oauth.get("authed_user") if isinstance(oauth.get("authed_user"), dict) else {}
-        token = str(authed_user.get("access_token") or "").strip()
-        if not token.startswith("xoxp-"):
-            raise RuntimeError("Slack did not return a user access token")
-        team = oauth.get("team") if isinstance(oauth.get("team"), dict) else {}
-        scopes = self._scope_rows(authed_user.get("scope") or oauth.get("scope"))
-        missing_scopes = [scope for scope in SLACK_REQUIRED_USER_SCOPES if scope not in scopes]
-        if missing_scopes:
-            raise SlackAPIError("missing_scope", missing_scope=", ".join(missing_scopes))
-        self.credentials.save_slack_token(
-            token,
-            workspace_id=str(team.get("id") or ""),
-            authenticated_user_id=str(authed_user.get("id") or ""),
-            team_name=str(team.get("name") or ""),
-            scopes=scopes,
-        )
-        self.storage.update_config(
-            lambda config: config["vault"]["slack"].__setitem__("enabled", True)
-        )
-        client = self._client()
-        auth = client.call("auth.test", {})
-        granted = self._require_read_scopes(auth)
-        source = self._ensure_source(auth, connected=True)
-        self._data_changed()
-        return {"ok": True, "source": source, "auth": auth, "scopes": granted or scopes}
-
-
-    def _save_user_cache(
-        self,
-        source: dict[str, Any],
-        users: dict[str, dict[str, Any]],
-    ) -> dict[str, Any]:
-        current = self.vault.get_data_source(source["id"])
-        metadata = copy.deepcopy(current.get("metadata", {}))
-        metadata["user_cache"] = copy.deepcopy(users)
-        metadata["user_cache_updated_at"] = _connector_now()
-        return self.vault.upsert_data_source(
-            SLACK_SOURCE_TYPE,
-            current["display_name"],
-            current["account_identifier"],
-            enabled=current["enabled"],
-            connection_state=current["connection_state"],
-            credential_reference=current["credential_reference"],
-            metadata=metadata,
-            source_id=current["id"],
-        )
-
-    def _load_users(
-        self,
-        client: Any,
-        source: dict[str, Any],
-    ) -> dict[str, dict[str, Any]]:
-        metadata = copy.deepcopy(source.get("metadata", {}))
-        cached = metadata.get("user_cache") if isinstance(metadata.get("user_cache"), dict) else {}
-        updated_at = str(metadata.get("user_cache_updated_at") or "")
-        stale = True
-        if updated_at:
-            try:
-                age = datetime.now(timezone.utc) - _parse_iso_datetime(
-                    updated_at, field_name="Slack user cache time",
-                )
-                stale = age.total_seconds() >= SLACK_USER_CACHE_MAX_AGE_SECONDS
-            except Exception:
-                stale = True
-        if cached and not stale:
-            return {
-                str(key): copy.deepcopy(value)
-                for key, value in cached.items()
-                if isinstance(value, dict)
-            }
-        self._progress("Loading users...")
-        rows = self._paged(client, "users.list", {"limit": SLACK_PAGE_SIZE}, "members")
-        users = {
-            str(row.get("id") or ""): _slack_user_row(row)
-            for row in rows
-            if str(row.get("id") or "")
-        }
-        self._save_user_cache(source, users)
-        return users
-
-    def _ensure_user(
-        self,
-        client: Any,
-        source: dict[str, Any],
-        users: dict[str, dict[str, Any]],
-        user_id: str,
-    ) -> dict[str, Any]:
-        key = str(user_id or "").strip()
-        if not key:
-            return {}
-        if key in users:
-            return users[key]
-        try:
-            payload = client.call("users.info", {"user": key})
-            raw = payload.get("user") if isinstance(payload.get("user"), dict) else {}
-            if raw:
-                users[key] = _slack_user_row(raw)
-                self._save_user_cache(source, users)
-                return users[key]
-        except SlackAPIError as exc:
-            self.storage.append_app_log(
-                "slack.user_lookup_failed",
-                {"user_id": key, "error": str(exc)},
-            )
-        users[key] = {
-            "id": key,
-            "display_name": key,
-            "real_name": "",
-            "email": "",
-            "deleted": False,
-            "is_bot": key.startswith("B"),
-            "avatar_url": "",
-            "updated": "",
-        }
-        return users[key]
-
-    @staticmethod
-    def _conversation_types(settings: dict[str, Any]) -> list[str]:
-        rows: list[str] = []
-        if settings.get("include_public_channels"):
-            rows.append("public_channel")
-        if settings.get("include_private_channels"):
-            rows.append("private_channel")
-        if settings.get("include_direct_messages"):
-            rows.append("im")
-        if settings.get("include_group_direct_messages"):
-            rows.append("mpim")
-        return rows
-
-    def _resolve_conversation_members(
-        self,
-        client: Any,
-        raw: dict[str, Any],
-    ) -> dict[str, Any]:
-        if not raw.get("is_mpim") or isinstance(raw.get("members"), list):
-            return raw
-        try:
-            members: list[str] = []
-            cursor = ""
-            seen_cursors: set[str] = set()
-            while True:
-                self._check_cancelled()
-                request: dict[str, Any] = {
-                    "channel": str(raw.get("id") or ""),
-                    "limit": SLACK_PAGE_SIZE,
-                }
-                if cursor:
-                    request["cursor"] = cursor
-                payload = client.call("conversations.members", request)
-                page = payload.get("members")
-                if not isinstance(page, list):
-                    raise SlackAPIError("malformed_response")
-                members.extend(str(row) for row in page if str(row))
-                next_cursor = self._next_cursor(payload)
-                if not next_cursor:
-                    break
-                if next_cursor == cursor or next_cursor in seen_cursors:
-                    raise SlackAPIError("repeated_cursor")
-                seen_cursors.add(next_cursor)
-                cursor = next_cursor
-            resolved = copy.deepcopy(raw)
-            resolved["members"] = members
-            return resolved
-        except SlackAPIError as exc:
-            self.storage.append_app_log(
-                "slack.conversation_members_failed",
-                {"conversation_id": str(raw.get("id") or ""), "error": str(exc)},
-            )
-            return raw
-
-    def _message_payload(
-        self,
-        raw: dict[str, Any],
-        *,
-        client: Any,
-        source: dict[str, Any],
-        conversation_id: str,
-        conversation_type: str,
-        workspace_id: str,
-        users: dict[str, dict[str, Any]],
-        channels: dict[str, dict[str, Any]],
-    ) -> dict[str, Any]:
-        subtype = str(raw.get("subtype") or "")
-        if subtype == "message_deleted":
-            previous = raw.get("previous_message") if isinstance(raw.get("previous_message"), dict) else {}
-            timestamp = str(raw.get("deleted_ts") or previous.get("ts") or raw.get("ts") or "")
-            source_message = previous
-            deleted = True
-        else:
-            source_message = raw
-            timestamp = str(raw.get("ts") or "")
-            deleted = False
-        user_id = str(source_message.get("user") or source_message.get("bot_id") or "")
-        user = self._ensure_user(client, source, users, user_id)
-        raw_text = str(source_message.get("text") or "")
-        body_source = raw_text or slack_blocks_text(source_message.get("blocks"))
-        body_text, links = normalize_slack_text(body_source, users=users, channels=channels)
-        author = str(
-            user.get("display_name") or user.get("real_name")
-            or source_message.get("username") or user_id or "Unknown"
-        )
-        payload = copy.deepcopy(source_message)
-        payload.update({
-            "workspace_id": workspace_id,
-            "conversation_id": conversation_id,
-            "conversation_type": conversation_type,
-            "message_timestamp": timestamp,
-            "thread_timestamp": str(source_message.get("thread_ts") or ""),
-            "parent_message_timestamp": (
-                str(source_message.get("thread_ts") or "")
-                if str(source_message.get("thread_ts") or "") != timestamp else ""
-            ),
-            "user_id": user_id,
-            "author_display_name": author,
-            "raw_text": raw_text,
-            "body_text": body_text,
-            "links": links,
-            "blocks": copy.deepcopy(
-                source_message.get("blocks") if isinstance(source_message.get("blocks"), list) else []
-            ),
-            "files": copy.deepcopy(
-                source_message.get("files") if isinstance(source_message.get("files"), list) else []
-            ),
-            "reactions": copy.deepcopy(
-                source_message.get("reactions") if isinstance(source_message.get("reactions"), list) else []
-            ),
-            "reply_users": copy.deepcopy(
-                source_message.get("reply_users") if isinstance(source_message.get("reply_users"), list) else []
-            ),
-            "latest_reply_timestamp": str(source_message.get("latest_reply") or ""),
-            "is_bot": bool(source_message.get("bot_id") or user.get("is_bot")),
-            "is_deleted": deleted,
-            "source_permalink": str(source_message.get("permalink") or ""),
-        })
-        return payload
-
-    def _reconcile_overlap(
-        self,
-        source_id: str,
-        container_id: str,
-        oldest: float,
-        seen_external_ids: set[str],
-    ) -> int:
-        changed = 0
-        for item in self.vault.list_items(
-            source_id=source_id,
-            container_id=container_id,
-            include_deleted=True,
-        ):
-            try:
-                timestamp = _parse_iso_datetime(
-                    item["primary_timestamp"], field_name="Slack message timestamp",
-                ).timestamp()
-            except Exception:
-                continue
-            if timestamp < oldest or item["external_id"] in seen_external_ids or item["is_deleted"]:
-                continue
-            item["is_deleted"] = True
-            item["last_synced_at"] = _connector_now()
-            item["content_hash"] = vault_item_content_hash(item)
-            self.vault.upsert_item(item)
-            changed += 1
-        return changed
-
-    def _recent_thread_timestamps(
-        self,
-        source_id: str,
-        container_id: str,
-        oldest: float,
-    ) -> set[str]:
-        rows: set[str] = set()
-        for item in self.vault.list_items(
-            source_id=source_id,
-            container_id=container_id,
-            include_deleted=False,
-        ):
-            if item.get("item_type") != "slack_message":
-                continue
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            if int(metadata.get("reply_count") or 0) <= 0:
-                continue
-            message_ts = str(metadata.get("message_timestamp") or "")
-            latest_reply = str(metadata.get("latest_reply_timestamp") or "")
-            try:
-                active = float(latest_reply or message_ts or "0") >= oldest
-            except ValueError:
-                active = False
-            if active and message_ts:
-                rows.add(message_ts)
-        return rows
-
-    def _sync_thread(
-        self,
-        client: Any,
-        source: dict[str, Any],
-        container: dict[str, Any],
-        parent_ts: str,
-        users: dict[str, dict[str, Any]],
-        channels: dict[str, dict[str, Any]],
-        generation: int,
-        seen: set[str],
-    ) -> tuple[int, float]:
-        replies = self._paged(
-            client,
-            "conversations.replies",
-            {
-                "channel": container["external_id"],
-                "ts": parent_ts,
-                "limit": SLACK_HISTORY_PAGE_SIZE,
-            },
-            "messages",
-        )
-        processed = 0
-        newest = 0.0
-        for reply in replies:
-            self._check_cancelled()
-            reply_ts = str(reply.get("ts") or "")
-            if not reply_ts or reply_ts == parent_ts:
-                # conversations.replies returns the parent first. The canonical
-                # parent came from conversations.history and may contain richer
-                # file, reaction, edit, and block metadata; do not overwrite it
-                # with the frequently sparser thread copy.
-                continue
-            payload = self._message_payload(
-                reply,
-                client=client,
-                source=source,
-                conversation_id=container["external_id"],
-                conversation_type=container["container_type"],
-                workspace_id=source["account_identifier"],
-                users=users,
-                channels=channels,
-            )
-            item = self.vault.upsert_slack_message(
-                source["id"], container["id"], payload,
-                sync_generation=generation,
-            )
-            seen.add(item["external_id"])
-            newest = max(newest, float(reply_ts))
-            processed += 1
-        return processed, newest
-
-    def _sync_conversation(
-        self,
-        client: Any,
-        source: dict[str, Any],
-        container: dict[str, Any],
-        raw_conversation: dict[str, Any],
-        users: dict[str, dict[str, Any]],
-        channels: dict[str, dict[str, Any]],
-        settings: dict[str, Any],
-        index: int,
-        total: int,
-    ) -> dict[str, Any]:
-        self._check_cancelled()
-        self._progress(f"Synchronizing {index} of {total} channels...")
-        state = self.vault.find_sync_state(
-            source["id"], container["id"], "slack_latest_timestamp",
-        )
-        try:
-            previous = float(str(state.get("cursor_value") or "0")) if state else 0.0
-        except ValueError:
-            previous = 0.0
-        if previous > 0:
-            oldest = max(0.0, previous - SLACK_INCREMENTAL_OVERLAP_SECONDS)
-        else:
-            history_days = int(settings.get("initial_history_days") or 0)
-            oldest = 0.0 if history_days == 0 else max(
-                0.0, time.time() - history_days * 86400.0,
-            )
-        generation = self.vault.next_sync_generation(source["id"], container["id"])
-        attempted_at = _connector_now()
-        history = self._paged(
-            client,
-            "conversations.history",
-            {
-                "channel": container["external_id"],
-                "oldest": f"{oldest:.6f}",
-                "inclusive": True,
-                "limit": SLACK_HISTORY_PAGE_SIZE,
-            },
-            "messages",
-        )
-        seen: set[str] = set()
-        newest = previous
-        processed = 0
-        thread_timestamps = self._recent_thread_timestamps(
-            source["id"], container["id"], oldest,
-        )
-        for raw in sorted(
-            history,
-            key=lambda row: float(str(row.get("ts") or row.get("deleted_ts") or "0")),
-        ):
-            self._check_cancelled()
-            try:
-                payload = self._message_payload(
-                    raw,
-                    client=client,
-                    source=source,
-                    conversation_id=container["external_id"],
-                    conversation_type=container["container_type"],
-                    workspace_id=source["account_identifier"],
-                    users=users,
-                    channels=channels,
-                )
-                message_ts = str(payload.get("message_timestamp") or "")
-                if not message_ts:
-                    continue
-                item = self.vault.upsert_slack_message(
-                    source["id"], container["id"], payload,
-                    sync_generation=generation,
-                )
-                seen.add(item["external_id"])
-                newest = max(newest, float(message_ts))
-                processed += 1
-                if int(raw.get("reply_count") or 0) > 0:
-                    thread_timestamps.add(str(raw.get("ts") or ""))
-            except ConnectorCancelledError:
-                raise
-            except Exception as exc:
-                self.storage.append_app_log(
-                    "slack.message_skipped",
-                    {
-                        "conversation_id": container["external_id"],
-                        "timestamp": str(raw.get("ts") or raw.get("deleted_ts") or ""),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
-                continue
-        for parent_ts in sorted(
-            (value for value in thread_timestamps if value),
-            key=lambda value: float(value),
-        ):
-            self._check_cancelled()
-            thread_processed, thread_newest = self._sync_thread(
-                client, source, container, parent_ts,
-                users, channels, generation, seen,
-            )
-            processed += thread_processed
-            newest = max(newest, thread_newest)
-        self._progress(f"Processing {processed} messages in {container['display_name']}...")
-        tombstoned = self._reconcile_overlap(
-            source["id"], container["id"], oldest, seen,
-        )
-        successful_at = _connector_now()
-        self.vault.commit_sync_state(
-            source["id"],
-            container["id"],
-            "slack_latest_timestamp",
-            f"{newest:.6f}" if newest else "",
-            generation,
-            metadata={
-                "overlap_seconds": SLACK_INCREMENTAL_OVERLAP_SECONDS,
-                "conversation_id": container["external_id"],
-                "last_reconciliation_at": successful_at,
-                "tombstoned": tombstoned,
-            },
-            attempted_at=attempted_at,
-            successful_at=successful_at,
-        )
-        self._data_changed()
-        return {
-            "processed": processed,
-            "newest": newest,
-            "tombstoned": tombstoned,
-        }
-
-    def _sync_blocking(self) -> dict[str, Any]:
-        attempted_at = _connector_now()
-        client = self._client()
-        self._progress("Connecting...")
-        auth = client.call("auth.test", {})
-        self._require_read_scopes(auth)
-        source = self._ensure_source(auth, connected=True)
-        self.vault.update_data_source_sync_status(
-            source["id"],
-            connection_state="syncing",
-            started_at=attempted_at,
-            error="",
-        )
-        settings = self._settings()
-        try:
-            users = self._load_users(client, source)
-            source = self.vault.get_data_source(source["id"])
-            types = self._conversation_types(settings)
-            if not types:
-                raise ValueError("Enable at least one Slack conversation type")
-            self._progress("Loading containers...")
-            conversations = self._paged(
-                client,
-                "conversations.list",
-                {
-                    "types": ",".join(types),
-                    "exclude_archived": False,
-                    "limit": SLACK_PAGE_SIZE,
-                },
-                "channels",
-            )
-            resolved_conversations: list[dict[str, Any]] = []
-            for raw in conversations:
-                resolved = self._resolve_conversation_members(client, raw)
-                for user_id in [
-                    str(resolved.get("user") or ""),
-                    *[str(row) for row in resolved.get("members", []) if str(row)],
-                ]:
-                    if user_id:
-                        self._ensure_user(client, source, users, user_id)
-                resolved_conversations.append(resolved)
-            raw_by_id = {
-                str(row.get("id") or ""): row
-                for row in resolved_conversations
-                if str(row.get("id") or "")
-            }
-            channel_map: dict[str, dict[str, Any]] = {}
-            containers: list[dict[str, Any]] = []
-            for raw in resolved_conversations:
-                conversation_id = str(raw.get("id") or "")
-                if not conversation_id:
-                    continue
-                name = _slack_conversation_name(raw, users)
-                container_type = _slack_conversation_type(raw)
-                container = self.vault.upsert_container(
-                    source["id"],
-                    conversation_id,
-                    container_type,
-                    name,
-                    display_name=name,
-                    is_archived=bool(raw.get("is_archived")),
-                    is_hidden=False,
-                    metadata={
-                        "name": str(raw.get("name") or ""),
-                        "name_normalized": str(raw.get("name_normalized") or ""),
-                        "topic": copy.deepcopy(
-                            raw.get("topic") if isinstance(raw.get("topic"), dict) else {}
-                        ),
-                        "purpose": copy.deepcopy(
-                            raw.get("purpose") if isinstance(raw.get("purpose"), dict) else {}
-                        ),
-                        "is_member": bool(raw.get("is_member")),
-                        "is_shared": bool(raw.get("is_shared")),
-                        "is_ext_shared": bool(raw.get("is_ext_shared")),
-                        "user": str(raw.get("user") or ""),
-                        "members": [
-                            str(row) for row in raw.get("members", []) if str(row)
-                        ] if isinstance(raw.get("members"), list) else [],
-                    },
-                )
-                channel_map[conversation_id] = {
-                    "name": name.lstrip("#"),
-                    "display_name": name,
-                }
-                if not container["is_archived"]:
-                    containers.append(container)
-            self._data_changed()
-            processed = 0
-            tombstoned = 0
-            failures: list[str] = []
-            for index, container in enumerate(containers, start=1):
-                try:
-                    summary = self._sync_conversation(
-                        client,
-                        source,
-                        container,
-                        raw_by_id.get(container["external_id"], {}),
-                        users,
-                        channel_map,
-                        settings,
-                        index,
-                        len(containers),
-                    )
-                    processed += int(summary.get("processed") or 0)
-                    tombstoned += int(summary.get("tombstoned") or 0)
-                except ConnectorCancelledError:
-                    raise
-                except SlackAPIError as exc:
-                    if exc.error in SLACK_GLOBAL_AUTH_ERRORS:
-                        raise
-                    error = f"{container['display_name']}: {exc}"
-                    failures.append(error)
-                    self.vault.record_sync_failure(
-                        source["id"],
-                        container["id"],
-                        "slack_latest_timestamp",
-                        error,
-                        attempted_at=attempted_at,
-                    )
-                    self.storage.append_app_log(
-                        "slack.channel_sync_failed",
-                        {
-                            "channel_id": container["external_id"],
-                            "error": str(exc),
-                        },
-                    )
-                    continue
-                except Exception as exc:
-                    error = f"{container['display_name']}: {type(exc).__name__}: {exc}"
-                    failures.append(error)
-                    self.vault.record_sync_failure(
-                        source["id"],
-                        container["id"],
-                        "slack_latest_timestamp",
-                        error,
-                        attempted_at=attempted_at,
-                    )
-                    self.storage.append_app_log(
-                        "slack.channel_sync_failed",
-                        {
-                            "channel_id": container["external_id"],
-                            "error": f"{type(exc).__name__}: {exc}",
-                        },
-                    )
-                    continue
-            self._progress("Finalizing...")
-            completed_at = _connector_now()
-            if containers and len(failures) == len(containers):
-                raise RuntimeError(
-                    "Every accessible Slack conversation failed to synchronize. "
-                    + "; ".join(failures[:4])
-                )
-            source = self.vault.update_data_source_sync_status(
-                source["id"],
-                connection_state="connected",
-                completed_at=completed_at,
-                successful_at=completed_at,
-                error="; ".join(failures[:4]),
-            )
-            self._data_changed()
-            return {
-                "ok": True,
-                "source_id": source["id"],
-                "containers": len(containers),
-                "processed": processed,
-                "tombstoned": tombstoned,
-                "failures": failures,
-            }
-        except Exception as exc:
-            self.vault.update_data_source_sync_status(
-                source["id"],
-                connection_state="error",
-                completed_at=_connector_now(),
-                error=str(exc),
-            )
-            self._data_changed()
-            raise
-
-    async def sync(self) -> dict[str, Any]:
-        return await self._run_blocking_lifecycle(
-            "sync", self._sync_blocking, success_message="Complete",
-        )
-
-    def _disconnect_lifecycle_blocking(self) -> dict[str, Any]:
-        self.credentials.clear_slack_token()
-        self.storage.update_config(
-            lambda config: config["vault"]["slack"].__setitem__("enabled", False)
-        )
-        source = self._source()
-        if source:
-            source = self.vault.upsert_data_source(
-                SLACK_SOURCE_TYPE,
-                source["display_name"],
-                source["account_identifier"],
-                enabled=False,
-                connection_state="disabled",
-                credential_reference="credentials/slack.cred",
-                metadata=source.get("metadata", {}),
-                source_id=source["id"],
-            )
-        self._data_changed()
-        return {"ok": True, "source": source}
-
-
 class VaultConnectorManager:
     """Independent manual, startup, and periodic scheduling for Vault connectors."""
 
@@ -20832,7 +19328,6 @@ class VaultConnectorManager:
         storage: Storage,
         google_drive: GoogleDriveConnector,
         gmail: GmailConnector,
-        slack: SlackConnector,
         *,
         data_changed_callback: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.time,
@@ -20841,7 +19336,6 @@ class VaultConnectorManager:
         self.connectors: dict[str, VaultConnectorContract] = {
             GOOGLE_DRIVE_SOURCE_TYPE: google_drive,
             GMAIL_SOURCE_TYPE: gmail,
-            SLACK_SOURCE_TYPE: slack,
         }
         self.data_changed_callback = data_changed_callback
         self.clock = clock
@@ -20849,7 +19343,6 @@ class VaultConnectorManager:
         now = self.clock()
         self.next_due: dict[str, float] = {
             GMAIL_SOURCE_TYPE: now + CONNECTOR_STARTUP_DELAY_SECONDS,
-            SLACK_SOURCE_TYPE: now + CONNECTOR_STARTUP_DELAY_SECONDS,
         }
         self._shutting_down = False
 
@@ -20871,14 +19364,6 @@ class VaultConnectorManager:
             status = self.connector(source_type).validate_configuration()
         except Exception:
             return False
-        if source_type == SLACK_SOURCE_TYPE:
-            return bool(
-                config.get("enabled")
-                and status.get("configured")
-                and status.get("token_present")
-                and status.get("token_valid_shape", True)
-                and not status.get("missing_scopes")
-            )
         return bool(config.get("enabled") and status.get("configured"))
 
     async def _run(self, source_type: str, operation: str) -> dict[str, Any]:
@@ -20959,7 +19444,7 @@ class VaultConnectorManager:
                 continue
             self._consume_finished_task(key, task)
             self.tasks.pop(key, None)
-        for source_type in (GMAIL_SOURCE_TYPE, SLACK_SOURCE_TYPE):
+        for source_type in (GMAIL_SOURCE_TYPE,):
             if source_type in self.tasks or now < self.next_due.get(source_type, 0.0):
                 continue
             if self._enabled(source_type):
@@ -41610,8 +40095,8 @@ class ToolRegistry:
         self.register("items_link_agent", "Link one existing agent task to an Item", self._schema({"item_id": item_id_schema, "agent_id": {"type": "string", "minLength": 1}}, ["item_id", "agent_id"]), self.tool_items_link_agent)
         self.register("items_unlink_agent", "Remove one agent link from an Item", self._schema({"item_id": item_id_schema, "agent_id": {"type": "string", "minLength": 1}}, ["item_id", "agent_id"]), self.tool_items_unlink_agent)
         self.register("week_chat_get", "Get or lazily create one Week Chat", self._schema({"date": iso_date_schema}, ["date"]), self.tool_week_chat_get)
-        self.register("vault_search", "Search locally cached Calendar, Gmail, or Slack records", self._schema({
-            "source": {"type": "string", "enum": ["google_calendar", "gmail", "slack"]},
+        self.register("vault_search", "Search locally cached Calendar or Gmail records", self._schema({
+            "source": {"type": "string", "enum": ["google_calendar", "gmail"]},
             "query": {"type": "string"},
         }, ["source", "query"]), self.tool_vault_search)
         self.register("vault_get", "Get one normalized local Vault record", self._schema({"item_id": item_id_schema}, ["item_id"]), self.tool_vault_get)
@@ -44225,8 +42710,8 @@ class ToolRegistry:
     async def tool_vault_search(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
         del ctx
         source_type = str((args or {}).get("source") or "").strip()
-        if source_type not in {GOOGLE_CALENDAR_SOURCE_TYPE, GMAIL_SOURCE_TYPE, SLACK_SOURCE_TYPE}:
-            raise ValueError("source must be google_calendar, gmail, or slack")
+        if source_type not in {GOOGLE_CALENDAR_SOURCE_TYPE, GMAIL_SOURCE_TYPE}:
+            raise ValueError("source must be google_calendar or gmail")
         query = str((args or {}).get("query") or "").strip().casefold()
         sources = [
             row for row in self.vault_store.list_data_sources()
@@ -44239,7 +42724,6 @@ class ToolRegistry:
         allowed_types = {
             GOOGLE_CALENDAR_SOURCE_TYPE: {"calendar_event"},
             GMAIL_SOURCE_TYPE: {"gmail_message"},
-            SLACK_SOURCE_TYPE: {"slack_message", "slack_thread_reply"},
         }[source_type]
         containers = {row["id"]: row for row in self.vault_store.list_containers(source["id"])}
         rows = []
@@ -47948,14 +46432,14 @@ class PersonalAssistantScheduler:
             current_report = ""
         context_parts = [
             f"Current local date and time: {local_now.isoformat(timespec='minutes')}",
-            "Review locally cached Gmail and Slack Vault data plus Calendar Events and Items. Google Drive is ad hoc only; discover with drive_list_drives/drive_list_root, traverse with drive_list_children, use folders_only for directory maps, and set limit up to 1000 when needed.",
+            "Review locally cached Gmail Vault data plus Calendar Events and Items. Google Drive is ad hoc only; discover with drive_list_drives/drive_list_root, traverse with drive_list_children, use folders_only for directory maps, and set limit up to 1000 when needed.",
         ]
         if prior_reports:
             context_parts.append("# Prior daily PA reports\n" + prior_reports)
         if current_report:
             context_parts.append("# Earlier PA Tasks today\n" + current_report[-60_000:])
         task = (
-            "Perform the scheduled Personal Assistant review. Inspect new locally cached Gmail and Slack records, "
+            "Perform the scheduled Personal Assistant review. Inspect new locally cached Gmail records, "
             "today's and upcoming Calendar Events, and open Items. Create or update Items for actionable work, "
             "schedule honest preparation time, and start General Agents for concrete local deliverables such as "
             "research notes, meeting preparation, documents, decks, spreadsheets, code, or analysis. Avoid duplicate "
@@ -49388,7 +47872,13 @@ class LLMTaskMonitor:
             return rows
         return rows[:max(0, int(limit))]
 
-    def statistics(self) -> dict[str, Any]:
+    def cost_statistics(self, window_seconds: int = 86400) -> dict[str, Any]:
+        with self._lock:
+            live = [copy.deepcopy(event) for key, event in self._cost_events.items()
+                    if not self._inference_metric_snapshots.get(key, {}).get("final")]
+        return self.cost_ledger.summary(live, window_seconds=window_seconds)
+
+    def statistics(self, *, include_costs: bool = True) -> dict[str, Any]:
         # Dashboard totals are lifetime totals for the current strict data root.
         # Do not apply the display-list limit here: a long-lived installation can
         # easily exceed an arbitrary cap, and the summary cards must still include
@@ -49396,9 +47886,7 @@ class LLMTaskMonitor:
         now_mono = time.monotonic()
         with self._lock:
             rows = [self._row_from_record(rec, now_mono) for rec in self._records.values()]
-            live_costs = [copy.deepcopy(event) for key, event in self._cost_events.items()
-                          if not self._inference_metric_snapshots.get(key, {}).get("final")]
-        costs_24h = self.cost_ledger.summary(live_costs)
+        costs_24h = self.cost_statistics() if include_costs else {}
         counts = collections.Counter(str(row.get("display_status") or row.get("state") or "unknown") for row in rows)
         terminal_rows = [row for row in rows if str(row.get("state") or "") in self.TERMINAL_STATES]
         input_tokens = sum(max(0, int(row.get("input_tokens") or 0)) for row in rows)
@@ -61982,6 +60470,7 @@ class UIState:
         self.active_chat_id: str | None = None
         self.selected_agent_id: str | None = None
         self.selected_llm_task_id: str | None = None
+        self.dashboard_cost_period = "24 hours"
         self.selected_scheduled_task_id: str | None = None
         self.selected_system_task_row_id: str | None = None
         self.scheduled_task_entries_cache: list[dict[str, Any]] = []
@@ -62083,11 +60572,6 @@ class UIState:
         self.vault_drive_action_task: asyncio.Task | None = None
         self.vault_drive_action_status: str = ""
         self.vault_drive_action_error: str = ""
-        self.vault_slack_height_cache: dict[tuple[str, int], int] = {}
-        self.vault_slack_layout_key: tuple[Any, ...] | None = None
-        self.vault_slack_layout_tops: list[int] = []
-        self.vault_slack_layout_heights: list[int] = []
-        self.vault_slack_layout_total_h: int = 0
         self.google_calendar_task: asyncio.Task | None = None
         self.google_calendar_operation: str = ""
         self.google_calendar_status: str = ""
@@ -62097,7 +60581,7 @@ class UIState:
         self.vault_connector_tasks: dict[str, asyncio.Task] = {}
         self.vault_connector_operations: dict[str, str] = {}
         self.vault_connector_events: dict[str, list[str]] = {
-            GOOGLE_DRIVE_SOURCE_TYPE: [], GMAIL_SOURCE_TYPE: [], SLACK_SOURCE_TYPE: [],
+            GOOGLE_DRIVE_SOURCE_TYPE: [], GMAIL_SOURCE_TYPE: [],
         }
         self.active_widget: str | None = None
         self.open_dropdown: str | None = None
@@ -64559,8 +63043,8 @@ class Widgets:
                 middle_y = cell.y + cell.h // 2
                 bottom_y = middle_y if value.get("tree_last") else cell.y + cell.h
                 self.renderer.draw_line(trunk_x, cell.y, trunk_x, bottom_y, Palette.muted2)
-                # Eight pixels of clear space between the arrow tip and ID text.
-                tip_x = cell.x + 10 + indent - 8
+                # Eighteen pixels of clear space between the arrow tip and ID text.
+                tip_x = cell.x + 10 + indent - 18
                 self.renderer.draw_line(trunk_x, middle_y, tip_x, middle_y, Palette.muted2)
                 self.renderer.draw_line(tip_x - 4, middle_y - 3, tip_x, middle_y, Palette.muted2)
                 self.renderer.draw_line(tip_x - 4, middle_y + 3, tip_x, middle_y, Palette.muted2)
@@ -64895,8 +63379,8 @@ class Widgets:
                     indent = min(max(0, int(value.get("indent") or 0)), max(0, cell.w - 28)) if isinstance(value, dict) else 0
                     if isinstance(value, dict) and value.get("tree_branch"):
                         # Large fonts need a longer branch, still with the same
-                        # eight-pixel arrow-to-text gap and unindented requirements.
-                        indent = min(max(indent, self._text_width("C") + 14), max(0, cell.w - 28))
+                        # eighteen-pixel arrow gap and unindented requirements.
+                        indent = min(max(indent, self._text_width("C") + 28), max(0, cell.w - 28))
                     if isinstance(value, dict) and (value.get("tree_branch") or value.get("tree_children")):
                         self._draw_table_tree_connector(cell, indent, value)
                     self.clipped_text(
@@ -65823,7 +64307,6 @@ class Services:
     google_calendar: GoogleCalendarIntegration | None = None
     google_drive: GoogleDriveConnector | None = None
     gmail: GmailConnector | None = None
-    slack: SlackConnector | None = None
     vault_connectors: VaultConnectorManager | None = None
     calendar_refresh_callback: Callable[[], Any] | None = None
     credentials: CredentialStore | None = None
@@ -68237,7 +66720,6 @@ class Panels:
         for source_type, connector in (
             (GOOGLE_DRIVE_SOURCE_TYPE, self.services.google_drive),
             (GMAIL_SOURCE_TYPE, self.services.gmail),
-            (SLACK_SOURCE_TYPE, self.services.slack),
         ):
             try:
                 statuses[source_type] = connector.get_status() if connector is not None else {}
@@ -68316,7 +66798,7 @@ class Panels:
             )
             snapshot["search_pending"] = pending_search
             # The controller owns immutable cached row lists; retaining the snapshot
-            # avoids cloning large Gmail/Slack result sets every frame.
+            # avoids cloning large Gmail result sets every frame.
             self.state.vault_query_snapshot = snapshot
             self.state.vault_query_error = ""
         except Exception as exc:
@@ -68399,7 +66881,6 @@ class Panels:
             self.state.vault_focus_area = "left"
             self.state.scroll["vault.left"] = 0
             self.state.scroll["vault.right.markdown"] = 0
-            self.state.scroll["vault.right.slack"] = 0
             changed = True
 
         placeholder = VAULT_SEARCH_PLACEHOLDERS.get(self.state.vault_source_type, "Search this source...")
@@ -68510,8 +66991,6 @@ class Panels:
             return max(VAULT_GOOGLE_DRIVE_ROW_H, self.f.line_h * 3 + 18)
         if source_type == GMAIL_SOURCE_TYPE:
             return max(VAULT_GMAIL_ROW_H, self.f.line_h * 3 + 18)
-        if source_type == SLACK_SOURCE_TYPE:
-            return max(VAULT_SLACK_CHANNEL_ROW_H, self.f.line_h * 2 + 16)
         return max(VAULT_CALENDAR_ROW_H, self.f.line_h + 18)
 
     @staticmethod
@@ -68701,164 +67180,6 @@ class Panels:
         lines.extend(["", "---", "", body or "_No readable message body is available._"])
         return "\n".join(lines)[:VAULT_MAX_DETAIL_MARKDOWN_CHARS]
 
-    @staticmethod
-    def _vault_slack_markdown_text(value: Any) -> str:
-        text = str(value or "")
-        text = re.sub(r"<((?:https?://)[^>|]+)\|([^>]+)>", r"[\2](\1)", text)
-        text = re.sub(r"<((?:https?://)[^>]+)>", r"\1", text)
-        text = re.sub(r"<@([A-Z0-9]+)>", r"@\1", text)
-        text = re.sub(r"<#([A-Z0-9]+)(?:\|([^>]+))?>", lambda m: "#" + (m.group(2) or m.group(1)), text)
-        return text
-
-    def _vault_slack_message_markdown(self, row: dict[str, Any]) -> str:
-        """Return readable Slack text plus retained file/link/reaction metadata."""
-        sections: list[str] = []
-        body = self._vault_slack_markdown_text(row.get("body_text")).strip()
-        if row.get("parent_outside_range"):
-            sections.append("_Parent message is outside the current date range._")
-        if body:
-            sections.append(body)
-
-        attachments = [entry for entry in (row.get("attachments") or []) if isinstance(entry, dict)]
-        if attachments:
-            attachment_lines = ["**Files**"]
-            for attachment in attachments[:20]:
-                filename = self._vault_markdown_escape_inline(attachment.get("filename") or "Attachment")
-                source_url = str(attachment.get("source_url") or "").strip()
-                mime_type = self._vault_markdown_escape_inline(attachment.get("mime_type"))
-                size = int(attachment.get("size_bytes") or 0)
-                details = ", ".join(part for part in (mime_type, human_bytes(size) if size else "") if part)
-                label = f"[{filename}]({source_url})" if source_url else filename
-                attachment_lines.append(f"- {label}" + (f" — {details}" if details else ""))
-            if len(attachments) > 20:
-                attachment_lines.append(f"- _{len(attachments) - 20} more files_…")
-            sections.append("\n".join(attachment_lines))
-
-        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        links = [entry for entry in (metadata.get("links") or []) if isinstance(entry, dict)]
-        if links:
-            link_lines = ["**Links**"]
-            for link in links[:20]:
-                url = str(link.get("url") or link.get("source_url") or "").strip()
-                label = self._vault_markdown_escape_inline(
-                    link.get("display_label") or link.get("label") or link.get("title") or url
-                )
-                if url:
-                    link_lines.append(f"- [{label or url}]({url})")
-                elif label:
-                    link_lines.append(f"- {label}")
-            if len(links) > 20:
-                link_lines.append(f"- _{len(links) - 20} more links_…")
-            sections.append("\n".join(link_lines))
-
-        reactions = metadata.get("reactions")
-        if isinstance(reactions, list) and reactions:
-            reaction_text = " · ".join(
-                f":{reaction.get('name', 'reaction')}: {int(reaction.get('count') or 0)}"
-                for reaction in reactions if isinstance(reaction, dict)
-            )
-            if reaction_text:
-                sections.append(f"**Reactions:** {reaction_text}")
-        elif reactions:
-            sections.append(f"**Reactions:** {self._vault_markdown_escape_inline(reactions)}")
-
-        source_url = str(row.get("source_url") or "").strip()
-        if source_url:
-            sections.append(f"[Open in Slack]({source_url})")
-        return "\n\n".join(section for section in sections if section).strip()
-
-    def _vault_draw_slack_messages(self, rect: Rect, snapshot: dict[str, Any]) -> None:
-        raw_rows = snapshot.get("right_rows")
-        rows = raw_rows if isinstance(raw_rows, list) else []
-        if not rows:
-            self._vault_draw_empty_message(rect, "No messages match the current search and date range.\n\nClear the search or expand the date range.")
-            return
-        scroll_id = "vault.right.slack"
-        width_bucket = max(1, rect.w // 32)
-        revision = self._vault_controller().revision()
-        layout_key = (
-            revision, str(snapshot.get("source_id") or ""), str(snapshot.get("selected_id") or ""),
-            self.state.vault_start_date_iso or "", self.state.vault_end_date_iso or "",
-            self.state.vault_applied_search_text, width_bucket, len(rows),
-        )
-        fixed_layout = len(rows) > VAULT_SLACK_DYNAMIC_LAYOUT_MAX_ROWS
-        if fixed_layout:
-            stride = max(VAULT_SLACK_FIXED_ROW_H, self.f.line_h * 5 + 24) + 4
-            total_h = len(rows) * stride
-            heights: list[int] = []
-            tops: list[int] = []
-        else:
-            if self.state.vault_slack_layout_key != layout_key:
-                heights = []
-                tops = []
-                running = 0
-                for row in rows:
-                    cache_key = (str(row.get("id") or ""), width_bucket)
-                    height = self.state.vault_slack_height_cache.get(cache_key)
-                    if height is None:
-                        indent = 30 if int(row.get("indentation_depth") or 0) else 0
-                        cols = max(12, (rect.w - 48 - indent) // max(1, self.f.char_w))
-                        message_markdown = self._vault_slack_message_markdown(row)
-                        line_count = int(clamp(
-                            estimate_wrapped_line_count_fast(message_markdown, cols), 1, 20,
-                        ))
-                        height = max(58, self.f.line_h * (line_count + 1) + 24)
-                        self.state.vault_slack_height_cache[cache_key] = height
-                    tops.append(running)
-                    heights.append(height)
-                    running += height + 4
-                self.state.vault_slack_layout_key = layout_key
-                self.state.vault_slack_layout_tops = tops
-                self.state.vault_slack_layout_heights = heights
-                self.state.vault_slack_layout_total_h = running
-            tops = self.state.vault_slack_layout_tops
-            heights = self.state.vault_slack_layout_heights
-            total_h = self.state.vault_slack_layout_total_h
-
-        scroll_y = int(self.state.scroll.get(scroll_id, 0))
-        if self.widgets._can_receive_pointer(scroll_id) and point_in_rect(
-            self.state.input.mouse_x, self.state.input.mouse_y, rect,
-        ) and self.state.input.wheel_y:
-            scroll_y -= int(self.state.input.wheel_y) * self.f.line_h * 4
-            self.state.input.mouse_consumed = True
-        scroll_y = int(clamp(scroll_y, 0, max(0, total_h - rect.h)))
-        scroll_y = self.widgets._scrollbar_input(scroll_id, rect, scroll_y, total_h)
-        self.state.scroll[scroll_id] = scroll_y
-        self.r.draw_rect(rect, Palette.panel2)
-        self.r.push_clip(rect)
-        if fixed_layout:
-            start_index, end_index = vault_visible_row_range(scroll_y, stride, len(rows), rect.h, overscan=2)
-        else:
-            start_index = max(0, bisect.bisect_right(tops, scroll_y) - 1)
-            end_index = min(len(rows), bisect.bisect_left(tops, scroll_y + rect.h) + 2)
-        tz = self._vault_controller().query.local_timezone
-        for index in range(start_index, end_index):
-            row = rows[index]
-            top = index * stride if fixed_layout else tops[index]
-            height = stride - 4 if fixed_layout else heights[index]
-            y = rect.y + top - scroll_y
-            indent = 30 if int(row.get("indentation_depth") or 0) else 0
-            rr = Rect(rect.x + 10 + indent, y + 2, max(1, rect.w - 26 - indent), height)
-            if indent:
-                self.r.draw_rect(Rect(rect.x + 16, rr.y, 2, rr.h), theme_alpha(Palette.accent, 100))
-            self.r.draw_round_rect(rr, 10, theme_mix(Palette.input_bg, Palette.white, 0.015))
-            author = str(row.get("author_display_name") or "Unknown")
-            stamp = format_vault_local_timestamp(row.get("primary_timestamp"), tz, include_date=False)
-            edited = " · edited" if row.get("metadata", {}).get("edited_timestamp") else ""
-            self.widgets.clipped_text(
-                Rect(rr.x + 10, rr.y + 5, rr.w - 20, self.f.line_h + 4),
-                f"{stamp}  {author}{edited}", Palette.text,
-            )
-            body_y = rr.y + self.f.line_h + 9
-            body_rect = Rect(rr.x + 8, body_y, rr.w - 16, max(1, rr.y + rr.h - body_y - 4))
-            body_text = self._vault_slack_message_markdown(row)
-            self.widgets.markdown_renderer.view(
-                f"vault.slack.message.{row.get('id')}", body_rect, body_text,
-                selectable=True, draw_card=False, vertical_scroll=False,
-                visible_clip=rect, cache_key=f"vault.slack.message.{row.get('id')}.{width_bucket}",
-            )
-        self.r.pop_clip()
-        self.widgets._scrollbar_draw(scroll_id, rect, scroll_y, total_h)
 
     def _vault_draw_empty_message(
         self, rect: Rect, message: str, *, settings_button: bool = False,
@@ -69300,7 +67621,6 @@ class Panels:
                 GOOGLE_CALENDAR_SOURCE_TYPE: "Calendar events",
                 GOOGLE_DRIVE_SOURCE_TYPE: "Google Drive data",
                 GMAIL_SOURCE_TYPE: "Gmail data",
-                SLACK_SOURCE_TYPE: "Slack data",
             }.get(source_type, "Vault data")
             source_error = str(source.get("last_sync_error") or "").strip()
             if source_error:
@@ -69322,15 +67642,11 @@ class Panels:
                 GOOGLE_CALENDAR_SOURCE_TYPE: "events",
                 GOOGLE_DRIVE_SOURCE_TYPE: "files",
                 GMAIL_SOURCE_TYPE: "messages",
-                SLACK_SOURCE_TYPE: "channels",
             }.get(source_type, "items")
             self._vault_draw_empty_message(
                 rect,
                 f"No {noun} match the current search and date range.\n\nClear the search or expand the date range.",
             )
-            return
-        if source_type == SLACK_SOURCE_TYPE:
-            self._vault_draw_slack_messages(rect, snapshot)
             return
         if source_type == GOOGLE_CALENDAR_SOURCE_TYPE:
             markdown = self._vault_calendar_markdown(snapshot)
@@ -69425,9 +67741,7 @@ class Panels:
                 # confirms that row without invoking its secondary action.
                 inp.key_enter = False
                 changed = bool(snapshot.get("selected_id")) or changed
-        focused_scroll = "vault.left" if self.state.vault_focus_area == "left" else (
-            "vault.right.slack" if snapshot.get("source_type") == "slack" else "vault.right.markdown"
-        )
+        focused_scroll = "vault.left" if self.state.vault_focus_area == "left" else "vault.right.markdown"
         focused_rect = layout.left_body if self.state.vault_focus_area == "left" else layout.right_body
         if inp.key_page_up:
             self.state.scroll[focused_scroll] = max(0, int(self.state.scroll.get(focused_scroll, 0)) - focused_rect.h)
@@ -70441,7 +68755,7 @@ class Panels:
                 "status": {"type": "status_icon", "icon": "check" if item_state in (CHECKLIST_ITEM_DONE, CHECKLIST_ITEM_VERIFIED) else "dot" if item_state == CHECKLIST_ITEM_IN_PROGRESS else "",
                            "label": marker, "color": color, "indent": 10 if parent_id else 0, "tooltip": state_label},
                 "requirement_id": {"label": item_id, "color": Palette.muted2 if parent_id else Palette.text,
-                                   "indent": 26 if parent_id else 0, "tree_branch": bool(parent_id),
+                                   "indent": 40 if parent_id else 0, "tree_branch": bool(parent_id),
                                    "tree_children": bool(children and item_id not in collapsed), "tooltip": tooltip},
                 "requirement": {"label": str(row.get("text") or ""), "tooltip": tooltip},
                 "progress": {"label": progress, "tooltip": tooltip},
@@ -77844,30 +76158,6 @@ class Panels:
         )
         gmail_cfg["include_spam"] = bool(gmail_cfg.get("include_spam", False))
         gmail_cfg["include_trash"] = bool(gmail_cfg.get("include_trash", False))
-        slack_cfg = vault_cfg.setdefault("slack", {})
-        slack_cfg["enabled"] = bool(slack_cfg.get("enabled", False))
-        redirect_uri = str(slack_cfg.get("redirect_uri") or SLACK_REDIRECT_URI_DEFAULT).strip()
-        try:
-            parsed_redirect = urllib.parse.urlparse(redirect_uri)
-            if parsed_redirect.scheme != "http" or parsed_redirect.hostname not in {"127.0.0.1", "localhost"} or not parsed_redirect.port:
-                raise ValueError
-            slack_cfg["redirect_uri"] = redirect_uri
-        except Exception:
-            slack_cfg["redirect_uri"] = SLACK_REDIRECT_URI_DEFAULT
-        slack_cfg["initial_history_days"] = self._coerce_settings_int(
-            slack_cfg.get("initial_history_days", SLACK_INITIAL_HISTORY_DAYS_DEFAULT),
-            SLACK_INITIAL_HISTORY_DAYS_DEFAULT, 0, None,
-        )
-        slack_cfg["sync_interval_minutes"] = self._coerce_settings_int(
-            slack_cfg.get("sync_interval_minutes", SLACK_SYNC_INTERVAL_MINUTES_DEFAULT),
-            SLACK_SYNC_INTERVAL_MINUTES_DEFAULT, 1, None,
-        )
-        for key in (
-            "include_public_channels", "include_private_channels",
-            "include_direct_messages", "include_group_direct_messages",
-        ):
-            slack_cfg[key] = bool(slack_cfg.get(key, True))
-
         meshy_cfg = cfg.setdefault("meshy", {})
         meshy_cfg["api_token"] = str(meshy_cfg.get("api_token") or "")
         meshy_cfg["base_url"] = str(meshy_cfg.get("base_url") or "https://api.meshy.ai").strip().rstrip("/") or "https://api.meshy.ai"
@@ -77905,9 +76195,9 @@ class Panels:
             "settings.meshy.poll_interval": ("meshy", "poll_interval_seconds"),
             "settings.accounts.gmail.initial_history_days": ("vault", "gmail", "initial_history_days"),
             "settings.accounts.gmail.sync_interval_minutes": ("vault", "gmail", "sync_interval_minutes"),
-            "settings.accounts.slack.redirect_uri": ("vault", "slack", "redirect_uri"),
-            "settings.accounts.slack.initial_history_days": ("vault", "slack", "initial_history_days"),
-            "settings.accounts.slack.sync_interval_minutes": ("vault", "slack", "sync_interval_minutes"),
+
+
+
         }
         if widget in exact:
             return exact[widget]
@@ -77930,8 +76220,8 @@ class Panels:
         "settings.meshy.poll_interval": "float",
         "settings.accounts.gmail.initial_history_days": "int",
         "settings.accounts.gmail.sync_interval_minutes": "int",
-        "settings.accounts.slack.initial_history_days": "int",
-        "settings.accounts.slack.sync_interval_minutes": "int",
+
+
         **{f"settings.web.{key}": kind for key, (_default, _minimum, kind) in WEB_RESOURCE_SETTING_SPECS.items()},
         **{f"settings.tools.{key}": kind for key, (_default, _minimum, kind) in TOOL_RESOURCE_SETTING_SPECS.items()},
     }
@@ -78283,7 +76573,7 @@ class Panels:
                 row["pausable"] = self.services.monitor.can_pause_task(task_id)
                 row["resumable"] = self.services.monitor.can_resume_task(task_id)
             self.state.llm_task_entries_cache = rows
-            self.state.llm_task_stats_cache = self.services.monitor.statistics()
+            self.state.llm_task_stats_cache = self.services.monitor.statistics(include_costs=False)
             self.state.llm_task_cache_scope_id = APP_SCOPE_ID
             self.state.llm_task_cache_revision = int(self.services.monitor.revision)
             self.state.llm_task_last_refresh = format_display_datetime(now_iso())
@@ -78442,9 +76732,9 @@ class Panels:
         )
 
     @staticmethod
-    def _account_connector_card_heights() -> tuple[int, int, int, int]:
-        """Return Calendar, Drive, Gmail, and Slack card heights for the grouped layout."""
-        return 1040, 640, 770, 980
+    def _account_connector_card_heights() -> tuple[int, int, int]:
+        """Return Calendar, Drive, and Gmail card heights for the grouped layout."""
+        return 1040, 640, 770
 
     def _agent_settings_layout(self, column_width: int) -> tuple[int, int, int, int]:
         inner_w = self._settings_inner_width_for_column(column_width)
@@ -78452,7 +76742,7 @@ class Panels:
             "General Agents use Velox's immutable agent protocol plus the editable General Agent skill. They execute concrete background work and cannot spawn other agents.", inner_w,
         )
         pa_intro_h = self._settings_wrapped_text_height(
-            "The PA reviews locally cached Gmail and Slack data plus Calendar Events and Items after the daily start time, then checks again at the configured interval when no PA Task is active. It may create or update Items and delegate concrete deliverables to General Agents. Google Drive remains ad hoc only.", inner_w,
+            "The PA reviews locally cached Gmail data plus Calendar Events and Items after the daily start time, then checks again at the configured interval when no PA Task is active. It may create or update Items and delegate concrete deliverables to General Agents. Google Drive remains ad hoc only.", inner_w,
         )
         general_h = self._settings_card_height_for_content(
             general_intro_h + SETTINGS_BLOCK_GAP + self._settings_rows_height(2)
@@ -78475,13 +76765,13 @@ class Panels:
         endpoint_cards = self._endpoint_settings_card_heights(content_width)
         agent_card_h, pa_card_h = self._agent_settings_card_heights(content_width)
         github_h = self._github_settings_card_height(content_width)
-        calendar_h, drive_h, gmail_h, slack_h = self._account_connector_card_heights()
+        calendar_h, drive_h, gmail_h = self._account_connector_card_heights()
         defaults_h = self._settings_card_height_for_content(self._settings_rows_height(6))
         heights = {
             "General": sum(general_cards) + gap * (len(general_cards) - 1) + 8,
             "Appearance": self._settings_card_height_for_content(self._settings_rows_height(10)) + 20,
             "Endpoints": sum(endpoint_cards) + gap * (len(endpoint_cards) - 1) + 20,
-            "Accounts": github_h + gap + calendar_h + gap + drive_h + gap + gmail_h + gap + slack_h + 24,
+            "Accounts": github_h + gap + calendar_h + gap + drive_h + gap + gmail_h + 24,
             "Agents": agent_card_h + gap + pa_card_h + gap + 360 + gap + 360 + 20,
             "Skills": 1240 + 20,
             "Tools": (
@@ -78978,7 +77268,7 @@ class Panels:
         except Exception as exc:
             github = {"username": "", "pat": ""}
             self._append_google_calendar_event(f"Credential error: {type(exc).__name__}: {exc}")
-        calendar_card_h, drive_card_h, gmail_card_h, slack_card_h = self._account_connector_card_heights()
+        calendar_card_h, drive_card_h, gmail_card_h = self._account_connector_card_heights()
         y = col.y
         card = self._settings_card_rect(col, y, self._github_settings_card_height(col.w))
         inner = self._draw_settings_card_shell(card, "GitHub")
@@ -79597,186 +77887,6 @@ class Panels:
             or "Gmail connection and synchronization events will appear here.",
         )
 
-        y += gmail_card.h + SETTINGS_CARD_GAP_Y
-        slack_settings = vault_cfg.setdefault("slack", copy.deepcopy(default_config()["vault"]["slack"]))
-        try:
-            slack_credentials = credential_store.load_slack()
-        except Exception as exc:
-            slack_credentials = {
-                "client_id": "", "client_secret": "", "access_token": "", "workspace_id": "",
-                "authenticated_user_id": "", "team_name": "", "scopes": [],
-            }
-            self._append_vault_connector_event(SLACK_SOURCE_TYPE, f"Credential error: {type(exc).__name__}: {exc}")
-        try:
-            slack_status = self.services.vault_connector_status(SLACK_SOURCE_TYPE)
-        except Exception as exc:
-            slack_status = {
-                "configured": False, "connected": False, "operation_in_progress": False,
-                "message": "", "last_error": f"{type(exc).__name__}: {exc}", "events": [], "source": None,
-            }
-        slack_card = self._settings_card_rect(col, y, slack_card_h)
-        slack_intro = (
-            "Connect a Slack app with a read-only user token. Velox mirrors conversations visible to that member and never "
-            "posts, edits, reacts, joins, or downloads file bodies."
-        )
-        inner = self._draw_settings_card_shell(
-            slack_card, "Slack",
-            tooltip=(
-                slack_intro + "\nThe OAuth request uses only read scopes for channels, private channels, DMs, group DMs, "
-                "users, reactions, and file metadata."
-            ),
-        )
-        cy = inner.y
-        label_w = min(190, max(130, int(inner.w * 0.28)))
-        value_x = inner.x + label_w + 10
-        value_w = min(SETTINGS_LONG_INPUT_W, max(1, inner.x + inner.w - value_x))
-        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Slack client ID", Palette.muted2)
-        next_slack_client_id = self.widgets.text_input(
-            "settings.accounts.slack.client_id", Rect(value_x, cy, value_w, SETTINGS_CONTROL_H),
-            str(slack_credentials.get("client_id") or ""), "Slack app client ID",
-        )
-        cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
-        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Slack client secret", Palette.muted2)
-        next_slack_client_secret = self.widgets.text_input(
-            "settings.accounts.slack.client_secret", Rect(value_x, cy, value_w, SETTINGS_CONTROL_H),
-            str(slack_credentials.get("client_secret") or ""), "Slack app client secret", password=True,
-        )
-        if (
-            next_slack_client_id != str(slack_credentials.get("client_id") or "")
-            or next_slack_client_secret != str(slack_credentials.get("client_secret") or "")
-        ):
-            try:
-                slack_credentials = credential_store.save_slack_oauth_client(
-                    next_slack_client_id, next_slack_client_secret,
-                )
-            except Exception as exc:
-                self._append_vault_connector_event(SLACK_SOURCE_TYPE, f"Credential save error: {type(exc).__name__}: {exc}")
-        cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
-        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Redirect URI", Palette.muted2)
-        slack_settings["redirect_uri"] = self.widgets.text_input(
-            "settings.accounts.slack.redirect_uri", Rect(value_x, cy, value_w, SETTINGS_CONTROL_H),
-            str(slack_settings.get("redirect_uri") or SLACK_REDIRECT_URI_DEFAULT), SLACK_REDIRECT_URI_DEFAULT,
-            tooltip="Add this exact localhost URL to the Slack app OAuth redirect URLs.",
-        )
-        cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
-        heading_h = max(24, self.f.line_h + 4)
-        conversation_column, history_column = settings_compact_two_column_rects(
-            Rect(inner.x, cy, inner.w, max(1, inner.y + inner.h - cy)),
-            left_preferred_w=440, right_preferred_w=390, gap=64,
-        )
-        toggles_x = conversation_column.x
-        split_w = conversation_column.w
-        sync_x = history_column.x
-        sync_w = history_column.w
-        self.widgets.clipped_text(Rect(toggles_x, cy, split_w, heading_h), "Conversations", Palette.muted2)
-        self.widgets.clipped_text(Rect(sync_x, cy, sync_w, heading_h), "History and synchronization", Palette.muted2)
-        controls_y = cy + heading_h + 4
-        toggle_rows = [
-            ("enabled", "Periodic synchronization"),
-            ("include_public_channels", "Public channels"),
-            ("include_private_channels", "Private channels"),
-            ("include_direct_messages", "Direct messages"),
-            ("include_group_direct_messages", "Group direct messages"),
-        ]
-        for row_index, (setting_key, toggle_label) in enumerate(toggle_rows):
-            default_enabled = False if setting_key == "enabled" else True
-            slack_settings[setting_key] = self.widgets.toggle(
-                f"settings.accounts.slack.{setting_key}",
-                Rect(toggles_x, controls_y + row_index * (SETTINGS_CONTROL_H + SETTINGS_ROW_GAP), split_w, SETTINGS_CONTROL_H),
-                toggle_label, bool(slack_settings.get(setting_key, default_enabled)),
-                tooltip=(
-                    "Synchronize Slack in the background at the configured interval after a successful connection."
-                    if setting_key == "enabled" else "Include this accessible Slack conversation type in read-only synchronization."
-                ),
-            )
-        sync_label_w = min(210, max(126, int(sync_w * 0.58)))
-        sync_value_x = sync_x + sync_label_w + 8
-        sync_value_w = min(SETTINGS_NUMERIC_INPUT_W, max(72, sync_x + sync_w - sync_value_x))
-        self.widgets.label(Rect(sync_x, controls_y, sync_label_w, SETTINGS_CONTROL_H), "Initial history days", Palette.muted2)
-        slack_settings["initial_history_days"] = self.widgets.text_input(
-            "settings.accounts.slack.initial_history_days", Rect(sync_value_x, controls_y, sync_value_w, SETTINGS_CONTROL_H),
-            str(slack_settings.get("initial_history_days", SLACK_INITIAL_HISTORY_DAYS_DEFAULT)),
-            str(SLACK_INITIAL_HISTORY_DAYS_DEFAULT), tooltip="Use 0 for full accessible history.",
-        )
-        sync_row_y = controls_y + SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
-        self.widgets.label(Rect(sync_x, sync_row_y, sync_label_w, SETTINGS_CONTROL_H), "Sync interval (min)", Palette.muted2)
-        slack_settings["sync_interval_minutes"] = self.widgets.text_input(
-            "settings.accounts.slack.sync_interval_minutes", Rect(sync_value_x, sync_row_y, sync_value_w, SETTINGS_CONTROL_H),
-            str(slack_settings.get("sync_interval_minutes", SLACK_SYNC_INTERVAL_MINUTES_DEFAULT)),
-            str(SLACK_SYNC_INTERVAL_MINUTES_DEFAULT),
-            tooltip="Minimum background synchronization interval in minutes.",
-        )
-        cy = controls_y + len(toggle_rows) * (SETTINGS_CONTROL_H + SETTINGS_ROW_GAP) + SETTINGS_BLOCK_GAP
-        setup_column, actions_column = self._draw_settings_account_action_columns(inner, cy, compact=True)
-        if self.widgets.button(
-            "settings.accounts.slack.create_app",
-            self._settings_account_action_button_rect(setup_column, 0),
-            "Create Slack app",
-            tooltip="Open Slack app management. Add the redirect URI above and the documented read-only user scopes.",
-        ):
-            try:
-                webbrowser.open(SLACK_APPS_URL)
-                self._append_vault_connector_event(SLACK_SOURCE_TYPE, "Opened Slack app management in the browser.")
-            except Exception as exc:
-                self._append_vault_connector_event(SLACK_SOURCE_TYPE, f"Error opening Slack app management: {type(exc).__name__}: {exc}")
-        scopes_text = ", ".join(SLACK_USER_SCOPES)
-        scopes_y = setup_column.y + SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
-        self.widgets.clipped_text(
-            Rect(setup_column.x, scopes_y, setup_column.w, 3 * SETTINGS_CONTROL_H + 2 * SETTINGS_ROW_GAP),
-            "Read scopes: " + scopes_text, Palette.muted2, tooltip=scopes_text,
-        )
-        slack_busy = bool(slack_status.get("operation_in_progress")) or bool(self.state.vault_connector_tasks.get(SLACK_SOURCE_TYPE))
-        slack_oauth_ready = bool(next_slack_client_id.strip() and next_slack_client_secret.strip())
-        slack_token_present = bool(slack_credentials.get("access_token"))
-        button_specs = [
-            ("connect", "Reconnect" if slack_token_present else "Connect Slack", not slack_busy and slack_oauth_ready, True, False),
-            ("test", "Test connection", not slack_busy and slack_token_present, False, False),
-            ("sync", "Sync now", not slack_busy and slack_token_present, False, False),
-            ("disconnect", "Disconnect", not slack_busy and slack_token_present, False, True),
-        ]
-        for row_index, (operation, label, enabled, primary, danger) in enumerate(button_specs):
-            if self.widgets.button(
-                f"settings.accounts.slack.{operation}",
-                self._settings_account_action_button_rect(actions_column, row_index),
-                label, enabled=enabled, primary=primary, danger=danger,
-                tooltip={
-                    "connect": "Open Slack in the browser and authorize the read-only user scopes.",
-                    "test": "Validate the saved user token without changing Slack.",
-                    "sync": "Synchronize accessible conversations now.",
-                    "disconnect": "Remove the user token while retaining synchronized Slack data.",
-                }[operation],
-            ):
-                self.state.active_widget = None
-                try:
-                    credential_store.save_slack_oauth_client(next_slack_client_id, next_slack_client_secret)
-                    self._begin_vault_connector_operation(SLACK_SOURCE_TYPE, operation)
-                except Exception as exc:
-                    self._append_vault_connector_event(SLACK_SOURCE_TYPE, f"Error: {type(exc).__name__}: {exc}")
-        cy = setup_column.y + 4 * (SETTINGS_CONTROL_H + SETTINGS_ROW_GAP) + SETTINGS_BLOCK_GAP
-        slack_source = slack_status.get("source") if isinstance(slack_status.get("source"), dict) else None
-        slack_identity = str(
-            (slack_source or {}).get("display_name")
-            or slack_credentials.get("team_name")
-            or slack_credentials.get("workspace_id")
-            or "Not connected"
-        )
-        slack_last = format_vault_local_timestamp(
-            (slack_source or {}).get("last_successful_sync_at"), self._vault_controller().query.local_timezone,
-        )
-        slack_line = f"Workspace: {slack_identity}"
-        if slack_last:
-            slack_line += f" · Last successful sync: {slack_last}"
-        self.widgets.clipped_text(Rect(inner.x, cy, inner.w, 28), slack_line, Palette.muted2, tooltip=slack_line)
-        cy += SETTINGS_CONTROL_H + SETTINGS_BLOCK_GAP
-        self.widgets.label(Rect(inner.x, cy, label_w, 24), "Events", Palette.muted2)
-        events_h = max(120, inner.y + inner.h - cy)
-        self.widgets.selectable_text_view(
-            "settings.accounts.slack.events", Rect(value_x, cy, value_w, events_h),
-            self._vault_connector_events_text(SLACK_SOURCE_TYPE, slack_status)
-            or "Slack connection and synchronization events will appear here.",
-        )
-
-
     def _draw_agents_settings_content(self, col: Rect, config: dict[str, Any]) -> None:
         agent_cfg = config.setdefault("agents", copy.deepcopy(default_config()["agents"]))
         pa_cfg = agent_cfg.setdefault(
@@ -79822,7 +77932,7 @@ class Panels:
         y = inner.y
         self.widgets.clipped_text(
             Rect(inner.x, y, inner.w, pa_intro_h),
-            "The PA reviews locally cached Gmail and Slack data plus Calendar Events and Items after the daily start time, then checks again at the configured interval when no PA Task is active. It may create or update Items and delegate concrete deliverables to General Agents. Google Drive remains ad hoc only.",
+            "The PA reviews locally cached Gmail data plus Calendar Events and Items after the daily start time, then checks again at the configured interval when no PA Task is active. It may create or update Items and delegate concrete deliverables to General Agents. Google Drive remains ad hoc only.",
             Palette.muted2,
             tooltip=f"Edit skills/{DEFAULT_PERSONAL_ASSISTANT_AGENT_SKILL_NAME}/skill.md to change PA operating guidance.",
         )
@@ -81263,51 +79373,131 @@ class Panels:
             elif row_id.startswith("task:"):
                 self._handle_dashboard_task_action(row_id.removeprefix("task:"), action_name)
 
-    def _dashboard_checklist_statistics(self) -> dict[str, Any]:
-        """Single-flight background refresh; an idle draw never parses state files."""
-        entry = getattr(self, "_checklist_statistics_entry", None)
+    def _dashboard_cost_statistics(self) -> dict[str, Any]:
+        """Single background query, including when the selected period changes."""
+        period = self.state.dashboard_cost_period
+        entry = getattr(self, "_dashboard_cost_entry", None)
         if entry is None:
-            entry = self._checklist_statistics_entry = {
-                "reader": ChecklistStatisticsCache(self.services.storage),
-                "snapshot": {"status": "loading"}, "task": None, "loaded_at": 0.0,
-            }
+            entry = self._dashboard_cost_entry = {"period": None, "task": None,
+                "snapshot": {"status": "loading"}, "loaded_at": 0.0, "task_period": None}
         task = entry["task"]
         if task is not None and task.done():
             entry["task"] = None
-            entry["loaded_at"] = time.monotonic()
             try:
-                entry["snapshot"] = task.result()
+                snapshot = {**task.result(), "status": "ready"}
             except asyncio.CancelledError:
-                pass
+                snapshot = {"status": "loading"}
             except Exception as exc:
-                entry["snapshot"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
-        if entry["task"] is None and time.monotonic() - entry["loaded_at"] >= 2.0:
+                snapshot = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            entry.update(snapshot=snapshot, period=entry["task_period"], loaded_at=time.monotonic())
+        if entry["task"] is None and (entry["period"] != period or time.monotonic() - entry["loaded_at"] >= 1.0):
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                return dict(entry["snapshot"])
-            task = loop.create_task(asyncio.to_thread(entry["reader"].read), name="velox-checklist-statistics")
-            task.add_done_callback(self._observe_background_task)
-            entry["task"] = task
+                loop = None
+            if loop is not None:
+                task = loop.create_task(asyncio.to_thread(self.services.monitor.cost_statistics,
+                    DASHBOARD_COST_PERIODS.get(period, 86400)), name="velox-dashboard-costs")
+                task.add_done_callback(self._observe_background_task)
+                entry.update(task=task, task_period=period)
+        if entry["period"] != period:
+            return {"status": "loading"}
         return dict(entry["snapshot"])
 
-    def _draw_agent_summary_cards(self, rect: Rect, stats: dict[str, Any]) -> int:
-        """Draw five app-wide logical LLM Task metric cards for Dashboard."""
+    @staticmethod
+    def _dashboard_summary_card_rects(rect: Rect, card_h: int, *, min_standard_width: int = 0) -> list[Rect]:
         gap = 12
-        card_count = 5
-        columns = 5 if rect.w >= 1450 else (3 if rect.w >= 960 else (2 if rect.w >= 620 else 1))
-        row_count = int(math.ceil(card_count / columns))
-        # Fit five statistics lines and the cost total plus five endpoint rows.
-        card_h = max(232, self.f.line_h + 64 + 5 * max(27, self.f.line_h + 3),
-                     self.f.line_h + 60 + 6 * max(23, self.f.line_h + 1))
-        card_w = max(1, (rect.w - gap * (columns - 1)) // columns)
+        groups = [(.5, 1.5, 1., 2.)] if rect.w >= max(1450, 5 * min_standard_width + 36) else ([(.5, 1.5), (1., 2.)] if rect.w >= 760 else [(1.,)] * 4)
         cards: list[Rect] = []
-        for index in range(card_count):
-            row = index // columns
-            col = index % columns
-            x = rect.x + col * (card_w + gap)
-            width = rect.x + rect.w - x if col == columns - 1 else card_w
-            cards.append(Rect(x, rect.y + row * (card_h + gap), width, card_h))
+        for row, weights in enumerate(groups):
+            usable = max(1, rect.w - gap * (len(weights) - 1))
+            used = 0
+            for index, weight in enumerate(weights):
+                right = round(usable * sum(weights[:index + 1]) / sum(weights))
+                cards.append(Rect(rect.x + used + gap * index, rect.y + row * (card_h + gap),
+                                  max(1, right - used), card_h))
+                used = right
+        return cards
+
+    def _draw_dashboard_cost_card(self, rect: Rect, costs: dict[str, Any]) -> None:
+        body = self._draw_agent_metric_card(rect, "Costs")
+        period = self.state.dashboard_cost_period
+        control_w = min(max(128, max(self.widgets._text_width(label) for label in DASHBOARD_COST_PERIODS) + 54), max(80, rect.w // 2))
+        control = Rect(rect.x + rect.w - control_w - 14, rect.y + 8, control_w, max(28, self.f.line_h + 8))
+        selected = self.widgets.dropdown("dashboard:cost-period", control, period, list(DASHBOARD_COST_PERIODS),
+            tooltip="Rolling usage window. One year is the last 365 days. Costs are in USD.")
+        if selected != period:
+            self.state.dashboard_cost_period = selected
+            self.state.scroll["dashboard:cost-bars"] = 0
+            costs = {"status": "loading"}
+            period = selected
+        line_h = max(23, self.f.line_h + 3)
+        total_y = max(body.y + 3, control.y + control.h + 6)
+        hint = token_cost_tooltip(costs)
+        if costs.get("error"):
+            hint += "\n" + str(costs["error"])
+        status = costs.get("status", "ready")
+        label = ("Loading costs..." if status == "loading" else "Costs unavailable" if status == "error"
+                 else "Total " + token_cost_label(costs) + (" !" if costs.get("error") else ""))
+        self.widgets.clipped_text(Rect(body.x, total_y, body.w, line_h), label, Palette.text, tooltip=hint)
+        chart = Rect(body.x, total_y + line_h + 8, body.w, max(1, body.y + body.h - total_y - line_h - 10))
+        ranked = costs.get("endpoints", costs.get("top_endpoints", [])) or []
+        if not ranked:
+            if status == "ready":
+                self.widgets.clipped_text(Rect(chart.x, chart.y, chart.w, line_h),
+                                          "No usage in this period", Palette.muted2)
+            return
+        row_h = max(33, line_h + 11)
+        total_h = len(ranked) * row_h
+        wid = "dashboard:cost-bars"
+        scroll = int(self.state.scroll.get(wid, 0))
+        if self.widgets._can_receive_pointer(wid) and point_in_rect(self.state.input.mouse_x, self.state.input.mouse_y, chart):
+            wheel = self.state.input.wheel_y
+            if wheel and total_h > chart.h:
+                scroll -= int(wheel * row_h * 2)
+                self.state.input.wheel_y = 0
+        scroll = self.widgets._scrollbar_input(wid, chart, scroll, total_h)
+        scroll = int(clamp(scroll, 0, max(0, total_h - chart.h)))
+        self.state.scroll[wid] = scroll
+        available_w = max(1, chart.w - (16 if total_h > chart.h else 0))
+        maximum = max(float(row.get("total_usd") or 0) for row in ranked)
+        self.r.push_clip(chart)
+        try:
+            for index, endpoint in enumerate(ranked):
+                row = Rect(chart.x, chart.y + index * row_h - scroll, available_w, row_h - 3)
+                if row.y + row.h <= chart.y or row.y >= chart.y + chart.h:
+                    continue
+                value = token_cost_label(endpoint)
+                cost_w = min(row.w // 3, max(66, self.widgets._text_width(value) + 8))
+                track = Rect(row.x, row.y, max(1, row.w - cost_w - 10), row.h)
+                self.r.draw_round_rect(track, 5, Palette.panel2)
+                amount = max(0., float(endpoint.get("total_usd") or 0))
+                bar_w = int(track.w * amount / maximum) if maximum else 0
+                if bar_w:
+                    color_key = str(endpoint.get("endpoint_type") or endpoint.get("label") or "")
+                    color = (Palette.accent, Palette.accent2)[hashlib.sha256(color_key.encode()).digest()[0] % 2]
+                    self.r.draw_round_rect(Rect(track.x, track.y, max(2, bar_w), track.h), 5, theme_alpha(color, 85))
+                    self.r.draw_round_rect(Rect(track.x, track.y + 4, 3, max(1, track.h - 8)), 1, color)
+                self.widgets.clipped_text(Rect(track.x + 10, track.y, max(1, track.w - 18), track.h),
+                    str(endpoint.get("label") or "Unknown endpoint"), Palette.text)
+                self.widgets.clipped_text(Rect(row.x + row.w - cost_w, row.y, cost_w, row.h),
+                    value, Palette.text, align="right")
+                hover = Rect(row.x, max(row.y, chart.y), row.w,
+                             max(0, min(row.y + row.h, chart.y + chart.h) - max(row.y, chart.y)))
+                self.widgets._queue_tooltip(wid + ":" + str(endpoint.get("endpoint_type") or index), hover,
+                                           endpoint_cost_bar_tooltip(endpoint, period))
+        finally:
+            self.r.pop_clip()
+        self.widgets._scrollbar_draw(wid, chart, scroll, total_h)
+
+    def _draw_agent_summary_cards(self, rect: Rect, stats: dict[str, Any]) -> int:
+        """Four cards, weighted 0.5 : 1.5 : 1 : 2 on a full-width Dashboard."""
+        gap = 12
+        card_h = max(232, self.f.line_h + 64 + 5 * max(27, self.f.line_h + 3),
+                     self.f.line_h + 61 + max(23, self.f.line_h + 3) + 5 * max(33, self.f.line_h + 14))
+        cards = self._dashboard_summary_card_rects(rect, card_h,
+            min_standard_width=2 * (max(self.widgets._text_width("TASK STATUS"), self.widgets._text_width("0 Inferencing")) + 32))
+        row_count = len({card.y for card in cards})
 
         counts = stats.get("counts") if isinstance(stats.get("counts"), dict) else {}
         terminal_tasks = int(stats.get("terminal_tasks", 0) or 0)
@@ -81344,7 +79534,7 @@ class Panels:
                     offset += line_h + line_gap
 
         def ring_layout(body: Rect) -> tuple[Rect, int, int]:
-            size = max(88, min(body.h - 8, int(body.w * 0.43)))
+            size = max(88, min(body.h - 8, int((min(cards[1].w, cards[2].w) - 28) * 0.43)))
             ring = Rect(body.x, body.y + max(0, (body.h - size) // 2), size, size)
             legend_x = ring.x + ring.w + 14
             return ring, legend_x, max(1, body.x + body.w - legend_x)
@@ -81409,53 +79599,7 @@ class Panels:
             (f"{float(percentages.get('cancelled', 0.0) or 0.0):.0f}% Cancelled ({cancelled:,})", Palette.warn, f"Cancelled: {cancelled:,}"),
         ])
 
-        cost_body = self._draw_agent_metric_card(cards[3], "Costs / 24h")
-        costs = stats.get("costs_24h") or {}
-        cost_hint = token_cost_tooltip(costs) + "\nRolling 24 hours; recorded requests survive restarts and Task deletion. Top five endpoint types by cost, not token count."
-        if costs.get("error"):
-            cost_hint += "\n" + str(costs["error"])
-        total_label = "Total " + token_cost_label(costs) + (" !" if costs.get("error") else "")
-        compact_h = max(23, self.f.line_h + 1)
-        self.widgets.clipped_text(Rect(cost_body.x, cost_body.y + 3, cost_body.w, compact_h),
-                                  total_label, Palette.text, tooltip=cost_hint)
-        ranked = costs.get("top_endpoints") or []
-        for index, endpoint in enumerate(ranked[:5]):
-            rr = Rect(cost_body.x, cost_body.y + 3 + (index + 1) * (compact_h + 3), cost_body.w, compact_h)
-            value = token_cost_label(endpoint)
-            value_w = min(rr.w // 2, max(86, self.widgets._text_width(value) + 6))
-            label = str(endpoint.get("label") or "Unknown")
-            hint = label + "\n" + token_cost_tooltip(endpoint)
-            self.widgets.clipped_text(Rect(rr.x, rr.y, max(1, rr.w - value_w - 8), rr.h),
-                                      label, Palette.muted, tooltip=hint)
-            self.widgets.clipped_text(Rect(rr.x + rr.w - value_w, rr.y, value_w, rr.h),
-                                      value, Palette.text, align="right", tooltip=hint)
-        if not ranked:
-            self.widgets.clipped_text(Rect(cost_body.x, cost_body.y + compact_h + 9, cost_body.w, compact_h),
-                                      "No usage in the last 24h", Palette.muted2, tooltip=cost_hint)
-
-        checklist_body = self._draw_agent_metric_card(cards[4], "Checklist statistics")
-        checklist_stats = stats.get("checklist_statistics") or {"status": "loading"}
-        if checklist_stats.get("status") != "ready":
-            label = "Checklist stats unavailable" if checklist_stats.get("status") == "error" else "Loading Checklists..."
-            draw_plain_lines(checklist_body, [(label, Palette.muted, str(checklist_stats.get("error") or label))])
-        else:
-            c = checklist_stats
-            def average(key: str) -> str:
-                value = c.get(key)
-                return f"{value:,.1f}" if value is not None else "\u2014"
-            scope = (f"All durable Chat/Agent Checklists, including history and prior Agent runs: {c['checklists']:,} lists, "
-                     f"{c['requirements']:,} requirements, {c['subitems']:,} sub-items. "
-                     "Each original requirement is counted once. Trivial requirements with no steps count as zero. "
-                     "These are descriptive counts, not quality targets.")
-            draw_plain_lines(checklist_body, [
-                (f"Checklists {c['checklists']:,} ({c['active']:,} active)", Palette.text,
-                 scope + f" Completed: {c['completed']:,}; cancelled: {c['cancelled']:,}."),
-                ("Avg requirements/list " + average("avg_requirements"), Palette.text, scope),
-                ("Avg sub-items/list " + average("avg_subitems"), Palette.text, scope),
-                ("Avg steps/requirement " + average("avg_subitems_per_requirement"), Palette.text, scope),
-                ("Requirements with steps " + (average("planned_percent") + "%" if c.get("planned_percent") is not None else "\u2014"),
-                 Palette.text, scope),
-            ])
+        self._draw_dashboard_cost_card(cards[3], stats.get("costs", stats.get("costs_24h", {})) or {})
         return row_count * card_h + (row_count - 1) * gap
 
     def _dashboard_task_snapshot(self, task_id: str) -> dict[str, Any]:
@@ -81998,8 +80142,8 @@ class Panels:
         ):
             self._refresh_llm_task_entries()
 
-        stats = dict(getattr(self.state, "llm_task_stats_cache", {}) or self.services.monitor.statistics())
-        stats["checklist_statistics"] = self._dashboard_checklist_statistics()
+        stats = dict(getattr(self.state, "llm_task_stats_cache", {}) or self.services.monitor.statistics(include_costs=False))
+        stats["costs"] = self._dashboard_cost_statistics()
         summary_h = self._draw_agent_summary_cards(Rect(outer.x, outer.y, outer.w, outer.h), stats)
         title_font = getattr(self.widgets, "bold_font", self.f)
         title_h = max(30, title_font.line_h + 8)
@@ -82132,12 +80276,8 @@ class VeloxApp:
             self.storage, self.vault, self.credentials,
             data_changed_callback=self._vault_data_changed,
         )
-        self.slack = SlackConnector(
-            self.storage, self.vault, self.credentials,
-            data_changed_callback=self._vault_data_changed,
-        )
         self.vault_connectors = VaultConnectorManager(
-            self.storage, self.google_drive, self.gmail, self.slack,
+            self.storage, self.google_drive, self.gmail,
             data_changed_callback=self._vault_data_changed,
         )
         self.monitor = LLMTaskMonitor(self.storage)
@@ -82180,7 +80320,6 @@ class VeloxApp:
             google_calendar=self.google_calendar,
             google_drive=self.google_drive,
             gmail=self.gmail,
-            slack=self.slack,
             vault_connectors=self.vault_connectors,
             calendar_refresh_callback=self.google_calendar.refresh,
             summaries=self.summaries,
@@ -83003,7 +81142,6 @@ class RecoveryService:
             (GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT, self.storage.paths.google_calendar_credentials_file(), credential_store.load_google_calendar),
             (GOOGLE_DRIVE_CREDENTIAL_ACCOUNT, self.storage.paths.google_drive_credentials_file(), credential_store.load_google_drive),
             (GMAIL_CREDENTIAL_ACCOUNT, self.storage.paths.gmail_credentials_file(), credential_store.load_gmail),
-            (SLACK_CREDENTIAL_ACCOUNT, self.storage.paths.slack_credentials_file(), credential_store.load_slack),
         ):
             if not path.is_file():
                 continue

@@ -190,7 +190,6 @@ def _create_fixture_symlink(link: Path, target: Path) -> None:
         raise
 
 
-
 class _TestDummyFont:
     """Deterministic font metrics for layout tests."""
 
@@ -1607,7 +1606,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('draw_text_run_font(brand_font, \"VELOX\"', nav)
         self.assertIn('draw_font = self.bold_font', self._method_source(velox.Widgets, "global_nav_button"))
         dashboard = self._method_source(velox.Panels, "draw_agents_panel")
-        self.assertIn("self.services.monitor.statistics()", dashboard)
+        self.assertIn("self.services.monitor.statistics(include_costs=False)", dashboard)
         self.assertIn("_refresh_llm_task_entries", dashboard)
         refresh = self._method_source(velox.Panels, "_refresh_llm_task_entries")
         self.assertIn("self.services.monitor.dashboard_records", refresh)
@@ -1635,11 +1634,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('rows.sort(key=self._system_task_row_sort_key)', system_tasks)
 
         summary_cards = self._method_source(velox.Panels, "_draw_agent_summary_cards")
-        for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h", "Checklist statistics"):
+        for label in ("Task status", "Token usage", "Task outcomes"):
             self.assertIn(label, summary_cards)
         self.assertIn("card_h = max(232,", summary_cards)
-        self.assertIn("Avg requirements/list", summary_cards)
-        self.assertIn("Avg sub-items/list", summary_cards)
+        self.assertNotIn("Avg requirements/list", summary_cards)
+        self.assertNotIn("Avg sub-items/list", summary_cards)
         self.assertNotIn("Active time", summary_cards)
         self.assertNotIn("Prefill time", summary_cards)
         self.assertNotIn("Generation time", summary_cards)
@@ -2439,7 +2438,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 self.assertAlmostEqual(stats["average_task_seconds"], 70.0)
 
                 panel_source = self._method_source(velox.Panels, "_draw_agent_summary_cards")
-                for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h", "Checklist statistics"):
+                for label in ("Task status", "Token usage", "Task outcomes"):
                     self.assertIn(label, panel_source)
                 self.assertIn("Chat, Agent, Image, and System Tasks", panel_source)
                 self.assertNotIn("Tool call success", panel_source)
@@ -4543,7 +4542,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("SDL_RenderGeometry", ring)
         self.assertIn("outer0", buffers)
         summary = self._method_source(velox.Panels, "_draw_agent_summary_cards")
-        for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h", "Checklist statistics"):
+        for label in ("Task status", "Token usage", "Task outcomes"):
             self.assertIn(label, summary)
         dialog = self._method_source(velox.Panels, "draw_modals")
         self.assertIn('\"Output\"', dialog)
@@ -6925,9 +6924,9 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 priority="P1",
                 linked_event_id=event["event_id"],
                 context_links=[{
-                    "type": "slack",
+                    "type": "web",
                     "label": "Comp discussion thread",
-                    "url_or_path": "https://slack.example/thread/1",
+                    "url_or_path": "https://example.com/thread/1",
                     "source_excerpt": "Please prepare the role descriptions.",
                     "external_source_id": "thread-1",
                 }],
@@ -7124,8 +7123,8 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "Sanitize optional lists",
                 context_links=[
                     None,
-                    {"type": "slack", "label": "Thread", "url_or_path": "https://slack/thread"},
-                    {"type": "slack", "label": "Duplicate", "url_or_path": "https://slack/thread"},
+                    {"type": "web", "label": "Thread", "url_or_path": "https://example.com/thread"},
+                    {"type": "web", "label": "Duplicate", "url_or_path": "https://example.com/thread"},
                     {"type": "email", "label": "Missing target"},
                 ],
                 attachments=["one.txt", "", 7, "one.txt", "two.txt"],
@@ -7382,7 +7381,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "scheduled_date": "2026-07-30",
                 "scheduled_start_time": "09:15",
                 "duration_minutes": "75",
-                "context_links_text": "slack | Source thread | https://slack.example/thread | key excerpt | thread-7",
+                "context_links_text": "web | Source thread | https://example.com/thread | key excerpt | thread-7",
                 "attachments_text": str(root / "draft.docx") + "\n" + str(root / "notes.txt"),
             })
             saved = panel._save_item_editor(modal)
@@ -7809,17 +7808,6 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         container = vault.upsert_container(source["id"], "all-mail", "mailbox", "All Mail")
         return source, container
 
-    @staticmethod
-    def _slack(vault: VaultStore) -> tuple[dict[str, Any], dict[str, Any]]:
-        source = vault.upsert_data_source(
-            "slack", "Work Slack", "T123", connection_state="connected",
-            credential_reference="credentials/slack.cred",
-        )
-        container = vault.upsert_container(
-            source["id"], "C123", "slack_public_channel", "leadership",
-            display_name="#leadership",
-        )
-        return source, container
 
     def test_upsert_identity_participants_attachments_and_source_specific_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -7933,17 +7921,9 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "internal_received_timestamp": "2026-07-31T14:00:00-04:00",
                 "body_text": "Staffing forecast attached.",
             })
-            slack, channel = self._slack(vault)
-            vault.upsert_slack_message(slack["id"], channel["id"], {
-                "conversation_id": "C123", "ts": "1785517200.000001",
-                "user_id": "U1", "author_display_name": "Ryan Torvik",
-                "text": "Puma staffing FORECAST",
-            })
             self.assertEqual(len(query.list_calendar_events_for_day(calendar_source["id"], "2026-07-31", "eric@example.com")), 1)
             self.assertEqual(len(query.list_gmail_messages(gmail["id"], None, None, "FINANCE team")), 1)
             self.assertEqual(len(query.list_gmail_messages(gmail["id"], "2026-08-01", None, "puma")), 0)
-            self.assertEqual(len(query.list_slack_channels(slack["id"], None, None, "#LEADERSHIP")), 1)
-            self.assertEqual(len(query.list_slack_messages(slack["id"], channel["id"], None, None, "ryan torvik")), 1)
             self.assertEqual(query.list_gmail_messages(gmail["id"], None, None, "leadership"), [])
             self.assertEqual(query.list_gmail_messages(gmail["id"], None, None, ""), query.list_gmail_messages(gmail["id"]))
 
@@ -7970,29 +7950,6 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual([row["external_id"] for row in query.list_gmail_messages(gmail["id"])], ["newer", "older"])
             self.assertEqual(query.get_visible_item_count(gmail["id"]), 2)
 
-            slack = vault.upsert_data_source("slack", "Slack", "T1", connection_state="connected")
-            older_channel = vault.upsert_container(slack["id"], "C1", "slack_public_channel", "alpha", display_name="#alpha")
-            newer_channel = vault.upsert_container(slack["id"], "C2", "slack_private_channel", "beta", display_name="#beta")
-            parent = vault.upsert_slack_message(slack["id"], newer_channel["id"], {
-                "conversation_id": "C2", "ts": "1785582000.000001", "text": "Parent", "user_id": "U1",
-            })
-            reply = vault.upsert_slack_message(slack["id"], newer_channel["id"], {
-                "conversation_id": "C2", "ts": "1785582060.000001",
-                "thread_ts": "1785582000.000001", "text": "Reply", "user_id": "U2",
-            })
-            vault.upsert_slack_message(slack["id"], older_channel["id"], {
-                "conversation_id": "C1", "ts": "1785578400.000001", "text": "Older", "user_id": "U3",
-            })
-            channels = query.list_slack_channels(slack["id"])
-            self.assertEqual([row["external_id"] for row in channels], ["C2", "C1"])
-            self.assertEqual(channels[0]["matching_message_count"], 2)
-            self.assertEqual(query.get_visible_item_count(slack["id"]), 2)
-            self.assertEqual(query.get_visible_item_count(slack["id"], container_id=newer_channel["id"]), 2)
-            messages = query.list_slack_messages(slack["id"], newer_channel["id"])
-            self.assertEqual([row["id"] for row in messages], [parent["id"], reply["id"]])
-            self.assertEqual([row["indentation_depth"] for row in messages], [0, 1])
-            self.assertEqual(messages[1]["parent_item_id"], parent["id"])
-            self.assertFalse(messages[1]["parent_outside_range"])
 
     def test_tombstones_require_completed_reconciliation_and_failed_sync_keeps_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -8082,57 +8039,25 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(message["attachments"]), 1)
             self.assertEqual(message["attachments"][0]["size_bytes"], 0)
 
-            slack, channel = self._slack(vault)
-            slack_message = vault.upsert_slack_message(slack["id"], channel["id"], {
-                "conversation_id": "C123",
-                "ts": "1785582000.000001",
-                "text": "Optional values should not poison the record.",
-                "reply_count": "bad",
-                "files": [{"id": "F1", "name": "bad.bin", "size": "bad"}],
-                "last_seen_sync_generation": "bad",
-            })
-            self.assertEqual(slack_message["metadata"]["reply_count"], 0)
-            self.assertEqual(slack_message["attachments"][0]["size_bytes"], 0)
-            self.assertEqual(slack_message["last_seen_sync_generation"], 0)
             with self.assertRaises(ValueError):
                 vault.upsert_gmail_message(gmail["id"], mailbox["id"], {"x_gm_msgid": "missing-time"})
 
-    def test_unique_source_container_identity_and_reply_parent_outside_range(self) -> None:
+    def test_unique_source_container_identity(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, _storage, _calendar, vault, query = self._stack(Path(td), "UTC")
-            first_source = vault.upsert_data_source("slack", "Work Slack", "T-unique")
-            second_source = vault.upsert_data_source("slack", "Renamed Slack", "T-unique")
+            first_source = vault.upsert_data_source("gmail", "Work Mail", "mike@example.com")
+            second_source = vault.upsert_data_source("gmail", "Renamed Mail", "mike@example.com")
             self.assertEqual(first_source["id"], second_source["id"] )
-            self.assertEqual(second_source["display_name"], "Renamed Slack")
+            self.assertEqual(second_source["display_name"], "Renamed Mail")
             first_container = vault.upsert_container(
-                second_source["id"], "C-unique", "slack_public_channel", "general",
+                second_source["id"], "C-unique", "mailbox", "general",
             )
             second_container = vault.upsert_container(
-                second_source["id"], "C-unique", "slack_public_channel", "general-renamed",
+                second_source["id"], "C-unique", "mailbox", "general-renamed",
             )
             self.assertEqual(first_container["id"], second_container["id"] )
             self.assertEqual(len(vault.list_containers(second_source["id"])), 1)
 
-            parent_ts = f"{datetime(2026, 7, 31, 23, 59, tzinfo=timezone.utc).timestamp():.6f}"
-            reply_ts = f"{datetime(2026, 8, 1, 0, 1, tzinfo=timezone.utc).timestamp():.6f}"
-            reply = vault.upsert_slack_message(second_source["id"], second_container["id"], {
-                "conversation_id": "C-unique", "ts": reply_ts, "thread_ts": parent_ts,
-                "text": "Reply after midnight", "user_id": "U2",
-            })
-            self.assertIsNone(reply["parent_item_id"])
-            parent = vault.upsert_slack_message(second_source["id"], second_container["id"], {
-                "conversation_id": "C-unique", "ts": parent_ts,
-                "text": "Parent before midnight", "user_id": "U1",
-            })
-            resolved_reply = vault.get_item(reply["id"] )
-            self.assertEqual(resolved_reply["parent_item_id"], parent["id"] )
-            visible = query.list_slack_messages(
-                second_source["id"], second_container["id"], "2026-08-01", "2026-08-01",
-            )
-            self.assertEqual([row["id"] for row in visible], [reply["id"]])
-            self.assertEqual(visible[0]["indentation_depth"], 1)
-            self.assertTrue(visible[0]["parent_outside_range"])
-            self.assertEqual(len(vault.list_items(source_id=second_source["id"])), 2)
 
     def test_query_api_surface_and_connector_contract_are_source_independent(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -8141,7 +8066,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             for name in (
                 "list_data_sources", "get_data_source", "list_calendar_days",
                 "list_calendar_events_for_day", "list_gmail_messages", "get_gmail_message",
-                "list_slack_channels", "list_slack_messages", "get_visible_item_count",
+                "get_visible_item_count",
             ):
                 self.assertTrue(callable(getattr(query, name)))
             for name in (
@@ -8182,12 +8107,6 @@ class _FakeVaultUIQuery:
                 "enabled": True, "connection_state": "connected", "last_successful_sync_at": "",
                 "last_sync_error": "",
             },
-            {
-                "id": "slack-source", "source_type": "slack",
-                "display_name": "Work Slack", "account_identifier": "T123",
-                "enabled": True, "connection_state": "connected", "last_successful_sync_at": "",
-                "last_sync_error": "",
-            },
         ]
         self.calendar_days: list[str] = ["2026-07-31", "2026-08-01"]
         self.calendar_events: dict[str, list[dict[str, Any]]] = {
@@ -8198,17 +8117,7 @@ class _FakeVaultUIQuery:
             {"id": "mail-new", "title": "Only current result", "primary_timestamp": "2026-08-01T12:00:00Z"},
             {"id": "mail-old", "title": "Earlier note", "primary_timestamp": "2026-08-01T10:00:00Z"},
         ]
-        self.slack_channels: list[dict[str, Any]] = [
-            {"id": "channel-1", "display_name": "#leadership", "matching_message_count": 2,
-             "latest_matching_message_timestamp": "2026-08-01T12:00:00Z"},
-        ]
-        self.slack_messages: dict[str, list[dict[str, Any]]] = {
-            "channel-1": [
-                {"id": "slack-1", "body_text": "One", "primary_timestamp": "2026-08-01T10:00:00Z"},
-                {"id": "slack-2", "body_text": "Two", "primary_timestamp": "2026-08-01T11:00:00Z"},
-            ],
-        }
-        self.store.sources_with_items.update({"calendar-source", "gmail-source", "slack-source"})
+        self.store.sources_with_items.update({"calendar-source", "gmail-source"})
 
     def list_data_sources(self) -> list[dict[str, Any]]:
         return self.sources
@@ -8241,19 +8150,6 @@ class _FakeVaultUIQuery:
             if str(row.get("id")) == item_id:
                 return row
         raise FileNotFoundError(item_id)
-
-    def list_slack_channels(self, source_id: str, start_date: str | None, end_date: str | None, search_text: str) -> list[dict[str, Any]]:
-        self.calls.append(("slack_channels", source_id, start_date, end_date, search_text))
-        needle = str(search_text or "").casefold()
-        return self.slack_channels if not needle else [
-            row for row in self.slack_channels if needle in str(row.get("display_name") or "").casefold()
-        ]
-
-    def list_slack_messages(self, source_id: str, channel_id: str, start_date: str | None, end_date: str | None, search_text: str) -> list[dict[str, Any]]:
-        self.calls.append(("slack_messages", source_id, channel_id, start_date, end_date, search_text))
-        needle = str(search_text or "").casefold()
-        rows = self.slack_messages.get(channel_id, [])
-        return rows if not needle else [row for row in rows if needle in str(row.get("body_text") or "").casefold()]
 
 
 class _VaultDividerStorageStub:
@@ -8321,7 +8217,7 @@ class VaultUITests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(len(refreshed["left_rows"]), 3)
         self.assertGreater(controller.query_count, 6)
 
-    def test_vault_calendar_gmail_and_slack_detail_views_are_read_only(self) -> None:
+    def test_vault_calendar_and_gmail_detail_views_are_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, calendar_store, vault, query = self._real_stack(Path(td), "UTC")
             event_payload = VaultTests._calendar_payload(
@@ -8375,39 +8271,6 @@ class VaultUITests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(message["is_unread"], unread_before)
             self.assertTrue(vault.get_item(message["id"])["is_unread"])
 
-            slack, channel = VaultTests._slack(vault)
-            parent = vault.upsert_slack_message(slack["id"], channel["id"], {
-                "conversation_id": "C123", "ts": "1785488400.000001",
-                "text": "Parent <https://example.com/docs|project docs>",
-                "user_id": "U1", "author_display_name": "Eric",
-                "permalink": "https://slack.example/archives/C123/p1785488400000001",
-                "links": [{"url": "https://example.com/roadmap", "label": "Roadmap"}],
-                "reactions": [{"name": "thumbsup", "count": 3}],
-                "files": [{
-                    "id": "F1", "name": "budget.xlsx", "mimetype": "application/vnd.ms-excel",
-                    "size": 4096, "permalink": "https://slack.example/files/F1",
-                }],
-            })
-            other = vault.upsert_slack_message(slack["id"], channel["id"], {
-                "conversation_id": "C123", "ts": "1785488460.000001",
-                "text": "Other parent", "user_id": "U3", "author_display_name": "Ryan",
-            })
-            reply = vault.upsert_slack_message(slack["id"], channel["id"], {
-                "conversation_id": "C123", "ts": "1785488520.000001",
-                "thread_ts": "1785488400.000001", "text": "Reply", "user_id": "U2",
-                "author_display_name": "Mike",
-            })
-            slack_rows = query.list_slack_messages(slack["id"], channel["id"])
-            self.assertEqual([row["id"] for row in slack_rows], [parent["id"], reply["id"], other["id"]])
-            self.assertEqual([row["indentation_depth"] for row in slack_rows], [0, 1, 0])
-            slack_markdown = panel._vault_slack_message_markdown(slack_rows[0])
-            self.assertIn("[project docs](https://example.com/docs)", slack_markdown)
-            self.assertIn("budget.xlsx", slack_markdown)
-            self.assertIn("4.0 KiB", slack_markdown)
-            self.assertIn("[Roadmap](https://example.com/roadmap)", slack_markdown)
-            self.assertIn(":thumbsup: 3", slack_markdown)
-            self.assertIn("[Open in Slack]", slack_markdown)
-
 
     def test_vault_divider_drag_persists_and_respects_minimum_widths(self) -> None:
         query = _FakeVaultUIQuery()
@@ -8443,19 +8306,6 @@ class VaultUITests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             {"id": f"mail-{index}", "title": f"Message {index}", "primary_timestamp": "2026-08-01T12:00:00Z"}
             for index in range(10_000)
         ]
-        query.slack_channels = [
-            {"id": f"channel-{index}", "display_name": f"#channel-{index}",
-             "matching_message_count": 200, "latest_matching_message_timestamp": "2026-08-01T12:00:00Z"}
-            for index in range(250)
-        ]
-        query.slack_messages = {
-            "channel-0": [
-                {"id": f"slack-{index}", "body_text": f"Message {index}",
-                 "primary_timestamp": "2026-08-01T12:00:00Z", "indentation_depth": index % 2,
-                 "metadata": {}, "attachments": []}
-                for index in range(50_000)
-            ],
-        }
         controller = velox.VaultUIController(query)
         gmail = controller.load("gmail", "gmail-source", None, None, "", "mail-0")
         count_after_first = controller.query_count
@@ -8465,16 +8315,6 @@ class VaultUITests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(len(gmail["left_rows"]), 10_000)
         start, end = velox.vault_visible_row_range(250_000, velox.VAULT_GMAIL_ROW_H, 10_000, 720)
         self.assertLess(end - start, 20)
-
-        slack = controller.load("slack", "slack-source", None, None, "", "channel-0")
-        self.assertEqual(len(slack["left_rows"]), 250)
-        self.assertEqual(len(slack["right_rows"]), 50_000)
-        slack_again = controller.load("slack", "slack-source", None, None, "", "channel-0")
-        self.assertIs(slack["right_rows"], slack_again["right_rows"])
-        draw_source = inspect.getsource(velox.Panels._vault_draw_slack_messages)
-        self.assertIn("VAULT_SLACK_DYNAMIC_LAYOUT_MAX_ROWS", draw_source)
-        self.assertIn("vault_visible_row_range", draw_source)
-        self.assertNotIn("copy.deepcopy", inspect.getsource(velox.VaultUIController.load))
 
 
 class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -9294,7 +9134,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
 class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
-    """Read-only Drive, Gmail and Slack synchronization."""
+    """Read-only Drive and Gmail synchronization."""
 
 
     @staticmethod
@@ -9439,85 +9279,18 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         def __exit__(self, *_args: Any) -> None:
             return None
 
-    class _FakeSlackClient:
-        def __init__(self):
-            now = time.time()
-            self.parent_ts = f"{now - 120:.6f}"
-            self.reply_ts = f"{now - 60:.6f}"
-            self.parent_text = "Hello <@U2>; read <https://example.com/report|the report>"
-            self.include_reply = True
-            self.fail_channels: set[str] = set()
-            self.calls: list[tuple[str, dict[str, Any]]] = []
-
-        def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-            params = dict(params or {})
-            self.calls.append((method, params))
-            if method == "auth.test":
-                return {"ok": True, "team_id": "T1", "team": "Example Workspace", "user_id": "U1"}
-            if method == "users.list":
-                if not params.get("cursor"):
-                    return {
-                        "ok": True,
-                        "members": [{"id": "U1", "real_name": "Mike", "profile": {"display_name": "Mike"}}],
-                        "response_metadata": {"next_cursor": "users-2"},
-                    }
-                return {
-                    "ok": True,
-                    "members": [{"id": "U2", "real_name": "Riley", "profile": {"display_name": "Riley"}}],
-                    "response_metadata": {"next_cursor": ""},
-                }
-            if method == "conversations.list":
-                return {
-                    "ok": True,
-                    "channels": [
-                        {"id": "C1", "name": "leadership", "name_normalized": "leadership", "is_private": False, "is_archived": False},
-                        {"id": "G1", "name": "private", "is_private": True, "is_archived": False},
-                        {"id": "D1", "is_im": True, "user": "U2", "is_archived": False},
-                        {"id": "M1", "is_mpim": True, "members": ["U1", "U2"], "is_archived": False},
-                    ],
-                    "response_metadata": {"next_cursor": ""},
-                }
-            if method == "conversations.history":
-                channel = str(params.get("channel") or "")
-                if channel in self.fail_channels:
-                    raise velox.SlackAPIError("not_in_channel")
-                if channel != "C1":
-                    return {"ok": True, "messages": [], "response_metadata": {"next_cursor": ""}}
-                parent = {
-                    "type": "message", "ts": self.parent_ts, "user": "U2", "text": self.parent_text,
-                    "reply_count": 1 if self.include_reply else 0,
-                    "edited": {"ts": f"{float(self.parent_ts) + 1:.6f}"},
-                    "reactions": [{"name": "thumbsup", "count": 2, "users": ["U1", "U2"]}],
-                    "files": [{"id": "F1", "name": "numbers.csv", "title": "Numbers", "mimetype": "text/csv", "size": 42, "permalink": "https://slack.example/files/F1"}],
-                }
-                return {"ok": True, "messages": [parent], "response_metadata": {"next_cursor": ""}}
-            if method == "conversations.replies":
-                messages = [{"type": "message", "ts": self.parent_ts, "user": "U2", "text": self.parent_text}]
-                if self.include_reply:
-                    messages.append({"type": "message", "ts": self.reply_ts, "thread_ts": self.parent_ts, "user": "U1", "text": "Agreed"})
-                return {"ok": True, "messages": messages, "response_metadata": {"next_cursor": ""}}
-            raise AssertionError(f"unexpected Slack method: {method}")
 
     def test_connector_credentials_are_revision_independent_xor_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             paths, storage, _vault, credentials, _query = _make_test_connector_stack(Path(td))
             credentials.save_gmail("mike@example.com", "abcd efgh ijkl mnop")
-            credentials.save_slack_oauth_client("slack-client", "slack-secret")
-            credentials.save_slack_token(
-                "xoxp-token", workspace_id="T1", authenticated_user_id="U1",
-                team_name="Example", scopes=velox.SLACK_USER_SCOPES,
-            )
             gmail_raw = velox.file_read_bytes(paths.gmail_credentials_file())
-            slack_raw = velox.file_read_bytes(paths.slack_credentials_file())
             self.assertNotIn(b"mike@example.com", gmail_raw)
-            self.assertNotIn(b"xoxp-token", slack_raw)
             fresh = velox.CredentialStore(paths)
             self.assertEqual(fresh.load_gmail()["app_password"], "abcdefghijklmnop")
-            self.assertEqual(fresh.load_slack()["workspace_id"], "T1")
             app_payload = velox.read_json(paths.app_json_path)
             serialized = json.dumps(app_payload)
             self.assertNotIn("xoxp-token", serialized)
-            self.assertNotIn("abcdefghijklmnop", serialized)
             self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, velox.data_schema('velox_account_credentials'))
 
     def test_gmail_mime_parsing_plain_html_encoded_headers_and_attachments(self) -> None:
@@ -9611,109 +9384,13 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(vault.list_items(source_id=source["id"])), 1)
             self.assertEqual(credentials.load_gmail()["app_password"], "")
 
-    def test_slack_http_client_rate_limit_json_and_permission_errors(self) -> None:
-        responses = [
-            self._HTTPResponse({"ok": False, "error": "ratelimited"}, status=429, headers={"Retry-After": "0"}),
-            self._HTTPResponse({"ok": True, "team_id": "T1"}),
-        ]
-        waits: list[float] = []
-        client = velox.SlackWebAPIClient("xoxp-token", opener=lambda *_a, **_k: responses.pop(0), sleep=waits.append)
-        self.assertEqual(client.call("auth.test")["team_id"], "T1")
-        self.assertTrue(waits)
-        denied = velox.SlackWebAPIClient(
-            "xoxp-token",
-            opener=lambda *_a, **_k: self._HTTPResponse({"ok": False, "error": "missing_scope", "needed": "groups:history"}),
-        )
-        with self.assertRaises(velox.SlackAPIError) as caught:
-            denied.call("conversations.history", {"channel": "G1"})
-        self.assertEqual(caught.exception.missing_scope, "groups:history")
 
-    def test_slack_oauth_initial_incremental_threads_and_duplicate_prevention(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            _paths, storage, vault, credentials, query = _make_test_connector_stack(Path(td))
-            credentials.save_slack_oauth_client("client-id", "client-secret")
-            fake_client = self._FakeSlackClient()
-            oauth_payload = {
-                "ok": True,
-                "authed_user": {"id": "U1", "access_token": "xoxp-token", "scope": ",".join(velox.SLACK_USER_SCOPES)},
-                "team": {"id": "T1", "name": "Example Workspace"},
-            }
-            connector = velox.SlackConnector(
-                storage, vault, credentials,
-                api_client_factory=lambda *_args, **_kwargs: fake_client,
-                oauth_code_provider=lambda *_args: "authorization-code",
-                oauth_opener=lambda *_args, **_kwargs: self._HTTPResponse(oauth_payload),
-                browser_open=lambda _url: True,
-            )
-            connected = asyncio.run(connector.connect_or_authorize())
-            self.assertTrue(connected["ok"])
-            self.assertTrue(credentials.load_slack()["access_token"].startswith("xoxp-"))
-            first = asyncio.run(connector.sync())
-            self.assertEqual(first["failures"], [])
-            source = next(row for row in vault.list_data_sources() if row["source_type"] == "slack")
-            containers = vault.list_containers(source["id"])
-            self.assertEqual({row["container_type"] for row in containers}, {
-                "slack_public_channel", "slack_private_channel", "slack_direct_message", "slack_group_message",
-            })
-            channel = next(row for row in containers if row["external_id"] == "C1")
-            rows = query.list_slack_messages(source["id"], channel["id"])
-            self.assertEqual(len(rows), 2)
-            parent, reply = rows
-            self.assertIn("@Riley", parent["body_text"])
-            self.assertIn("the report (https://example.com/report)", parent["body_text"])
-            self.assertEqual(reply["parent_item_id"], parent["id"])
-            self.assertEqual(reply["indentation_depth"], 1)
-            self.assertEqual(parent["attachments"][0]["filename"], "numbers.csv")
-            self.assertEqual(parent["metadata"]["reactions"][0]["count"], 2)
-            parent_id = parent["id"]
-            fake_client.parent_text = "Edited text"
-            fake_client.include_reply = False
-            second = asyncio.run(connector.sync())
-            self.assertGreaterEqual(second["processed"], 1)
-            rows_all = vault.list_items(source_id=source["id"], container_id=channel["id"], include_deleted=True)
-            current_parent = next(row for row in rows_all if row["external_id"] == f"C1:{fake_client.parent_ts}")
-            current_reply = next(row for row in rows_all if row["external_id"] == f"C1:{fake_client.reply_ts}")
-            self.assertEqual(current_parent["id"], parent_id)
-            self.assertEqual(current_parent["body_text"], "Edited text")
-            self.assertTrue(current_reply["is_deleted"])
-            cursor = vault.find_sync_state(source["id"], channel["id"], "slack_latest_timestamp")
-            self.assertIsNotNone(cursor)
-
-    def test_slack_missing_scopes_channel_failure_and_failed_page_keep_cursor(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            _paths, storage, vault, credentials, _query = _make_test_connector_stack(Path(td))
-            credentials.save_slack_oauth_client("client-id", "client-secret")
-            credentials.save_slack_token("xoxp-token", workspace_id="T1", authenticated_user_id="U1", scopes=["channels:read"])
-            connector = velox.SlackConnector(storage, vault, credentials, api_client_factory=lambda *_a, **_k: self._FakeSlackClient())
-            with self.assertRaises(velox.SlackAPIError) as caught:
-                asyncio.run(connector.test_connection())
-            self.assertEqual(caught.exception.error, "missing_scope")
-
-            credentials.save_slack_token("xoxp-token", workspace_id="T1", authenticated_user_id="U1", scopes=velox.SLACK_USER_SCOPES)
-            fake = self._FakeSlackClient()
-            connector = velox.SlackConnector(storage, vault, credentials, api_client_factory=lambda *_a, **_k: fake)
-            asyncio.run(connector.sync())
-            source = next(row for row in vault.list_data_sources() if row["source_type"] == "slack")
-            private = next(row for row in vault.list_containers(source["id"]) if row["external_id"] == "G1")
-            prior = vault.find_sync_state(source["id"], private["id"], "slack_latest_timestamp")
-            fake.fail_channels.add("G1")
-            result = asyncio.run(connector.sync())
-            self.assertTrue(any("not_in_channel" in row for row in result["failures"]))
-            after = vault.find_sync_state(source["id"], private["id"], "slack_latest_timestamp")
-            self.assertIsNotNone(after)
-            self.assertEqual(prior["cursor_value"], after["cursor_value"])
-            self.assertEqual(prior["sync_generation"], after["sync_generation"])
-            self.assertGreaterEqual(after["consecutive_failures"], prior["consecutive_failures"] + 1)
-            public = next(row for row in vault.list_containers(source["id"]) if row["external_id"] == "C1")
-            self.assertIsNotNone(vault.find_sync_state(source["id"], public["id"], "slack_latest_timestamp"))
-
-    def test_calendar_gmail_slack_vault_refresh_and_selection(self) -> None:
-        """Exercise all three normalized sources through sync, query, and UI-controller refresh."""
+    def test_calendar_gmail_vault_refresh_and_selection(self) -> None:
+        """Exercise both normalized sources through sync, query, and UI-controller refresh."""
         with tempfile.TemporaryDirectory() as td:
             _paths, storage, vault, credentials, query = _make_test_connector_stack(Path(td))
             config = storage.load_config()
             config["vault"]["gmail"]["enabled"] = True
-            config["vault"]["slack"]["enabled"] = True
             storage.write_config(config)
 
             calendar_day = "2026-07-31"
@@ -9751,20 +9428,9 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             )
             self.assertEqual(asyncio.run(gmail_connector.sync())["processed"], 1)
 
-            credentials.save_slack_oauth_client("client-id", "client-secret")
-            credentials.save_slack_token(
-                "xoxp-token", workspace_id="T1", authenticated_user_id="U1",
-                team_name="Example Workspace", scopes=velox.SLACK_USER_SCOPES,
-            )
-            slack_fake = self._FakeSlackClient()
-            slack_connector = velox.SlackConnector(
-                storage, vault, credentials,
-                api_client_factory=lambda *_args, **_kwargs: slack_fake,
-            )
-            self.assertEqual(asyncio.run(slack_connector.sync())["failures"], [])
 
             sources = {row["source_type"]: row for row in query.list_data_sources()}
-            self.assertEqual(set(sources), {"google_calendar", "gmail", "slack"})
+            self.assertEqual(set(sources), {"google_calendar", "gmail"})
             controller = velox.VaultUIController(query)
 
             calendar_view = controller.load(
@@ -9784,25 +9450,6 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             gmail_selected = gmail_view["selected_id"]
             self.assertEqual(gmail_view["right_rows"][0]["title"], "Staffing plan")
 
-            slack_day = velox._parse_iso_datetime(
-                velox.normalize_vault_timestamp(slack_fake.parent_ts, field_name="Slack end-to-end timestamp"),
-                field_name="Slack end-to-end timestamp",
-            ).astimezone(query.local_timezone).date().isoformat()
-            slack_view = controller.load(
-                "slack", sources["slack"]["id"],
-                slack_day, slack_day, "report", "",
-            )
-            self.assertEqual(slack_view["visible_count"], 1)
-            slack_selected = slack_view["selected_id"]
-            self.assertEqual(len(slack_view["right_rows"]), 1)
-            self.assertEqual(slack_view["right_rows"][0]["indentation_depth"], 0)
-
-            # Removing the search exposes the reply immediately below its parent.
-            slack_thread_view = controller.load(
-                "slack", sources["slack"]["id"],
-                slack_day, slack_day, "", slack_selected,
-            )
-            self.assertEqual([row["indentation_depth"] for row in slack_thread_view["right_rows"]], [0, 1])
 
             gmail_fake.messages[2] = {
                 "msgid": "gmail-e2e-2",
@@ -9811,8 +9458,6 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "labels": ["\\Inbox"],
             }
             asyncio.run(gmail_connector.sync())
-            slack_fake.parent_text = "Edited report summary"
-            asyncio.run(slack_connector.sync())
 
             refreshed_gmail = controller.load(
                 "gmail", sources["gmail"]["id"],
@@ -9822,16 +9467,6 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(refreshed_gmail["visible_count"], 2)
             self.assertEqual(len(query.list_gmail_messages(sources["gmail"]["id"])), 2)
 
-            refreshed_slack = controller.load(
-                "slack", sources["slack"]["id"],
-                slack_day, slack_day, "", slack_selected,
-            )
-            self.assertEqual(refreshed_slack["selected_id"], slack_selected)
-            self.assertEqual(len(refreshed_slack["right_rows"]), 2)
-            self.assertEqual(refreshed_slack["right_rows"][0]["body_text"], "Edited report summary")
-            self.assertEqual(
-                len(vault.list_items(source_id=sources["slack"]["id"], include_deleted=False)), 2,
-            )
 
     def test_connector_manager_manual_periodic_independence_and_no_overlap(self) -> None:
         class FakeConnector(velox.VaultConnectorContract):
@@ -9856,24 +9491,21 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             _paths, storage, _vault, _credentials, _query = _make_test_connector_stack(root)
             config = storage.load_config()
             config["vault"]["gmail"]["enabled"] = True
-            config["vault"]["slack"]["enabled"] = True
             storage.write_config(config)
             drive = FakeConnector("google_drive")
             gmail = FakeConnector("gmail")
-            slack = FakeConnector("slack")
             clock = [0.0]
             changes: list[str] = []
-            manager = velox.VaultConnectorManager(storage, drive, gmail, slack, data_changed_callback=changes.append, clock=lambda: clock[0])
-            manager.next_due = {"google_drive": 9999.0, "gmail": 0.0, "slack": 0.0}
+            manager = velox.VaultConnectorManager(storage, drive, gmail, data_changed_callback=changes.append, clock=lambda: clock[0])
+            manager.next_due = {"google_drive": 9999.0, "gmail": 0.0}
             await manager.tick()
-            self.assertEqual(set(manager.tasks), {"gmail", "slack"})
+            self.assertEqual(set(manager.tasks), {"gmail"})
             with self.assertRaises(RuntimeError):
                 manager.start("gmail", "sync")
             gmail.gate.set()
-            slack.gate.set()
             await asyncio.gather(*list(manager.tasks.values()))
             await manager.tick()
-            self.assertEqual(sorted(changes), ["gmail", "slack"])
+            self.assertEqual(sorted(changes), ["gmail"])
             await manager.shutdown()
 
         with tempfile.TemporaryDirectory() as td:
@@ -9885,25 +9517,15 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             '"Google Drive"', "settings.accounts.google_drive.client_id", "settings.accounts.google_drive.client_secret",
             'f"settings.accounts.google_drive.{operation}"', '"Gmail"', "settings.accounts.gmail.email_address", "settings.accounts.gmail.app_password",
             'f"settings.accounts.gmail.{operation}"', '"test"', '"connect"', '"sync"',
-            '"Slack"', "settings.accounts.slack.client_id", "settings.accounts.slack.client_secret",
-            "settings.accounts.slack.redirect_uri", "settings.accounts.slack.create_app",
-            'f"settings.accounts.slack.{operation}"', '"connect"', '"test"', '"sync"',
         ):
             self.assertIn(token, accounts)
         gmail_source = inspect.getsource(velox.GmailConnector)
         self.assertIn("readonly=True", gmail_source)
         self.assertIn("BODY.PEEK[]", gmail_source)
         self.assertNotIn("client.store(", gmail_source)
-        slack_source = inspect.getsource(velox.SlackConnector)
-        for method in ("conversations.list", "conversations.history", "conversations.replies", "users.list", "auth.test"):
-            self.assertIn(method, slack_source)
-        for forbidden in ("chat.postMessage", "reactions.add", "conversations.join", "chat.update", "files.upload"):
-            self.assertNotIn(forbidden, slack_source)
         paths_source = inspect.getsource(velox.AppPaths)
         self.assertIn("gmail.cred", paths_source)
-        self.assertIn("slack.cred", paths_source)
         self.assertIn("Gmail", _project_documentation("README.md"))
-        self.assertIn("Slack", _project_documentation("README.md"))
 
 
 class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -10166,8 +9788,7 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
             paths, storage, _vault, _credentials, _query = _make_test_connector_stack(root)
             drive = ImmediateConnector(velox.GOOGLE_DRIVE_SOURCE_TYPE)
             gmail = ImmediateConnector(velox.GMAIL_SOURCE_TYPE, fail_first=True)
-            slack = ImmediateConnector(velox.SLACK_SOURCE_TYPE, fail_first=True)
-            manager = velox.VaultConnectorManager(storage, drive, gmail, slack)
+            manager = velox.VaultConnectorManager(storage, drive, gmail)
 
             first = manager.start(velox.GMAIL_SOURCE_TYPE, "sync")
             while not first.done():
@@ -10183,7 +9804,7 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
 
             # A task that finishes immediately before shutdown is gathered even
             # when the periodic scheduler has not consumed it yet.
-            shutdown_task = manager.start(velox.SLACK_SOURCE_TYPE, "sync")
+            shutdown_task = manager.start(velox.GMAIL_SOURCE_TYPE, "sync")
             while not shutdown_task.done():
                 await asyncio.sleep(0)
             await manager.shutdown()
@@ -10700,7 +10321,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
                 def cancel_sync(self): return None
                 def get_status(self): return {}
                 def validate_configuration(self): return {"configured": False}
-            manager = velox.VaultConnectorManager(storage, connector, NoopConnector(), NoopConnector())  # type: ignore[arg-type]
+            manager = velox.VaultConnectorManager(storage, connector, NoopConnector())  # type: ignore[arg-type]
             self.assertNotIn(velox.GOOGLE_DRIVE_SOURCE_TYPE, manager.next_due)
             with self.assertRaisesRegex(RuntimeError, "ad-hoc only"):
                 manager.start(velox.GOOGLE_DRIVE_SOURCE_TYPE, "sync")
@@ -10767,7 +10388,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
         with tempfile.TemporaryDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
-    def test_vault_tools_search_cached_gmail_and_slack_but_not_drive(self) -> None:
+    def test_vault_tools_search_cached_gmail_but_not_drive(self) -> None:
         async def scenario(root: Path) -> None:
             _paths, storage, _chats = _make_test_chat_stack(root)
             vault = velox.VaultStore(storage)
@@ -10779,19 +10400,11 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
                 "to": [{"display_name": "Mike", "email": "mike@example.com"}],
                 "internal_received_timestamp": "2026-08-02T10:00:00+00:00", "body_text": "Review the FY27 assumptions.",
             })
-            slack_source = vault.upsert_data_source("slack", "Studio Slack", "T1", connection_state="connected")
-            slack_channel = vault.upsert_container(slack_source["id"], "C1", "slack_public_channel", "leadership", display_name="#leadership")
-            vault.upsert_slack_message(slack_source["id"], slack_channel["id"], {
-                "conversation_id": "C1", "ts": "1785668400.000001", "text": "Staffing plan update",
-                "author_display_name": "Rory", "user": "U1",
-            })
             tools = velox.ToolRegistry(storage)
             gmail = await tools.tool_vault_search(velox.ToolContext(velox.APP_SCOPE_ID), {"source": "gmail", "query": "budget"})
             self.assertEqual(gmail["items"][0]["item_id"], gmail_item["id"])
             self.assertEqual((await tools.tool_vault_get(velox.ToolContext(velox.APP_SCOPE_ID), {"item_id": gmail_item["id"]}))["item"]["title"], "Budget review")
-            slack = await tools.tool_vault_search(velox.ToolContext(velox.APP_SCOPE_ID), {"source": "slack", "query": "staffing"})
-            self.assertEqual(slack["count"], 1)
-            with self.assertRaisesRegex(ValueError, "google_calendar, gmail, or slack"):
+            with self.assertRaisesRegex(ValueError, "google_calendar or gmail"):
                 await tools.tool_vault_search(velox.ToolContext(velox.APP_SCOPE_ID), {"source": "google_drive", "query": "roadmap"})
 
         with tempfile.TemporaryDirectory() as td:
@@ -10810,9 +10423,9 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
         self.assertNotIn("vault_date_picker_target", source)
         rows = velox.vault_source_option_rows([])
         self.assertEqual([row["source_type"] for row in rows], list(velox.VAULT_SOURCE_ORDER))
-        self.assertEqual([row["label"].split(" [", 1)[0] for row in rows], ["GCalendar", "GDrive", "GMail", "Slack"])
+        self.assertEqual([row["label"].split(" [", 1)[0] for row in rows], ["GCalendar", "GDrive", "GMail"])
         self.assertTrue(next(row for row in rows if row["source_type"] == velox.GOOGLE_DRIVE_SOURCE_TYPE)["synthetic"])
-        self.assertEqual(velox.VAULT_LEFT_HEADERS, {"google_calendar": "DAYS", "google_drive": "FILES", "gmail": "MESSAGES", "slack": "CHANNELS"})
+        self.assertEqual(velox.VAULT_LEFT_HEADERS, {"google_calendar": "DAYS", "google_drive": "FILES", "gmail": "MESSAGES"})
 
     def test_architecture_and_source_have_no_migration_and_document_current_operating_model(self) -> None:
         production = Path(velox.__file__).read_text(encoding="utf-8")
@@ -10820,9 +10433,8 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
         self.assertNotIn("def migrate_v", lowered)
         self.assertNotIn("previous_data_file_version", lowered)
         readme = _project_documentation("README.md")
-        for phrase in ("Context Docs", "Google Drive", "Gmail", "Slack", "python test_velox.py", "SECURITY.md"):
+        for phrase in ("Context Docs", "Google Drive", "Gmail", "python test_velox.py", "SECURITY.md"):
             self.assertIn(phrase, readme)
-
 
 
 class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -11666,7 +11278,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertLess(general_h, 510)
         self.assertLess(pa_h, 704)
         self.assertGreaterEqual(general_h, 170)
-        self.assertGreaterEqual(pa_h, 390)
+        self.assertEqual(pa_h, 384)  # Shorter connector description now occupies one fewer line.
 
         source = inspect.getsource(velox.Panels._draw_agents_settings_content)
         self.assertIn("_agent_settings_layout", source)
@@ -11794,7 +11406,6 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(cpp_path.is_file())
             self.assertFalse((root / "skills" / "C").exists())
             self.assertEqual(cpp_path.read_text(encoding="utf-8"), cpp)
-
 
 
     def test_machine_specific_path_discovery_preserves_executable_invocation_aliases(self) -> None:
@@ -13011,7 +12622,6 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             velox.IMAGE_ANALYSIS_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             velox.ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
         )
-
 
 
     def test_expert_mode_action_first_and_test_design_guidance(self) -> None:
@@ -15597,7 +15207,6 @@ class CalendarLayoutAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         methods = (
             velox.Widgets.table_view,
             velox.Panels._draw_calendar_timeline,
-            velox.Panels._vault_draw_slack_messages,
         )
         for method in methods:
             source = inspect.getsource(method)
@@ -16406,8 +16015,8 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertEqual(narrow_right.w, 180)
         self.assertEqual(narrow_right.x + narrow_right.w, 390)
         source = inspect.getsource(velox.Panels._draw_accounts_settings_content)
-        self.assertEqual(source.count("compact=True"), 4)
-        self.assertEqual(source.count("settings_compact_two_column_rects"), 2)
+        self.assertEqual(source.count("compact=True"), 3)
+        self.assertEqual(source.count("settings_compact_two_column_rects"), 1)
         self.assertNotIn("settings_shifted_two_column_rects", source)
 
     def test_calendar_overlap_is_twenty_percent_and_labels_are_top_anchored(self) -> None:
@@ -16509,12 +16118,11 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             "settings.accounts.google_calendar.client_secret",
             "settings.accounts.google_drive.client_secret",
             "settings.accounts.gmail.app_password",
-            "settings.accounts.slack.client_secret",
         ):
             start = accounts_source.index(widget_id)
             segment = accounts_source[start:start + 650]
             self.assertIn("password=True", segment, widget_id)
-        self.assertGreaterEqual(accounts_source.count("password=True"), 5)
+        self.assertGreaterEqual(accounts_source.count("password=True"), 4)
 
     def test_long_task_limits_are_twenty_times_higher_without_web_rate_changes(self) -> None:
         self.assertEqual(velox.LONG_TASK_LIMIT_MULTIPLIER, 20)
@@ -17294,7 +16902,6 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
         self.assertEqual(len(velox.default_config()["llm"]["endpoint_profiles"]), 9)
-
 
 
 class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
@@ -18761,7 +18368,7 @@ class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unit
                     velox._RegisteredBackgroundWriter.shutdown_all.__func__,
                 )
 
-        for connector_type in (velox.GmailConnector, velox.SlackConnector):
+        for connector_type in (velox.GmailConnector,):
             with self.subTest(connector_type=connector_type.__name__):
                 self.assertNotIn("connect_or_authorize", connector_type.__dict__)
                 self.assertNotIn("disconnect", connector_type.__dict__)
@@ -19348,8 +18955,8 @@ class TaskInspectorTests(unittest.TestCase):
     def test_cost_card_keeps_underlying_task_type_and_tool_statistics(self) -> None:
         source = inspect.getsource(velox.Panels._draw_agent_summary_cards)
         stats_source = inspect.getsource(velox.LLMTaskMonitor.statistics)
-        self.assertIn('cards[3], "Costs / 24h"', source)
-        self.assertIn('stats.get("costs_24h")', source)
+        self.assertIn('self._draw_dashboard_cost_card(cards[3]', source)
+        self.assertIn('stats.get("costs", stats.get("costs_24h", {})', source)
         self.assertNotIn("Task mix", source)
         self.assertIn('"task_types": dict(collections.Counter', stats_source)
         self.assertIn('"top_tools": top_tools', stats_source)
@@ -20409,7 +20016,7 @@ class ContextCapacityAndIdleWorkTests(unittest.TestCase):
             self.assertNotIn(forbidden, production)
         for required in (
             "LLMTaskMonitor", "LLMTaskRecord", "CHAT/AGENT TASKS", "SYSTEM TASKS",
-            "TASK TOOL POLICY", "Task status", "Task outcomes", "Costs / 24h",
+            "TASK TOOL POLICY", "Task status", "Task outcomes", "Costs",
             "fits_effective_context", "estimate_llm_request_input_tokens", "_draw_card_title_text",
         ):
             self.assertIn(required, production)
@@ -22148,7 +21755,6 @@ class StallAndProgressTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase
         self.assertIn('The system prompt owns the shared Checklist and execution workflow', velox.DEFAULT_GENERAL_PROGRAMMING_SKILL_MARKDOWN)
 
 
-
 class EndpointRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     """Durable request retries, grep and context preservation."""
 
@@ -23530,16 +23136,17 @@ class DashboardRawAndTopToolsTests(_DataRootsIsolatedTestMixin, unittest.TestCas
         with tempfile.TemporaryDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
-    def test_cost_card_is_top_five_and_uses_table_terms(self) -> None:
+    def test_cost_card_uses_scrollable_endpoint_bars_and_table_terms(self) -> None:
         summary = inspect.getsource(velox.Panels._draw_agent_summary_cards)
         dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
-        self.assertIn('self._draw_agent_metric_card(cards[3], "Costs / 24h")', summary)
-        self.assertIn("ranked[:5]", summary)
-        self.assertIn("token_cost_label", summary)
+        self.assertIn('self._draw_dashboard_cost_card(cards[3]', summary)
+        chart = inspect.getsource(velox.Panels._draw_dashboard_cost_card)
+        self.assertIn("_scrollbar_draw", chart)
+        self.assertIn("token_cost_label", chart)
         self.assertIn("costs_24h", summary)
         self.assertNotIn("table_view", summary)
-        self.assertIn('"Checklist statistics"', summary)
-        self.assertIn('"Avg requirements/list "', summary)
+        self.assertNotIn('"Checklist statistics"', summary)
+        self.assertIn("endpoint_cost_bar_tooltip", chart)
         self.assertNotIn('"Inference throughput"', summary)
         self.assertIn('"title": "IN t/s"', dashboard)
         self.assertIn('"title": "OUT t/s"', dashboard)
@@ -24233,7 +23840,6 @@ class EngineeringWorkflowTests(unittest.TestCase):
             self.assertNotIn(term, production)
 
 
-
     def test_agent_self_selects_expert_mode_without_serial_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
@@ -24268,7 +23874,6 @@ class EngineeringWorkflowTests(unittest.TestCase):
             self.assertNotIn(forbidden, prompt)
         self.assertNotIn("one requirement at a time", prompt.lower())
         self.assertNotIn("requirements_verify", prompt)
-
 
 
     def test_3d_diagnostics_remain_deep_but_optional(self) -> None:
@@ -24665,7 +24270,6 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertNotIn("previous response stopped", prompt)
 
 
-
     def test_shell_exec_model_description_states_windows_cmd_contract(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
@@ -24920,7 +24524,6 @@ class ChecklistStoreTests(unittest.TestCase):
         self.assertEqual(later["items"][1]["state"], velox.CHECKLIST_ITEM_VERIFIED)
 
 
-
     def test_all_done_prompts_verify_not_completion(self) -> None:
         checklist = self._create(items=["One"])
         cid = checklist["checklist_id"]
@@ -24954,7 +24557,6 @@ class ChecklistStoreTests(unittest.TestCase):
         self.assertTrue(any(event["actor"] == "implementer" and event["new_state"] == velox.CHECKLIST_ITEM_DONE for event in events))
         self.assertTrue(any(event["actor"] == "reviewer" and event["new_state"] == velox.CHECKLIST_ITEM_VERIFIED for event in events))
         self.assertTrue(all("timestamp" in event and "comment" in event and "review_cycle" in event for event in events))
-
 
 
     def test_native_checklist_create_accepts_advertised_json_schema(self) -> None:
@@ -25956,7 +25558,6 @@ class ChatSidebarReportTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("migrate_", production)
 
 
-
 class ReviewerQualityTests(unittest.TestCase):
     """Artifact inspection and evidence requirements for acceptance review."""
 
@@ -26041,7 +25642,6 @@ class ReviewerQualityTests(unittest.TestCase):
         production = application_source()
         self.assertNotIn("migrate_", production)
         self.assertNotIn("SUPPORTED_DATA_FILE_VERSIONS", production)
-
 
 
 class ChecklistUiReviewCardTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -26165,7 +25765,6 @@ class ChecklistUiReviewCardTests(_DataRootsIsolatedTestMixin, unittest.TestCase)
                 velox.DATA_ROOTS.assert_supported(root)
         production = application_source()
         self.assertNotIn("migrate_", production)
-
 
 
 class ChatAppearanceTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -28246,7 +27845,6 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
         self.assertNotIn("migrate_", production)
 
 
-
 # Owner lifecycle and reviewer failure paths.
 class DurableLifecycleTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def setUp(self) -> None:
@@ -28568,7 +28166,6 @@ class ReviewerFailurePathTests(_DataRootsIsolatedTestMixin, unittest.IsolatedAsy
             velox._extract_reviewer_result(fake, 'reviewer', {})
 
 
-
     async def test_restart_fails_orphan_paused_reviewer_but_preserves_normal_pause(self) -> None:
         reviewer = self.agents.create_agent(self.chat_id, 'Review', context=velox.EXPERT_MODE_REVIEW_AGENT_CONTEXT_MARKER+'\n{}')
         normal = self.agents.create_agent(self.chat_id, 'Ordinary work')
@@ -28666,7 +28263,6 @@ class AtomicStateTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
                     velox._parse_reviewer_result(text, {'requirements':[{'id':'C1'}]})
-
 
 
 class DeletionCommitTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -29688,7 +29284,6 @@ class BoundaryRecoveryTests(_AsyncRuntimeFixture):
         self.assertTrue(any(t.get("model_replay_messages") for t in self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)))
 
 
-
 class UserStopChecklistTests(_AsyncRuntimeFixture):
     """Stop is terminal for Chat Checklists, not a fabricated item verdict."""
 
@@ -30000,7 +29595,6 @@ class UserStopChecklistTests(_AsyncRuntimeFixture):
         self.chats.delete_chat(velox.APP_SCOPE_ID, self.cid)
         await self.stop()
         self.assertFalse(self.paths.chat_dir(self.cid).exists())
-
 
 
     async def test_user_stop_during_real_reviewer_wait_leaves_terminal_lists(self) -> None:
@@ -31169,7 +30763,6 @@ class ShutdownAndAgentPrefixTests(_AsyncRuntimeFixture):
         scheduler._finalize_active_agents();self.assertEqual(store.get_task(row['scheduled_task_id'])['last_error'],'Compiler failed with exact diagnostic')
 
 
-
 class GLMFlashProfileTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     """GLM-5.3-Flash is an explicit family, not a label on a text-only preset."""
 
@@ -31967,7 +31560,6 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             await scheduler.close()
 
 
-
     async def test_transport_close_unblocks_buffered_socket_read(self) -> None:
         await self._check_buffered_socket_close(wrapped=False)
 
@@ -32007,7 +31599,6 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             peer.close()
             client.close()
             await asyncio.to_thread(thread.join, 1)
-
 
 
     async def test_transport_close_interrupts_only_its_own_transport(self) -> None:
@@ -32064,7 +31655,6 @@ class TransportDeadlineTests(_AsyncRuntimeFixture):
             peer_a.close()
             client_a.close()
             await asyncio.to_thread(thread_a.join, 1)
-
 
 
 def _run_negative_control_child() -> NoReturn:
@@ -33150,7 +32740,6 @@ class LocalHTTPDeadlineTests(_AsyncRuntimeFixture):
                         server.server_close()
                         await asyncio.to_thread(thread.join, 1)
                         self.assertTrue(await asyncio.to_thread(first_done.wait, 1))
-
 
 
 # =============================================================================
@@ -34269,7 +33858,6 @@ class CalibrationTests(_AsyncRuntimeFixture):
         await self._wire_usage('responses',False)
 
 
-
 class _ContextRecoveryLLM:
     """Protocol-shaped fixture; real Chat/Agent compaction and tool dispatch remain live."""
     def __init__(self, storage: Storage, *, reject: int = 1, partial: bool = False, tool_first: bool = False,
@@ -34489,7 +34077,6 @@ class ContextUITests(_AsyncRuntimeFixture):
         self.assertEqual(panel._chat_context_usage_line(self.chats.load_turns(velox.APP_SCOPE_ID,self.cid)),expected)
 
 
-
 class HTTPRecoveryTests(_AsyncRuntimeFixture):
     async def run_http(self, transport: str) -> None:
         main_payloads=[];summary_payloads=[];handler_errors=[]
@@ -34607,7 +34194,6 @@ class RecoveryEdgeTests(_AsyncRuntimeFixture):
         endpoint=dict(fake.resolve_endpoint(self.eid),context_window_tokens=65536,max_output_tokens=8192)
         cap=velox.prepared_request_capacity_snapshot(endpoint,estimated_message_tokens=velox.estimate_request_messages_tokens(messages),message_count=len(messages))
         self.assertTrue(cap['fits'],cap);self.assertEqual(messages[-1],last)
-
 
 
 class AccountingEdgeTests(_AsyncRuntimeFixture):
@@ -35080,7 +34666,6 @@ class ReviewerReconciliationTests(_ReviewerWaitFixture):
         result = self.finish(cid, aid, cycle)
         self.assertEqual(result["action"], "review_error")
         self.assertEqual(result["items"][0]["state"], "done")
-
 
 
 class ReviewerChatIntegrationTests(_AsyncRuntimeFixture):
@@ -36088,7 +35673,7 @@ class PromptContractTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_general_agent_and_pa_external_write_boundaries_preserved(self) -> None:
         self.assertIn('absent write scope means read-only',velox.DEFAULT_GENERAL_AGENT_SKILL_MARKDOWN)
-        self.assertIn('Email, Slack, Google Calendar and Drive are read-only',velox.DEFAULT_PERSONAL_ASSISTANT_AGENT_SKILL_MARKDOWN)
+        self.assertIn('Email, Google Calendar and Drive are read-only',velox.DEFAULT_PERSONAL_ASSISTANT_AGENT_SKILL_MARKDOWN)
         self.assertIn('Action -> Agent WIP -> Review -> Done',velox.DEFAULT_GENERAL_AGENT_SKILL_MARKDOWN)
         self.assertIn('prior PA reports',velox.DEFAULT_PERSONAL_ASSISTANT_AGENT_SKILL_MARKDOWN)
 
@@ -36292,7 +35877,6 @@ async def _test_agent_recovery_contract(test: unittest.TestCase, *, failures: in
             test.assertFalse(any(e["kind"] == "conversation_message" for e in agents.load_transcript(aid)))
         finally:
             await runtime.shutdown()
-
 
 
 class EndpointRecoveryPolicyTests(_AsyncRuntimeFixture):
@@ -36940,7 +36524,6 @@ class EndpointRecoveryHTTPTests(_AsyncRuntimeFixture):
                 response=await self.run_request(True)
                 self.assertEqual(response['text'],'Recovered \u03c4 safely.')
                 self.assertEqual(len(requests),1)
-
 
 
 class _EndpointEditorRecorder:
@@ -38268,7 +37851,6 @@ class LifecycleSafetyTests(_AsyncRuntimeFixture):
         self.user("Continue the stopped task.")
 
 
-
     def test_live_old_reviewer_blocks_resume(self) -> None:
         worker = self.agents.create_agent(self.cid, "Old review still cleaning up")
         collection = self.manager.load_collection(self.owner)
@@ -38289,7 +37871,6 @@ class LifecycleSafetyTests(_AsyncRuntimeFixture):
         self.assertEqual(state['checklist_id'],cid)
         self.assertNotIn('Full acceptance',self.manager.continuation_prompt(owner))
         self.assertEqual(self.manager.active(self.owner)['id'],self.root)
-
 
 
     def test_pending_stop_prevents_resume_even_with_new_user_message(self) -> None:
@@ -38475,7 +38056,7 @@ class NestedChecklistPresentationTests(_WriterDataRootsIsolatedTestMixin, unitte
         self.assertEqual([row['id'] for row in rows], ['C1', 'C1.1', 'C1.2', 'C2'])
         self.assertEqual([row['_depth'] for row in rows], [0, 1, 1, 0])
         self.assertEqual(state, before)
-        self.assertEqual(rows[1]['requirement_id']['indent'], 26)
+        self.assertEqual(rows[1]['requirement_id']['indent'], 40)
         self.assertTrue(rows[1]['requirement_id']['tree_branch'])
         self.assertEqual(rows[1]['_parent_id'], 'C1')
 
@@ -39757,7 +39338,6 @@ class NestedReviewerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.checklists.active(self.owner))
 
 
-
 class CachedUsageTests(unittest.TestCase):
     def test_chat_completions_and_responses_hit_fields(self) -> None:
         for total_key, detail_key in (("prompt_tokens", "prompt_tokens_details"), ("input_tokens", "input_tokens_details")):
@@ -39962,7 +39542,7 @@ class TokenDashboardTests(_StorageFixture):
             self.assertTrue(body.y <= cache[0].y and cache[0].y + cache[0].h <= body.y + body.h)
             self.assertGreater(cache[0].x, body.x)
             self.assertLess(cache[0].w, body.w)
-            self.assertIn("Checklist statistics", [title for title, _ in cards])
+            self.assertNotIn("Checklist statistics", [title for title, _ in cards])
             self.assertNotIn("Inference throughput", [title for title, _ in cards])
 
 
@@ -40173,9 +39753,10 @@ class ChecklistStatisticsTests(_StorageFixture):
         self.assertEqual(counts["requirements"], 100); self.assertEqual(counts["subitems"], 10000)
 
 
-class ChecklistStatsAsyncTests(_AsyncRuntimeFixture):
+class DashboardCostStatsAsyncTests(_AsyncRuntimeFixture):
     def panel(self) -> Panels:
-        panel = object.__new__(velox.Panels); panel.services = SimpleNamespace(storage=self.storage)
+        self.monitor = velox.LLMTaskMonitor(self.storage)
+        panel = object.__new__(velox.Panels); panel.services = SimpleNamespace(storage=self.storage, monitor=self.monitor); panel.state = velox.UIState()
         panel._observe_background_task = lambda task: None
         return panel
 
@@ -40184,27 +39765,27 @@ class ChecklistStatsAsyncTests(_AsyncRuntimeFixture):
         def slow(reader: Any) -> dict[str, Any]:
             calls.append(threading.get_ident()); entered.set()
             if not release.wait(3): raise TimeoutError("stats fixture")
-            return {"status": "ready", "checklists": 7}
-        with mock.patch.object(velox.ChecklistStatisticsCache, "read", slow):
-            self.assertEqual(panel._dashboard_checklist_statistics()["status"], "loading")
+            return {"status": "ready", "total_usd": 7}
+        with mock.patch.object(self.monitor, "cost_statistics", slow):
+            self.assertEqual(panel._dashboard_cost_statistics()["status"], "loading")
             try:
                 self.assertTrue(await asyncio.to_thread(entered.wait, 2))
-                for _ in range(100): self.assertEqual(panel._dashboard_checklist_statistics()["status"], "loading")
+                for _ in range(100): self.assertEqual(panel._dashboard_cost_statistics()["status"], "loading")
                 self.assertEqual(len(calls), 1); self.assertNotEqual(calls[0], main)
             finally:
-                release.set(); await panel._checklist_statistics_entry["task"]
-            self.assertEqual(panel._dashboard_checklist_statistics()["checklists"], 7)
-            for _ in range(100): panel._dashboard_checklist_statistics()
+                release.set(); await panel._dashboard_cost_entry["task"]
+            self.assertEqual(panel._dashboard_cost_statistics()["total_usd"], 7)
+            for _ in range(100): panel._dashboard_cost_statistics()
             self.assertEqual(len(calls), 1)
 
     async def test_background_read_error_is_visible_not_zero(self) -> None:
         panel = self.panel()
-        with mock.patch.object(velox.ChecklistStatisticsCache, "read", side_effect=ValueError("Corrupt collection")):
-            panel._dashboard_checklist_statistics()
-            await asyncio.gather(panel._checklist_statistics_entry["task"], return_exceptions=True)
-            result = panel._dashboard_checklist_statistics()
-        self.assertEqual(result["status"], "error"); self.assertIn("Corrupt collection", result["error"])
-        self.assertNotIn("checklists", result)
+        with mock.patch.object(self.monitor, "cost_statistics", side_effect=ValueError("Corrupt ledger")):
+            panel._dashboard_cost_statistics()
+            await asyncio.gather(panel._dashboard_cost_entry["task"], return_exceptions=True)
+            result = panel._dashboard_cost_statistics()
+        self.assertEqual(result["status"], "error"); self.assertIn("Corrupt ledger", result["error"])
+        self.assertNotIn("total_usd", result)
 
 
 class QualityPromptTests(_AsyncRuntimeFixture):
@@ -40366,7 +39947,6 @@ class CacheRuntimeTests(_AsyncRuntimeFixture):
             monitor.cancel(tid); await scheduler.close()
 
 
-
 class UsageAccountingLifecycleTests(_AsyncRuntimeFixture):
     async def partial_chat(self, exception: BaseException) -> dict[str, Any]:
         storage = self.storage
@@ -40442,28 +40022,6 @@ class UsageAccountingLifecycleTests(_AsyncRuntimeFixture):
             panel._draw_skills_settings_content(velox.Rect(0, 0, 1000, 1400))
         self.assertTrue(any("Unable to read Skills" in text and "Invalid mode schema" in text for text in seen))
 
-    def test_all_five_checklist_stat_lines_fit_normal_and_large_ui_fonts(self) -> None:
-        for font_height in (16, 20, 30, 40, 48):
-            with self.subTest(font_height=font_height):
-                widgets = ChecklistRenderingTests.widgets(); widgets.font.line_h = font_height
-                panel = object.__new__(velox.Panels); panel.widgets = widgets; panel.state = widgets.state
-                panel.services = SimpleNamespace(monitor=velox.LLMTaskMonitor(self.storage))
-                cards = {}; lines = []
-                original = panel._draw_agent_metric_card
-                def card(rect: velox.Rect, title: str) -> velox.Rect:
-                    body = original(rect, title); cards[title] = body; return body
-                values = {**dict.fromkeys(velox.ChecklistStatisticsCache.FIELDS, 0), "status": "ready", "checklists": 4, "active": 1, "avg_requirements": 8.5,
-                          "avg_subitems": 24, "avg_subitems_per_requirement": 2.8, "planned_percent": 80}
-                with mock.patch.object(panel, "_draw_agent_metric_card", side_effect=card), \
-                     mock.patch.object(widgets, "clipped_text", side_effect=lambda rect, text, *a, **k: lines.append((rect,str(text)))):
-                    panel._draw_agent_summary_cards(velox.Rect(0, 0, 1800, 1400), {"checklist_statistics": values})
-                body = cards["Checklist statistics"]
-                relevant = [(r,t) for r,t in lines if t.startswith(("Checklists ", "Avg ", "Requirements with steps"))]
-                self.assertEqual(len(relevant), 5)
-                for rect, label in relevant:
-                    self.assertGreaterEqual(rect.y, body.y, label)
-                    self.assertLessEqual(rect.y + rect.h, body.y + body.h, label)
-
 
 
 class DashboardPresentationTests(_StorageFixture):
@@ -40522,7 +40080,7 @@ class DashboardPresentationTests(_StorageFixture):
                 first, second = rings[:2]
                 self.assertEqual((first[0].w,first[0].h), (second[0].w,second[0].h))
                 body = bodies["Token usage"]
-                self.assertEqual(first[0].w, max(88,min(body.h-8,int(body.w*0.43))))
+                self.assertEqual(first[0].w, max(88,min(body.h-8,int(min(body.w,bodies["Task outcomes"].w)*0.43))))
                 self.assertEqual(first[0].y-body.y, (body.h-first[0].h)//2)
                 self.assertEqual([v for v,_c in first[1]], [335233,47754])
                 self.assertIn("382,987 total", first[2]["center_tooltip"])
@@ -42258,7 +41816,6 @@ class HandoffIntegrationTests(_AsyncRuntimeFixture):
         self.assertIn('REDACTED', payload['instruction'])
 
 
-
 class CallbackIsolationTests(_AsyncRuntimeFixture):
     """A finished helper may never terminalize a different live Chat owner."""
 
@@ -43006,8 +42563,6 @@ class TestResultMarkerTests(unittest.TestCase):
             self.assertFalse(_test_result_matches(path, os.getpid(), 3))
 
 
-
-
 class JsonlAppendHandleTests(unittest.TestCase):
     """Ownership and error handling for the Windows JSONL append handle."""
 
@@ -43212,7 +42767,6 @@ class ReleaseSchemaTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
             self.assertEqual(velox.AGENT_SCHEMA, velox.data_schema('agent'))
             self.assertEqual(velox.SOURCE_REVISION, str(velox.CURRENT_VERSION))
-
 
 
 class ScrollInputOwnershipTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
@@ -44282,11 +43836,11 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 
 class UnifiedReleaseVersionTests(_StorageFixture):
-    def test_current_version_313_preserves_data_generation_311(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 313)
+    def test_current_version_314_preserves_data_generation_311(self) -> None:
+        self.assertEqual(velox.CURRENT_VERSION, 314)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 311)
-        self.assertEqual(velox.APP_VERSION, 'velox.v313')
-        self.assertEqual(velox.SOURCE_REVISION, '313')
+        self.assertEqual(velox.APP_VERSION, 'velox.v314')
+        self.assertEqual(velox.SOURCE_REVISION, '314')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v311')
 
     def test_all_exported_schema_constants_share_data_generation(self) -> None:
@@ -45145,11 +44699,10 @@ class DashboardCostAndChecklistLayoutTests(_StorageFixture):
                 with mock.patch.object(panel,'_draw_agent_metric_card',side_effect=card), \
                      mock.patch.object(panel.widgets,'clipped_text',side_effect=lambda r,t,*a,**k:recorded.append((r,t))):
                     panel._draw_agent_summary_cards(velox.Rect(0,0,1920,2000), {'costs_24h':costs})
-                body=bodies['Costs / 24h']; rows=[(r,t) for r,t in recorded if t.startswith('Endpoint')]
+                body=bodies['Costs']; rows=[(r,t) for r,t in recorded if t.startswith('Endpoint')]
                 self.assertEqual(len(rows),5)
                 for rect,text in rows:
                     self.assertLessEqual(rect.y+rect.h,body.y+body.h,text)
-
 
 
 class EndpointCostIntegrationTests(_StorageFixture):
@@ -45194,7 +44747,6 @@ class EndpointCostIntegrationTests(_StorageFixture):
             finally:
                 await scheduler.close()
         asyncio.run(scenario())
-
 
 
 class ResizableFilePickerTests(_AttachmentUiFixture, unittest.TestCase):
@@ -45572,14 +45124,14 @@ class ConnectedChecklistTreeTests(unittest.TestCase):
             self.assertIn((trunk, child.y, trunk, end, velox.Palette.muted2), lines)
             previous = child
 
-    def test_arrow_heads_leave_eight_pixels_before_id_text(self) -> None:
+    def test_arrow_heads_leave_eighteen_pixels_before_id_text(self) -> None:
         w, calls, texts = self.render()
         text_rects = {c.args[1]: c.args[0] for c in texts}
         lines = [a for name, a, kw in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted2]
         for c in calls:
             cell, indent, value = c.args
             if not value.get('tree_branch'): continue
-            tip = text_rects[value['label']].x - 8
+            tip = text_rects[value['label']].x - 18
             middle = cell.y + cell.h // 2
             self.assertIn((tip - 4, middle - 3, tip, middle, velox.Palette.muted2), lines)
             self.assertIn((tip - 4, middle + 3, tip, middle, velox.Palette.muted2), lines)
@@ -45903,8 +45455,8 @@ class ChecklistTreeAlignmentTests(unittest.TestCase):
             for call in branches:
                 cell, indent, value = call.args
                 if not value.get('tree_branch'): continue
-                tip = rects[value['label']].x - 8
-                self.assertGreaterEqual(tip - (cell.x + 10 + width), 6)
+                tip = rects[value['label']].x - 18
+                self.assertGreaterEqual(tip - (cell.x + 10 + width), 10)
                 self.assertIn((tip - 4, cell.y + cell.h // 2 - 3, tip, cell.y + cell.h // 2, velox.Palette.muted2), lines)
 
     def test_step_marks_are_shifted_exactly_ten_pixels_and_stay_in_status_column(self) -> None:
@@ -46066,6 +45618,338 @@ class RunnerFailureDiagnosticsTests(unittest.TestCase):
                 _publish_test_failure_details(result, 1)
             self.assertIn('UNEXPECTED SUCCESS', _read_test_failure_details(marker, os.getpid(), 'token', 1))
 
+
+class CostWindowRegressionTests(_StorageFixture):
+    def event(self, key: str, epoch: float, endpoint: str = 'a', amount: float = 1.0) -> dict[str, Any]:
+        pricing = velox.endpoint_cost_pricing_snapshot(velox.endpoint_profile_ref(
+            self.storage.load_config(), velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID))
+        pricing.update(endpoint_type=endpoint, type_label='Endpoint ' + endpoint)
+        cost = velox.estimate_token_cost(pricing, 1000, 200, 750)
+        cost['total_usd'] = amount
+        return {'schema': velox.data_schema('token_cost'), 'event_id': key, 'epoch': epoch,
+                'pricing': pricing, 'cost': cost}
+
+    def test_all_five_windows_have_exact_rolling_boundaries(self) -> None:
+        now = datetime(2026, 9, 28, 12, tzinfo=timezone.utc).timestamp()
+        for period, seconds in velox.DASHBOARD_COST_PERIODS.items():
+            with self.subTest(period=period):
+                ledger = velox.TokenCostLedger(self.paths.root_dir / period.replace(' ', '_'))
+                for key, stamp in [('outside', now-seconds-1), ('boundary', now-seconds),
+                                   ('inside', now-seconds+.001), ('now', now), ('future', now+.001)]:
+                    ledger.record(self.event(key, stamp))
+                value = ledger.summary(now=now, window_seconds=seconds)
+                self.assertEqual(value['requests'], 2)
+                self.assertEqual(value['total_usd'], 2)
+                self.assertEqual(value['window_seconds'], seconds)
+
+    def test_year_reads_persisted_history_after_restart(self) -> None:
+        now = time.time(); ledger = self.monitor.cost_ledger
+        ledger.record(self.event('historical', now - 300*86400))
+        ledger.record(self.event('recent', now-60, 'b', 3))
+        restored = velox.TokenCostLedger(self.paths.root_dir)
+        self.assertEqual(restored.summary(now=now)['total_usd'], 3)
+        self.assertEqual(restored.summary(now=now, window_seconds=365*86400)['total_usd'], 4)
+        self.assertEqual(restored.summary(now=now, window_seconds=90*86400)['total_usd'], 3)
+
+    def test_midnight_cutoff_does_not_include_previous_day(self) -> None:
+        now = datetime(2026,9,28,tzinfo=timezone.utc).timestamp()
+        ledger = self.monitor.cost_ledger
+        for i, stamp in enumerate((now-86400, now-86400+.001, now-.001, now)):
+            ledger.record(self.event(str(i), stamp))
+        self.assertEqual(ledger.summary(now=now)['requests'], 3)
+
+    def test_live_final_and_corrections_are_one_physical_request(self) -> None:
+        ledger = self.monitor.cost_ledger; now=time.time()
+        live = self.event('one', now-10, amount=7)
+        final = self.event('one', now-10, amount=3)
+        self.assertEqual(ledger.summary([live],now=now)['total_usd'],7)
+        ledger.record(final)
+        self.assertEqual(ledger.summary([live],now=now)['total_usd'],3)
+        corrected = self.event('one',now-10,amount=4); ledger.record(corrected)
+        value = ledger.summary([live],now=now)
+        self.assertEqual((value['requests'],value['total_usd']), (1,4))
+        self.assertEqual(velox.TokenCostLedger(self.paths.root_dir).summary(now=now)['total_usd'],4)
+
+    def test_endpoint_totals_sum_unrounded_values_and_all_endpoint_types(self) -> None:
+        now=time.time(); ledger=self.monitor.cost_ledger
+        for i in range(9): ledger.record(self.event(str(i),now-1,str(i),.004 * (i+1)))
+        value=ledger.summary(now=now)
+        self.assertEqual(len(value['endpoints']),9); self.assertEqual(len(value['top_endpoints']),5)
+        self.assertAlmostEqual(value['total_usd'],.18)
+        self.assertEqual([r['endpoint_type'] for r in value['endpoints']],list('876543210'))
+        self.assertEqual(value['input_tokens'],9000); self.assertEqual(value['cached_input_tokens'],6750)
+
+    def test_profiles_of_same_endpoint_type_merge_without_token_double_count(self) -> None:
+        now=time.time(); ledger=self.monitor.cost_ledger
+        for key in ('one','two'):
+            event=self.event(key,now-1);event['pricing']['endpoint_profile_id']=key;ledger.record(event)
+        row=ledger.summary(now=now)['endpoints'][0]
+        self.assertEqual(row['input_tokens'],2000);self.assertEqual(row['cached_input_tokens'],1500)
+        self.assertEqual(row['output_tokens'],400);self.assertEqual(row['requests'],2)
+
+    def test_daily_aggregate_cache_avoids_reparsing_unchanged_year(self) -> None:
+        now=time.time();ledger=self.monitor.cost_ledger
+        ledger.record(self.event('old',now-100*86400))
+        before=ledger.summary(now=now,window_seconds=365*86400)
+        with mock.patch.object(velox,'iter_jsonl',side_effect=AssertionError('unchanged day parsed')):
+            after=ledger.summary(now=now,window_seconds=365*86400)
+        self.assertEqual(before,after)
+        day=ledger._day(now-100*86400)
+        self.assertIsNone(ledger._day_cache[day]['events'])
+
+    def test_window_can_move_with_no_file_changes(self) -> None:
+        now=time.time();ledger=self.monitor.cost_ledger
+        ledger.record(self.event('expiring',now-3599))
+        self.assertEqual(ledger.summary(now=now,window_seconds=3600)['requests'],1)
+        self.assertEqual(ledger.summary(now=now+2,window_seconds=3600)['requests'],0)
+
+    def test_final_write_does_not_scan_history(self) -> None:
+        with mock.patch.object(velox,'iter_jsonl',side_effect=AssertionError('record read history')):
+            self.monitor.cost_ledger.record(self.event('one',time.time()-1))
+
+    def test_new_and_corrected_daily_events_invalidate_cached_aggregates(self) -> None:
+        now=time.time();ledger=self.monitor.cost_ledger;stamp=now-50*86400
+        ledger.record(self.event('old',stamp,amount=1))
+        ledger.summary(now=now,window_seconds=90*86400)
+        ledger.record(self.event('old',stamp,amount=2));ledger.record(self.event('next',stamp,amount=3))
+        result=ledger.summary(now=now,window_seconds=90*86400)
+        self.assertEqual((result['requests'],result['total_usd']),(2,5))
+
+    def test_external_append_invalidates_cached_day(self) -> None:
+        now=time.time();ledger=self.monitor.cost_ledger
+        ledger.record(self.event('one',now-10));ledger.summary(now=now)
+        event=self.event('two',now-5)
+        velox.append_jsonl(ledger.directory/(ledger._day(event['epoch'])+'.jsonl'),event)
+        self.assertEqual(ledger.summary(now=now)['requests'],2)
+
+    def test_failed_write_is_counted_once_and_retry_becomes_durable(self) -> None:
+        now=time.time();ledger=self.monitor.cost_ledger;event=self.event('one',now-1)
+        with mock.patch.object(velox,'append_jsonl',side_effect=OSError('disk full')):
+            ledger.record(event)
+        value=ledger.summary(now=now)
+        self.assertEqual(value['total_usd'],1);self.assertIn('not durable',value['error'])
+        ledger.record(event)
+        self.assertEqual(ledger.summary(now=now)['requests'],1)
+        self.assertEqual(velox.TokenCostLedger(self.paths.root_dir).summary(now=now)['requests'],1)
+
+    def test_invalid_windows_and_end_times_fail_explicitly(self) -> None:
+        ledger=self.monitor.cost_ledger
+        for seconds in (0,-1,True,1.5,366*86400):
+            with self.subTest(seconds=seconds),self.assertRaises(ValueError): ledger.summary(window_seconds=seconds)
+        for now in (float('nan'),float('inf')):
+            with self.assertRaises(ValueError):ledger.summary(now=now)
+
+    def test_old_supported_ledger_schema_and_settings_do_not_need_migration(self) -> None:
+        self.assertEqual(velox.CURRENT_VERSION,314);self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION,311)
+        archived=next(iter(set(velox.VAULT_SOURCE_TYPES)-set(velox.VAULT_SOURCE_ORDER)))
+        cfg=self.storage.load_config();cfg['vault'][archived]={'enabled':True,'custom':'keep'}
+        self.storage.write_config(cfg)
+        self.assertEqual(self.storage.load_config()['vault'][archived],{'enabled':True,'custom':'keep'})
+        self.assertEqual(velox.VAULT_SOURCE_ORDER,('google_calendar','google_drive','gmail'))
+        self.assertEqual(set(velox.default_config()['vault'])-{'local_timezone','divider_fraction'},
+                         {'google_calendar','google_drive','gmail'})
+
+    def test_dashboard_non_cost_snapshot_never_opens_ledger(self) -> None:
+        with mock.patch.object(self.monitor.cost_ledger,'summary',side_effect=AssertionError('UI disk read')):
+            stats=self.monitor.statistics(include_costs=False)
+        self.assertIn('counts',stats);self.assertEqual(stats['costs_24h'],{})
+
+    def test_malformed_history_warns_without_rewriting_it(self) -> None:
+        ledger=self.monitor.cost_ledger;now=time.time();old=now-200*86400
+        path=ledger.directory/(ledger._day(old)+'.jsonl');path.parent.mkdir(exist_ok=True)
+        path.write_text('{"schema":"broken"}\n',encoding='utf-8');before=path.read_bytes()
+        value=ledger.summary(now=now,window_seconds=365*86400)
+        self.assertTrue(value['error']);self.assertEqual(path.read_bytes(),before)
+        self.assertEqual(value['requests'],0)
+
+
+class DashboardCostBarRenderingTests(_StorageFixture):
+    def panel(self, font_h: int = 18) -> Panels:
+        panel=object.__new__(velox.Panels);panel.widgets=ChecklistRenderingTests.widgets()
+        panel.state=panel.widgets.state;panel.services=SimpleNamespace(monitor=self.monitor)
+        panel.widgets.font.line_h=font_h
+        return panel
+
+    @staticmethod
+    def costs(count: int = 3) -> dict[str, Any]:
+        rows=[{'endpoint_type':str(i),'label':'Endpoint '+str(i),'total_usd':float(count-i),
+               'input_tokens':1200,'cached_input_tokens':900,'output_tokens':200,
+               'input_usd':.25,'cached_input_usd':.05,'output_usd':.7,'requests':1} for i in range(count)]
+        return {**velox.sum_token_costs(rows),'endpoints':rows,'status':'ready'}
+
+    def test_wide_card_ratio_is_half_one_and_half_one_double(self) -> None:
+        for width in (1450,1920,2048,3840):
+            rect=velox.Rect(9,13,width,500);rows=velox.Panels._dashboard_summary_card_rects(rect,250)
+            standard=(width-36)/5
+            for row,weight in zip(rows,(.5,1.5,1,2)):
+                self.assertAlmostEqual(row.w,standard*weight,delta=1)
+            self.assertEqual(rows[-1].x+rows[-1].w,rect.x+rect.w)
+            self.assertTrue(all(a.x+a.w+12==b.x for a,b in zip(rows,rows[1:])))
+
+    def test_responsive_card_rows_never_overlap_or_exceed_viewport(self) -> None:
+        for width in (320,620,759,760,960,1200,1449,1450,1920):
+            rows=velox.Panels._dashboard_summary_card_rects(velox.Rect(5,7,width,3000),250)
+            self.assertEqual(len(rows),4)
+            for row in rows:self.assertTrue(5 <= row.x < row.x+row.w <= width+5)
+            for i,a in enumerate(rows):
+                for b in rows[i+1:]:self.assertFalse(velox.rects_intersect_fast(a.x,a.y,a.w,a.h,b.x,b.y,b.w,b.h))
+
+    def test_card_inventory_has_four_cards_and_no_checklist_card(self) -> None:
+        panel=self.panel();names=[];old=panel._draw_agent_metric_card
+        def card(rect,title):names.append(title);return old(rect,title)
+        with mock.patch.object(panel,'_draw_agent_metric_card',side_effect=card):
+            panel._draw_agent_summary_cards(velox.Rect(0,0,1920,900),{'costs':self.costs()})
+        self.assertEqual(names,['Task status','Token usage','Task outcomes','Costs'])
+
+    def test_period_picker_values_and_default_are_exact(self) -> None:
+        panel=self.panel()
+        with mock.patch.object(panel.widgets,'dropdown',wraps=panel.widgets.dropdown) as picker:
+            panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),self.costs())
+        self.assertEqual(picker.call_args.args[2],'24 hours')
+        self.assertEqual(picker.call_args.args[3],['1 hour','24 hours','30 days','90 days','1 year'])
+
+    def test_period_change_clears_stale_cost_and_resets_scroll(self) -> None:
+        panel=self.panel();panel.state.scroll['dashboard:cost-bars']=70
+        with mock.patch.object(panel.widgets,'dropdown',return_value='30 days'),\
+             mock.patch.object(panel.widgets,'clipped_text') as text:
+            panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),self.costs())
+        self.assertEqual(panel.state.dashboard_cost_period,'30 days')
+        self.assertEqual(panel.state.scroll['dashboard:cost-bars'],0)
+        self.assertIn('Loading costs...',[c.args[1] for c in text.call_args_list])
+        self.assertFalse(any(c.args[1].startswith(('Total','Endpoint')) for c in text.call_args_list))
+
+    def test_chart_tooltips_include_counts_costs_and_cached_subset(self) -> None:
+        panel=self.panel();value=self.costs();calls=[]
+        with mock.patch.object(panel.widgets,'_queue_tooltip',side_effect=lambda *a,**k:calls.append(a)):
+            panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),value)
+        hints=[a[2] for a in calls if a[0].startswith('dashboard:cost-bars:')]
+        self.assertEqual(len(hints),3)
+        for hint in hints:
+            for text in ('Cost (USD):','Input: 1,200 tokens total','Uncached input: 300 tokens | $0.25',
+                         'Cached input: 900 tokens | $0.05','Output: 200 tokens | $0.70'):
+                self.assertIn(text,hint)
+            self.assertGreaterEqual(hint.count('\n'),6)
+
+    def test_bar_widths_are_proportional_and_use_unrounded_costs(self) -> None:
+        panel=self.panel();value=self.costs();value['endpoints'][0]['total_usd']=.004
+        value['endpoints'][1]['total_usd']=.002;value['endpoints'][2]['total_usd']=0
+        panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),value)
+        bars=[a[0] for name,a,k in panel.r.drawn if name=='draw_round_rect' and a[1]==5 and a[2].a==85]
+        self.assertEqual(len(bars),2);self.assertAlmostEqual(bars[0].w/2,bars[1].w,delta=1)
+
+    def test_many_endpoints_are_virtualized_and_scroll_to_last(self) -> None:
+        panel=self.panel();rect=velox.Rect(0,0,720,280);value=self.costs(100)
+        with mock.patch.object(panel.widgets,'clipped_text') as text:
+            panel._draw_dashboard_cost_card(rect,value)
+        first=[c.args[1] for c in text.call_args_list if c.args[1].startswith('Endpoint')]
+        self.assertLess(len(first),10);self.assertIn('Endpoint 0',first)
+        panel.state.scroll['dashboard:cost-bars']=10**9
+        with mock.patch.object(panel.widgets,'clipped_text') as text:
+            panel._draw_dashboard_cost_card(rect,value)
+        self.assertIn('Endpoint 99',[c.args[1] for c in text.call_args_list])
+        self.assertLess(panel.state.scroll['dashboard:cost-bars'],10**9)
+
+    def test_wheel_is_consumed_only_by_hovered_scrollable_chart(self) -> None:
+        panel=self.panel();panel.state.input.mouse_x=40;panel.state.input.mouse_y=170
+        panel.state.input.wheel_y=-1
+        panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),self.costs(100))
+        self.assertGreater(panel.state.scroll['dashboard:cost-bars'],0)
+        self.assertEqual(panel.state.input.wheel_y,0)
+        panel.state.input.mouse_x=900;panel.state.input.wheel_y=-1
+        panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),self.costs(100))
+        self.assertEqual(panel.state.input.wheel_y,-1)
+
+    def test_modal_prevents_cost_chart_scrolling(self) -> None:
+        panel=self.panel();panel.state.input.mouse_x=40;panel.state.input.mouse_y=170
+        panel.state.input.wheel_y=-1
+        with mock.patch.object(panel.widgets,'_input_blocked',return_value=True):
+            panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),self.costs(100))
+        self.assertEqual(panel.state.scroll['dashboard:cost-bars'],0)
+
+    def test_zero_and_unpriced_endpoints_do_not_disappear(self) -> None:
+        panel=self.panel();value=self.costs(2)
+        for row in value['endpoints']:row.update(total_usd=0)
+        value['endpoints'][1]['unpriced_requests']=1
+        with mock.patch.object(panel.widgets,'clipped_text') as text:
+            panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),value)
+        shown=[c.args[1] for c in text.call_args_list]
+        for label in ('Endpoint 0','Endpoint 1','$0.00','Unpriced'):self.assertIn(label,shown)
+        self.assertFalse(any('USD' in label for label in shown))
+
+    def test_tooltip_warnings_are_specific_to_missing_data(self) -> None:
+        row=self.costs(1)['endpoints'][0]
+        hint=velox.endpoint_cost_bar_tooltip(row,'1 year');self.assertNotIn('missing',hint)
+        row.update(unpriced_requests=1,unknown_cache_requests=1,estimated_requests=1,cache_write_premium_usd=.01)
+        hint=velox.endpoint_cost_bar_tooltip(row,'1 year')
+        for text in ('last','Cache writes: $0.01','missing prices','Cache counts missing','estimated token'):
+            self.assertIn(text.lower(),hint.lower())
+
+    def test_long_endpoint_label_uses_one_stable_row_tooltip_identity(self) -> None:
+        panel=self.panel();value=self.costs(1);value['endpoints'][0]['label']='Very long endpoint '*50
+        with mock.patch.object(panel.widgets,'_queue_tooltip') as queue:
+            panel._draw_dashboard_cost_card(velox.Rect(0,0,500,280),value)
+        rows=[c for c in queue.call_args_list if c.args[0].startswith('dashboard:cost-bars:')]
+        self.assertEqual(len(rows),1);self.assertIn(value['endpoints'][0]['label'],rows[0].args[2])
+
+
+class CostPeriodAsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def panel(self, reader: Callable[...,dict[str,Any]]) -> Panels:
+        panel=object.__new__(velox.Panels);panel.state=velox.UIState()
+        panel.services=SimpleNamespace(monitor=SimpleNamespace(cost_statistics=reader))
+        panel._observe_background_task=lambda task:None
+        return panel
+
+    async def test_changed_period_waits_for_one_reader_and_never_labels_old_total_as_new(self) -> None:
+        entered=threading.Event();release=threading.Event();calls=[]
+        def read(seconds):
+            calls.append(seconds);entered.set()
+            if not release.wait(5):raise TimeoutError('fixture released late')
+            return {'total_usd':seconds,'window_seconds':seconds}
+        panel=self.panel(read)
+        try:
+            self.assertEqual(panel._dashboard_cost_statistics(),{'status':'loading'})
+            self.assertTrue(await asyncio.to_thread(entered.wait,3))
+            panel.state.dashboard_cost_period='1 year'
+            for _ in range(50):self.assertEqual(panel._dashboard_cost_statistics(),{'status':'loading'})
+            self.assertEqual(calls,[86400])
+            release.set();await panel._dashboard_cost_entry['task']
+            self.assertEqual(panel._dashboard_cost_statistics(),{'status':'loading'})
+            await panel._dashboard_cost_entry['task']
+            result=panel._dashboard_cost_statistics()
+            self.assertEqual(result['total_usd'],365*86400);self.assertEqual(calls,[86400,365*86400])
+        finally:
+            release.set()
+            task=panel._dashboard_cost_entry['task']
+            if task is not None:await asyncio.gather(task,return_exceptions=True)
+
+    async def test_completed_query_refresh_is_rate_limited(self) -> None:
+        calls=[];panel=self.panel(lambda seconds:(calls.append(seconds) or {'total_usd':3}))
+        panel._dashboard_cost_statistics();await panel._dashboard_cost_entry['task']
+        panel._dashboard_cost_statistics()
+        for _ in range(100):self.assertEqual(panel._dashboard_cost_statistics()['total_usd'],3)
+        self.assertEqual(calls,[86400])
+
+
+class ChecklistArrowSpacingTests(unittest.TestCase):
+    def test_extra_gap_and_stem_preserve_trunk_and_status_indentation(self) -> None:
+        w=ChecklistRenderingTests.widgets();rows=ChecklistRenderingTests.rows('verified')
+        with mock.patch.object(w,'clipped_text',wraps=w.clipped_text) as text,\
+             mock.patch.object(w,'_draw_table_tree_connector',wraps=w._draw_table_tree_connector) as branch:
+            w.table_view('tree',velox.Rect(0,0,830,250),velox.Panels._expert_mode_table_columns(),rows)
+        rects={c.args[1]:c.args[0] for c in text.call_args_list};child=next(c for c in branch.call_args_list if c.args[2].get('tree_branch'))
+        cell,indent,_=child.args;trunk=cell.x+10+w._text_width('C');tip=rects['C1.1'].x-18
+        previous_indent=max(26,w._text_width('C')+14);old_tip=cell.x+10+previous_indent-8
+        self.assertEqual(tip-old_tip,4)
+        self.assertEqual(rows[1]['status']['indent'],10)
+        self.assertEqual(rects['C1'].x+w._text_width('C'),trunk)
+        self.assertEqual(rects['Implementation step'].x,rects['Requirement'].x)
+
+    def test_step_id_still_fits_id_cell_at_default_text_metrics(self) -> None:
+        w=ChecklistRenderingTests.widgets();rows=ChecklistRenderingTests.rows('done')
+        with mock.patch.object(w,'clipped_text',wraps=w.clipped_text) as text:
+            w.table_view('tree',velox.Rect(0,0,830,250),velox.Panels._expert_mode_table_columns(),rows)
+        child=next(c for c in text.call_args_list if c.args[1]=='C1.1')
+        self.assertGreaterEqual(child.args[0].w,w._text_width('C1.1'))
 
 
 def main() -> None:
