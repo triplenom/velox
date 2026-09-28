@@ -291,8 +291,8 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 315
-BACKWARD_COMPATIBLE_VERSION = 315
+CURRENT_VERSION = 316
+BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
 WINDOW_TITLE_SUFFIX = f"[V{SOURCE_REVISION}]"
@@ -4331,6 +4331,7 @@ ENDPOINT_RATE_LIMIT_WINDOW_SECONDS = 60.0
 # Standard USD / million-token list prices checked 2026-09-27. Editable per endpoint.
 # https://developers.openai.com/api/docs/pricing
 # https://novita.ai/pricing and the corresponding live model-detail pages.
+ENDPOINT_PRICE_LABELS = ("Input $ / 1M", "Cache $ / 1M", "Output $ / 1M")
 ENDPOINT_PRICE_FIELDS = (
     "input_price_usd_per_million", "cached_input_price_usd_per_million",
     "output_price_usd_per_million",
@@ -53473,7 +53474,7 @@ CHAT_LIST_MAX_WIDTH_FRACTION = 0.60
 CHAT_LIST_ROW_RIGHT_GUTTER_PX = 20
 CHAT_MAIN_WIDTH_MIN = 420
 CHAT_DIVIDER_HOVER_HALF_PX = 4
-CHAT_COMPOSER_HEIGHT_DEFAULT = 390
+CHAT_COMPOSER_HEIGHT_DEFAULT = 488  # 390 * 1.25, rounded to a whole pixel.
 CALENDAR_CHAT_COMPOSER_HEIGHT_DEFAULT = 300
 CHAT_COMPOSER_HEIGHT_MIN = 180
 CHAT_COMPOSER_HEIGHT_MAX = 900
@@ -55053,6 +55054,9 @@ TEXT_GEOMETRY_ADMISSION_MAX = 512
 # =============================================================================
 
 
+MINIMIZED_UI_POLL_SECONDS = 0.1
+
+
 class SDLHost:
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -55067,6 +55071,8 @@ class SDLHost:
         self._cursor_cache: dict[str, Any] = {}
         self._cursor_kind: str | None = None
         self._window_title: str = ""
+        self.minimized = False
+        self.window_id = 0
 
     def init(self) -> None:
         # Feature: create single native desktop window using PySDL3; no browser, no DOM, no HTML/CSS.
@@ -55092,6 +55098,9 @@ class SDLHost:
                 sdl.SDL_SetWindowPosition(self.window, int(self.x), int(self.y))
             except Exception:
                 pass
+        get_id = getattr(sdl, "SDL_GetWindowID", None)
+        if callable(get_id):
+            self.window_id = int(get_id(self.window))
         self._set_window_icon()
         driver = self._choose_renderer_driver()
         self.renderer = sdl.SDL_CreateRenderer(self.window, driver.encode() if driver else None)
@@ -55226,8 +55235,9 @@ class SDLHost:
         return None
 
     def update_window_size(self) -> None:
-        # Feature: renderer adapts to window resize.
-        if not self.window or sdl is None:
+        # Minimized native geometry can be zero or offscreen. Retain the last
+        # visible geometry for persistence and for the first restored frame.
+        if not self.window or sdl is None or self.minimized:
             return
         w = ctypes.c_int()
         h = ctypes.c_int()
@@ -55239,7 +55249,7 @@ class SDLHost:
         self.height = max(1, int(h.value))
 
     def update_window_position(self) -> None:
-        if sdl is None or not self.window:
+        if sdl is None or not self.window or self.minimized:
             return
         if not hasattr(sdl, "SDL_GetWindowPosition"):
             return
@@ -55253,6 +55263,7 @@ class SDLHost:
         self.y = int(y.value)
 
     def current_geometry(self) -> dict[str, int | None]:
+        self._refresh_minimized_state()
         self.update_window_size()
         self.update_window_position()
         return {"window_width": self.width, "window_height": self.height, "window_x": self.x, "window_y": self.y}
@@ -55320,17 +55331,69 @@ class SDLHost:
                 pass
         self._cursor_kind = kind
 
+    def _refresh_minimized_state(self) -> None:
+        """Query on the SDL/UI thread; events remain the fallback for old bindings."""
+        get_flags = getattr(sdl, "SDL_GetWindowFlags", None)
+        flag = getattr(sdl, "SDL_WINDOW_MINIMIZED", 0)
+        if self.window and callable(get_flags) and flag:
+            try:
+                self.minimized = bool(int(get_flags(self.window)) & int(flag))
+            except (TypeError, ValueError, OSError):
+                pass
+
+    @staticmethod
+    def _release_input(input_state: UIInput) -> None:
+        # Release can occur outside our window. Never keep a stuck drag/modifier
+        # or replay a paste/Enter that preceded minimize or focus loss.
+        input_state.suppress_for_background_overlay()
+        input_state.ctrl_down = input_state.cmd_down = input_state.shift_down = False
+
+    def _handle_window_event(self, event: Any, input_state: UIInput) -> bool:
+        actions = {
+            getattr(sdl, "SDL_EVENT_WINDOW_MINIMIZED", -101): "minimize",
+            getattr(sdl, "SDL_EVENT_WINDOW_RESTORED", -102): "restore",
+            getattr(sdl, "SDL_EVENT_WINDOW_MAXIMIZED", -103): "restore",
+            getattr(sdl, "SDL_EVENT_WINDOW_CLOSE_REQUESTED", -104): "close",
+            getattr(sdl, "SDL_EVENT_WINDOW_FOCUS_LOST", -105): "focus_lost",
+        }
+        action = actions.get(event.type)
+        if action is None:
+            return False
+        event_id = int(getattr(getattr(event, "window", None), "windowID", 0) or 0)
+        if self.window_id and event_id and event_id != self.window_id:
+            return True
+        if action == "close":
+            input_state.quit = True
+            self.running = False
+        elif action == "minimize":
+            self.minimized = True
+            self._release_input(input_state)
+        elif action == "restore":
+            self.minimized = False
+        else:
+            # Being unfocused is NOT minimized. A visible background window
+            # must still update and show agent progress.
+            self._release_input(input_state)
+        return True
+
     def poll_events(self, input_state: UIInput) -> None:
         # Feature: mouse, keyboard, clipboard copy, scroll wheel, and Ctrl/Cmd+Enter input are handled through SDL events.
         if sdl is None:
             return
         input_state.begin_frame()
+        self._refresh_minimized_state()
+        if self.minimized:
+            self._release_input(input_state)
         event = sdl.SDL_Event()
         while sdl.SDL_PollEvent(ctypes.byref(event)):
             et = event.type
             if et == getattr(sdl, "SDL_EVENT_QUIT", -1):
                 input_state.quit = True
                 self.running = False
+            elif self._handle_window_event(event, input_state):
+                continue
+            elif self.minimized:
+                continue
             elif et == getattr(sdl, "SDL_EVENT_MOUSE_MOTION", -2):
                 next_x = int(getattr(event.motion, "x", input_state.mouse_x))
                 next_y = int(getattr(event.motion, "y", input_state.mouse_y))
@@ -55385,7 +55448,12 @@ class SDLHost:
                 key = getattr(event.key, "key", 0)
                 mod = getattr(event.key, "mod", 0)
                 self._apply_key(input_state, key, mod, False)
-        self.update_window_size()
+        self._refresh_minimized_state()
+        if self.minimized:
+            self._release_input(input_state)
+        else:
+            self.update_window_size()
+            self.update_window_position()
 
     def _apply_key(self, input_state: UIInput, key: Any, mod: Any, down: bool) -> None:
         if sdl is None:
@@ -70704,7 +70772,8 @@ class Panels:
                 content = Rect(body.x, body.y - scroll_y, max(1, body.w - 14), content_h)
                 self.r.push_clip(body)
 
-                label_w = min(170, max(118, int(content.w * 0.18)))
+                label_w = max(min(170, max(118, int(content.w * 0.18))),
+                              max(self.widgets._text_width(label) for label in ENDPOINT_PRICE_LABELS) + 8)
                 field_x = content.x + label_w + 10
                 full_w = max(1, content.x + content.w - field_x)
                 y = content.y
@@ -70814,7 +70883,7 @@ class Panels:
                     tooltip="Shown while editing this endpoint. Errors, logs, exported debug reports, and header previews still redact the value.",
                 )
                 text_row("modal.endpoint.model", "Model", "model", "provider/model-id")
-                for price_key, price_label in zip(ENDPOINT_PRICE_FIELDS, ("Input / 1M", "Cache / 1M", "Output / 1M")):
+                for price_key, price_label in zip(ENDPOINT_PRICE_FIELDS, ENDPOINT_PRICE_LABELS):
                     text_row("modal.endpoint." + price_key, price_label, price_key, "Blank = unpriced; 0 = free",
                              tooltip="USD per million tokens. Input means uncached input; cache means cache reads. "
                              "List prices checked 2026-09-27. Rates are editable for every endpoint. "
@@ -79393,7 +79462,7 @@ class Panels:
     @staticmethod
     def _dashboard_summary_card_rects(rect: Rect, card_h: int, *, min_standard_width: int = 0) -> list[Rect]:
         gap = 12
-        groups = [(.5, 1.5, 1., 2.)] if rect.w >= max(1450, 5 * min_standard_width + 36) else ([(.5, 1.5), (1., 2.)] if rect.w >= 760 else [(1.,)] * 4)
+        groups = [(.5, 1., 1.5, 2.)] if rect.w >= max(1450, 5 * min_standard_width + 36) else ([(.5, 1.), (1.5, 2.)] if rect.w >= 760 else [(1.,)] * 4)
         cards: list[Rect] = []
         for row, weights in enumerate(groups):
             usable = max(1, rect.w - gap * (len(weights) - 1))
@@ -79477,7 +79546,7 @@ class Panels:
         self.widgets._scrollbar_draw(wid, chart, scroll, total_h)
 
     def _draw_agent_summary_cards(self, rect: Rect, stats: dict[str, Any]) -> int:
-        """Four cards, weighted 0.5 : 1.5 : 1 : 2 on a full-width Dashboard."""
+        """Four cards, weighted 0.5 : 1 : 1.5 : 2 on a full-width Dashboard."""
         gap = 12
         # Keep the pre-bar-chart height. Width weights must not enlarge cards
         # vertically; additional cost bars use the existing chart scrollbar.
@@ -79568,10 +79637,19 @@ class Panels:
             (f"{float(percentages.get('cancelled', 0.0) or 0.0):.0f}% Cancelled ({cancelled:,})", Palette.warn, f"Cancelled: {cancelled:,}"),
         ]
 
+        outcomes_body = self._draw_agent_metric_card(cards[1], "Task outcomes")
+        ring, legend_x, legend_w = ring_layout(outcomes_body)
+        self._draw_ring_chart(
+            ring, [(completed, Palette.ok), (failed, Palette.danger), (cancelled, Palette.warn)],
+            center_text=f"{float(percentages.get('completed', 0.0) or 0.0):.0f}%",
+            center_tooltip=f"Completion rate across {terminal_tasks:,} terminal Tasks",
+        )
+        draw_bullet_lines(outcomes_body, legend_x, legend_w, outcome_lines)
+
         input_tokens = int(stats.get("input_tokens", 0) or 0)
         output_tokens = int(stats.get("output_tokens", 0) or 0)
         total_tokens = int(stats.get("total_tokens", 0) or 0)
-        tokens_body = self._draw_agent_metric_card(cards[1], "Token usage")
+        tokens_body = self._draw_agent_metric_card(cards[2], "Token usage")
         token_ring, token_x, token_w = ring_layout(tokens_body)
         self._draw_ring_chart(
             token_ring, [(input_tokens, Palette.accent), (output_tokens, Palette.accent2)],
@@ -79584,15 +79662,6 @@ class Panels:
             (f"Output {output_tokens:,}", Palette.accent2, f"Output tokens: {output_tokens:,}"),
             (f"Total {total_tokens:,}", Palette.text, f"Total tokens: {total_tokens:,}"),
         ])
-
-        outcomes_body = self._draw_agent_metric_card(cards[2], "Task outcomes")
-        ring, legend_x, legend_w = ring_layout(outcomes_body)
-        self._draw_ring_chart(
-            ring, [(completed, Palette.ok), (failed, Palette.danger), (cancelled, Palette.warn)],
-            center_text=f"{float(percentages.get('completed', 0.0) or 0.0):.0f}%",
-            center_tooltip=f"Completion rate across {terminal_tasks:,} terminal Tasks",
-        )
-        draw_bullet_lines(outcomes_body, legend_x, legend_w, outcome_lines)
 
         self._draw_dashboard_cost_card(cards[3], stats.get("costs", stats.get("costs_24h", {})) or {})
         return row_count * card_h + (row_count - 1) * gap
@@ -80598,6 +80667,62 @@ class VeloxApp:
         self.widgets = Widgets(self.renderer, self.font, self.ui_state, self.layout_cache, self.code_font, self.bold_font, self.italic_font, self.bold_italic_font)
         self.panels = Panels(self.widgets, self.ui_state, self.services)
 
+    def _suspend_ui_interactions(self) -> None:
+        """Discard transient pointer actions, never drafts, selections or tasks."""
+        state = self.ui_state
+        SDLHost._release_input(state.input)
+        state.text_drag_widget = None
+        state.drag_scrollbar_id = None
+        state.table_resize_state = None
+        state.file_picker_resize_state = None
+        state.chat_column_divider_dragging = False
+        state.composer_divider_dragging = ""
+        state.calendar_divider_dragging = ""
+        state.vault_divider_dragging = False
+        state.calendar_drag_active = False
+        state.calendar_drag_item_id = None
+        state.tooltip = None
+        # Finalize an edited settings field once. Runtime persistence and
+        # queued context edits continue even without any draw calls.
+        active_widget = state.active_widget
+        try:
+            state.active_widget = None
+            if self.panels and isinstance(state.config_draft, dict):
+                self.panels._autosave_settings_if_changed(state.config_draft)
+        finally:
+            # Restore keyboard focus along with the window; only pointer drags
+            # are discarded, so typing can continue without a second click.
+            state.active_widget = active_widget
+
+    async def _run_ui_iteration(self, frame_delay: float) -> None:
+        assert self.sdl_host
+        start = time.perf_counter()
+        self.sdl_host.poll_events(self.ui_state.input)
+        if not self.sdl_host.running or self.ui_state.input.quit:
+            self.sdl_host.running = False
+            return
+        if self.sdl_host.minimized:
+            if not getattr(self, "_ui_render_suspended", False):
+                self._suspend_ui_interactions()
+                self._ui_render_suspended = True
+            if self.panels:
+                self.panels._pump_context_autosave()
+            # Scheduling, agents, tools, network responses and durable writes
+            # remain alive; only presentation/layout and UI refresh are idle.
+            await self.run_background_ticks()
+            await asyncio.sleep(MINIMIZED_UI_POLL_SECONDS)
+            return
+        self._ui_render_suspended = False
+        self.ui_state.note_input_activity()
+        await self.handle_events()
+        if not self.sdl_host.running:
+            return
+        await self.run_background_ticks()
+        draw_start = time.perf_counter()
+        self.draw_frame()
+        self._update_perf_stats(time.perf_counter() - start, time.perf_counter() - draw_start)
+        await asyncio.sleep(max(0.0, frame_delay - (time.perf_counter() - start)))
+
     async def run(self) -> None:
         import contextlib
         shutdown_errors: list[BaseException] = []
@@ -80621,17 +80746,7 @@ class VeloxApp:
             config = self.storage.load_config()
             frame_delay = 1.0 / max(1, int(config["ui"].get("target_fps", 60)))
             while self.sdl_host.running:
-                start = time.perf_counter()
-                self.sdl_host.poll_events(self.ui_state.input)
-                self.ui_state.note_input_activity()
-                await self.handle_events()
-                await self.run_background_ticks()
-                draw_start = time.perf_counter()
-                self.draw_frame()
-                draw_elapsed = time.perf_counter() - draw_start
-                self._update_perf_stats(time.perf_counter() - start, draw_elapsed)
-                elapsed = time.perf_counter() - start
-                await asyncio.sleep(max(0.0, frame_delay - elapsed))
+                await self._run_ui_iteration(frame_delay)
         finally:
             original_failure = sys.exc_info()[1]
             async with cleanup_step('settings'):
@@ -80972,6 +81087,8 @@ class VeloxApp:
     def draw_frame(self) -> None:
         """Draw Chat, Calendar, Agents, Vault, or Settings using the shared PySDL3 chrome."""
         assert self.renderer and self.panels and self.widgets and self.sdl_host
+        if self.sdl_host.minimized:
+            return
         self.renderer.begin_frame()
         ww, wh = self.sdl_host.width, self.sdl_host.height
         line_h = self.font.line_h if self.font else 28
