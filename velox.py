@@ -93,6 +93,7 @@ from email.utils import format_datetime, getaddresses, parsedate_to_datetime
 
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -292,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 311
+CURRENT_VERSION = 312
 BACKWARD_COMPATIBLE_VERSION = 311
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -4381,7 +4382,7 @@ ENDPOINT_PRICE_FIELDS = (
 TOKEN_COST_SUM_FIELDS = (
     "input_usd", "cached_input_usd", "output_usd", "cache_write_premium_usd",
     "total_usd", "unpriced_requests", "estimated_requests", "unknown_cache_requests",
-    "theoretical_requests", "requests", "input_tokens", "cached_input_tokens", "output_tokens",
+    "requests", "input_tokens", "cached_input_tokens", "output_tokens",
 )
 
 
@@ -4394,7 +4395,7 @@ def endpoint_default_token_prices(model_type: str, provider: str) -> dict[str, f
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH): (0.15, 0.03, 0.50),
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT): (0.15, 0.016, 0.47),
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP): (0.44, 0.028, 1.32),
-        # Local inference has no token invoice. This is a clearly marked Novita proxy.
+        # Use the same editable token rates for local and hosted inference.
         (ENDPOINT_PROVIDER_VLLM, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP): (0.44, 0.028, 1.32),
     }.get((provider, model_type), (None, None, None))
     return dict(zip(ENDPOINT_PRICE_FIELDS, rates))
@@ -4414,7 +4415,6 @@ def endpoint_cost_pricing_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
             rate = None
         rates[key] = rate if rate is not None and math.isfinite(rate) and rate >= 0 else None
     label = ENDPOINT_MODEL_TYPE_LABELS.get(family, model) if family != ENDPOINT_MODEL_TYPE_CUSTOM else model
-    theoretical = provider == ENDPOINT_PROVIDER_VLLM and family == ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP
     tier = "default"
     try:
         extra = parse_endpoint_extra_body(str(profile.get("extra_body_json") or ""))
@@ -4427,7 +4427,7 @@ def endpoint_cost_pricing_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
         "endpoint_label": str(profile.get("profile_label") or profile.get("label") or model),
         "endpoint_type": provider + ":" + (model if family == ENDPOINT_MODEL_TYPE_CUSTOM else family),
         "type_label": ENDPOINT_PROVIDER_LABELS.get(provider, provider) + " / " + label,
-        "theoretical": theoretical, "service_tier": tier,
+        "service_tier": tier,
         "gpt6_rules": provider == ENDPOINT_PROVIDER_OPENAI and family in ENDPOINT_GPT_6_MODEL_TYPES,
     }
 
@@ -4465,7 +4465,7 @@ def estimate_token_cost(
         "cache_write_premium_usd": premium, "total_usd": sum(amounts) + premium,
         "unpriced_requests": int(unpriced), "estimated_requests": int(estimated),
         "unknown_cache_requests": int(inp > 0 and not cache_known),
-        "theoretical_requests": int(bool(pricing.get("theoretical"))), "requests": 1,
+        "requests": 1,
         "input_tokens": inp, "cached_input_tokens": cache, "output_tokens": out,
         "long_context": long_context, "service_tier": tier, "cache_write_tokens": writes,
     }
@@ -4477,8 +4477,12 @@ def token_cost_label(cost: dict[str, Any] | None) -> str:
     missing = bool(cost.get("unpriced_requests"))
     if missing and not amount:
         return "Unpriced"
-    text = ("<$0.00000001" if 0 < amount < 0.000000005 else
-            f"${amount:,.4f}" if amount >= 0.0001 or not amount else f"${amount:.8f}".rstrip("0"))
+    # Round for display only. Summation and sorting retain the full token cost.
+    # Decimal avoids binary-float surprises at exact half-cent boundaries.
+    with localcontext() as context:
+        context.prec = max(28, len(str(int(amount))) + 3)
+        rounded = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    text = f"${rounded:,.2f}"
     return text + (" + ?" if missing else "")
 
 
@@ -4489,11 +4493,11 @@ def token_cost_tooltip(cost: dict[str, Any] | None) -> str:
                        ("estimated_requests", "estimated usage")):
         if cost.get(key):
             flags.append(f"{int(cost[key])} {label}")
-    qualifier = " (includes theoretical DSV4F/Novita proxy)" if cost.get("theoretical_requests") else ""
     return "\n".join([
-        "Estimated token cost (USD): " + token_cost_label(cost) + qualifier,
-        f"Input ${float(cost.get('input_usd') or 0):.6f} | Cache read ${float(cost.get('cached_input_usd') or 0):.6f} | Output ${float(cost.get('output_usd') or 0):.6f}",
-        f"Reported cache-write premium +${float(cost.get('cache_write_premium_usd') or 0):.6f}; own requests only, excludes child rows.",
+        "Estimated token cost (USD): " + token_cost_label(cost),
+        " | ".join(label + " " + token_cost_label({"total_usd": cost.get(key)})
+                   for key, label in (("input_usd", "Input"), ("cached_input_usd", "Cache read"), ("output_usd", "Output"))),
+        "Reported cache-write premium +" + token_cost_label({"total_usd": cost.get("cache_write_premium_usd")}) + "; own requests only, excludes child rows.",
         ("; ".join(flags) + ". ") if flags else "Provider usage; output includes billed reasoning.",
         "Frozen per-request rates. Excludes tool fees, taxes, regional premiums, unreported cache writes and discounts.",
     ])
@@ -5652,7 +5656,7 @@ def normalize_endpoint_profile(profile: Any, *, location: str = "endpoint profil
     out["system_prompt_addon"] = str(out.get("system_prompt_addon") or "").strip()
     for field_name in ENDPOINT_PRICE_FIELDS:
         if isinstance(out.get(field_name), bool):
-            raise ValueError(f"{field_name} must be a nonnegative finite USD price or blank")
+            raise ValueError(f"{field_name} must be a nonnegative finite price or blank")
         out[field_name] = _optional_finite_float(out.get(field_name), field_name, minimum=0.0)
     return out
 
@@ -56671,8 +56675,8 @@ class SDLHost:
     def set_cursor_kind(self, kind: str) -> None:
         """Set a native cursor when SDL exposes system cursors.
 
-        Table column resize uses this to show an east/west resize cursor over
-        draggable dividers. The method is intentionally best-effort so tests and
+        Table dividers and file-picker edges/corners request directional resize
+        cursors. The method is intentionally best-effort so tests and
         platforms without the cursor API keep running.
         """
         if sdl is None:
@@ -56692,6 +56696,8 @@ class SDLHost:
             "arrow": ["SDL_SYSTEM_CURSOR_DEFAULT", "SDL_SYSTEM_CURSOR_ARROW"],
             "resize_x": ["SDL_SYSTEM_CURSOR_EW_RESIZE", "SDL_SYSTEM_CURSOR_SIZEWE", "SDL_SYSTEM_CURSOR_HORIZONTAL"],
             "resize_y": ["SDL_SYSTEM_CURSOR_NS_RESIZE", "SDL_SYSTEM_CURSOR_SIZENS", "SDL_SYSTEM_CURSOR_VERTICAL"],
+            "resize_nwse": ["SDL_SYSTEM_CURSOR_NWSE_RESIZE", "SDL_SYSTEM_CURSOR_SIZENWSE"],
+            "resize_nesw": ["SDL_SYSTEM_CURSOR_NESW_RESIZE", "SDL_SYSTEM_CURSOR_SIZENESW"],
             "text": ["SDL_SYSTEM_CURSOR_TEXT", "SDL_SYSTEM_CURSOR_IBEAM"],
             "ibeam": ["SDL_SYSTEM_CURSOR_TEXT", "SDL_SYSTEM_CURSOR_IBEAM"],
             "hand": ["SDL_SYSTEM_CURSOR_POINTER", "SDL_SYSTEM_CURSOR_HAND", "SDL_SYSTEM_CURSOR_LINK"],
@@ -62139,6 +62145,9 @@ class UIState:
         self.file_picker_selection_anchor: str = ""
         self.file_picker_attachment_owner: tuple[str, str] | None = None
         self.file_picker_manual: str = ""
+        # Session-only geometry; resizing does not change the saved-data format.
+        self.file_picker_rect: Rect | None = None
+        self.file_picker_resize_state: dict[str, Any] | None = None
         self.table_sort: dict[str, tuple[str, bool]] = {}
         self.table_column_widths: dict[str, dict[str, int]] = {}
         self.table_resize_state: dict[str, Any] | None = None
@@ -62786,6 +62795,15 @@ class Widgets:
             half = max(4, min(7, rect.h // 3))
             for dx in range(0, half + 1):
                 self.renderer.draw_line(cx - half // 2 + dx, cy - half + dx, cx - half // 2 + dx, cy + half - dx, color, overlay=overlay)
+        elif kind in {"select_all", "clear_selection"}:
+            # A checked/empty selection box, not font-dependent Unicode glyphs.
+            box = Rect(rect.x + 4, rect.y + 4, max(4, rect.w - 8), max(4, rect.h - 8))
+            self.renderer.draw_round_outline(box, 3, color, overlay=overlay)
+            if kind == "select_all":
+                self.renderer.draw_line(box.x + 3, cy, cx - 1, box.y + box.h - 4, color, overlay=overlay)
+                self.renderer.draw_line(cx - 1, box.y + box.h - 4, box.x + box.w - 3, box.y + 4, color, overlay=overlay)
+            else:
+                self.renderer.draw_line(box.x + 4, cy, box.x + box.w - 4, cy, color, overlay=overlay)
         elif kind == "cross":
             self.renderer.draw_line(cx - 3, cy - 3, cx + 3, cy + 3, color, overlay=overlay)
             self.renderer.draw_line(cx + 3, cy - 3, cx - 3, cy + 3, color, overlay=overlay)
@@ -64461,6 +64479,29 @@ class Widgets:
         finally:
             self.renderer.pop_clip()
 
+    def _draw_table_tree_connector(self, cell: Rect, indent: int, value: dict[str, Any]) -> None:
+        """Draw connected two-level ID branches, including through clipped rows."""
+        if cell.w < 28 or cell.h < 12:
+            return
+        trunk_x = cell.x + 12
+        self.renderer.push_clip(cell)
+        try:
+            if value.get("tree_branch") and indent >= 20:
+                middle_y = cell.y + cell.h // 2
+                bottom_y = middle_y if value.get("tree_last") else cell.y + cell.h
+                self.renderer.draw_line(trunk_x, cell.y, trunk_x, bottom_y, Palette.muted)
+                # Eight pixels of clear space between the arrow tip and ID text.
+                tip_x = cell.x + 10 + indent - 8
+                self.renderer.draw_line(trunk_x, middle_y, tip_x, middle_y, Palette.muted)
+                self.renderer.draw_line(tip_x - 4, middle_y - 3, tip_x, middle_y, Palette.muted)
+                self.renderer.draw_line(tip_x - 4, middle_y + 3, tip_x, middle_y, Palette.muted)
+            elif value.get("tree_children"):
+                # Start below the parent's label, never draw through its glyphs.
+                self.renderer.draw_line(trunk_x, cell.y + cell.h - 5,
+                                        trunk_x, cell.y + cell.h, Palette.muted)
+        finally:
+            self.renderer.pop_clip()
+
     def table_view(
         self,
         widget_id: str,
@@ -64596,12 +64637,24 @@ class Widgets:
                 self.state.table_sort[widget_id] = (sort_key, sort_asc)
                 self.inp.mouse_consumed = True
             label = str(c.get("title", key)).upper()
-            self.clipped_text(
-                Rect(cell.x + 10, cell.y + 2, max(1, cell.w - 30), max(1, cell.h - 4)),
-                label, Palette.muted, align="left", tooltip=label,
-            )
-            if sort_key == key:
-                self._draw_shape("arrow_down" if sort_asc else "arrow_up", Rect(cell.x + cell.w - 22, cell.y + cell.h // 2 - 6, 12, 12), Palette.accent)
+            # Use the same alignment and horizontal insets as the values. Put
+            # the sort marker opposite right-aligned labels so it cannot move
+            # their right edge away from the numeric values below them.
+            align = str(c.get("align", "left"))
+            text_rect = Rect(cell.x + 10, cell.y + 2, max(1, cell.w - 18), max(1, cell.h - 4))
+            sort_rect = None
+            if sort_key == key and bool(c.get("sortable", True)):
+                sort_rect = Rect(cell.x + (10 if align == "right" else cell.w - 22),
+                                 cell.y + cell.h // 2 - 6, 12, 12)
+                if align == "right":
+                    text_rect = Rect(text_rect.x + 18, text_rect.y, max(1, text_rect.w - 18), text_rect.h)
+                elif align == "center":
+                    text_rect = Rect(text_rect.x + 18, text_rect.y, max(1, text_rect.w - 36), text_rect.h)
+                else:
+                    text_rect = Rect(text_rect.x, text_rect.y, max(1, text_rect.w - 18), text_rect.h)
+            self.clipped_text(text_rect, label, Palette.muted, align=align, tooltip=label)
+            if sort_rect is not None:
+                self._draw_shape("arrow_down" if sort_asc else "arrow_up", sort_rect, Palette.accent)
             if x > header.x:
                 self.renderer.draw_line(x, header.y, x, header.y + header.h + body.h, theme_alpha(Palette.border, 120))
             x += w
@@ -64771,10 +64824,8 @@ class Widgets:
                     display_value = value.get("label", "") if isinstance(value, dict) else value
                     display_text = str(display_value)
                     indent = min(max(0, int(value.get("indent") or 0)), max(0, cell.w - 28)) if isinstance(value, dict) else 0
-                    if indent and isinstance(value, dict) and value.get("tree_branch"):
-                        branch_x, branch_y = cell.x + 12, cell.y + cell.h // 2
-                        self.renderer.draw_line(branch_x, cell.y + 3, branch_x, branch_y, Palette.muted)
-                        self.renderer.draw_line(branch_x, branch_y, branch_x + max(2, indent - 7), branch_y, Palette.muted)
+                    if isinstance(value, dict) and (value.get("tree_branch") or value.get("tree_children")):
+                        self._draw_table_tree_connector(cell, indent, value)
                     self.clipped_text(
                         Rect(cell.x + 10 + indent, cell.y + 2, max(1, cell.w - 18 - indent), max(1, cell.h - 4)),
                         display_text, color if isinstance(color, Color) else Palette.text,
@@ -65200,6 +65251,67 @@ class Widgets:
         self._scrollbar_draw("fp.tree", body, scroll, content_h)
         return chosen
 
+    def _file_picker_geometry(self, viewport: Rect) -> Rect:
+        """Keep the modal on screen and resize its edges without stealing child clicks."""
+        available = Rect(viewport.x + 16, viewport.y + 16,
+                         max(1, viewport.w - 32), max(1, viewport.h - 32))
+        min_w, min_h = min(640, available.w), min(400, available.h)
+        current = self.state.file_picker_rect
+        if current is None:
+            # Previous default was 920 x 700. Use 150% in each dimension,
+            # limited only by the available viewport.
+            width, height = min(1380, available.w), min(1050, available.h)
+            current = Rect(available.x + (available.w - width) // 2,
+                           available.y + (available.h - height) // 2, width, height)
+        width = int(clamp(current.w, min_w, available.w))
+        height = int(clamp(current.h, min_h, available.h))
+        current = Rect(int(clamp(current.x, available.x, available.x + available.w - width)),
+                       int(clamp(current.y, available.y, available.y + available.h - height)), width, height)
+        drag = self.state.file_picker_resize_state
+        if drag is None and self._can_receive_pointer("fp.resize"):
+            mx, my = self.inp.mouse_x, self.inp.mouse_y
+            # The larger corner targets also cover the bottom-right grip.
+            near = (current.x - 6 <= mx <= current.x + current.w + 6
+                    and current.y - 6 <= my <= current.y + current.h + 6)
+            horizontal = "w" if abs(mx - current.x) <= 10 else "e" if abs(mx - (current.x + current.w)) <= 10 else ""
+            vertical = "n" if abs(my - current.y) <= 10 else "s" if abs(my - (current.y + current.h)) <= 10 else ""
+            edge = vertical + horizontal if near else ""
+            if edge:
+                cursor = ("resize_nwse" if edge in {"nw", "se"} else "resize_nesw" if edge in {"ne", "sw"}
+                          else "resize_x" if horizontal else "resize_y")
+                self.state.requested_cursor = cursor
+                if self.inp.mouse_pressed:
+                    drag = {"edge": edge, "cursor": cursor, "rect": current,
+                            "mouse_x": mx, "mouse_y": my}
+                    self.state.file_picker_resize_state = drag
+                    self.state.active_widget = None
+                    self.inp.mouse_consumed = True
+        if drag is not None:
+            if self.inp.mouse_down or self.inp.mouse_released:
+                start = drag["rect"]
+                dx, dy = self.inp.mouse_x - drag["mouse_x"], self.inp.mouse_y - drag["mouse_y"]
+                left, top, right, bottom = start.x, start.y, start.x + start.w, start.y + start.h
+                # Re-clamp the fixed edge too if the host window changed mid-drag.
+                right = int(clamp(right, available.x + min_w, available.x + available.w))
+                bottom = int(clamp(bottom, available.y + min_h, available.y + available.h))
+                left = int(clamp(left, available.x, right - min_w))
+                top = int(clamp(top, available.y, bottom - min_h))
+                if "w" in drag["edge"]:
+                    left = int(clamp(start.x + dx, available.x, right - min_w))
+                if "e" in drag["edge"]:
+                    right = int(clamp(start.x + start.w + dx, left + min_w, available.x + available.w))
+                if "n" in drag["edge"]:
+                    top = int(clamp(start.y + dy, available.y, bottom - min_h))
+                if "s" in drag["edge"]:
+                    bottom = int(clamp(start.y + start.h + dy, top + min_h, available.y + available.h))
+                current = Rect(left, top, right - left, bottom - top)
+                self.inp.mouse_consumed = True
+                self.state.requested_cursor = drag["cursor"]
+            if not self.inp.mouse_down or self.inp.mouse_released:
+                self.state.file_picker_resize_state = None
+        self.state.file_picker_rect = current
+        return current
+
     def file_picker_modal(self, rect: Rect, scope_id: str | None) -> list[str] | None:
         # Attachment mode exposes checkboxes, Ctrl/Cmd toggles and Shift ranges.
         # Save mode retains its single-destination contract.
@@ -65261,6 +65373,7 @@ class Widgets:
                     return []
                 self.state.file_picker_last_dir = str(destination.parent)
                 self.state.file_picker_open = False
+                self.state.file_picker_resize_state = None
                 self._file_picker_cache.discard()
                 self._file_picker_tree.discard()
                 clear_selection()
@@ -65296,6 +65409,7 @@ class Widgets:
             if parent.is_dir():
                 self.state.file_picker_last_dir = str(parent)
             self.state.file_picker_open = False
+            self.state.file_picker_resize_state = None
             self._file_picker_cache.discard()
             self._file_picker_tree.discard()
             clear_selection()
@@ -65308,12 +65422,12 @@ class Widgets:
             self.state.file_picker_dir = str(last_dir if last_dir.is_dir() else Path.home())
 
         self.renderer.draw_rect(Rect(rect.x, rect.y, rect.w, rect.h), Palette.modal_backdrop)
-        mw = max(320, rect.w - 32) if rect.w < 680 else min(920, max(520, rect.w - 140))
-        mh = max(300, rect.h - 32) if rect.h < 560 else min(700, max(420, rect.h - 140))
-        mx = int(clamp(rect.x + (rect.w - mw) // 2, rect.x + 8, max(rect.x + 8, rect.x + rect.w - mw - 8)))
-        my = int(clamp(rect.y + (rect.h - mh) // 2, rect.y + 8, max(rect.y + 8, rect.y + rect.h - mh - 8)))
-        mrect = Rect(mx, my, mw, mh)
+        mrect = self._file_picker_geometry(rect)
+        mx, my, mw, mh = mrect.x, mrect.y, mrect.w, mrect.h
         self.renderer.draw_card(mrect, radius=22, fill=Palette.panel)
+        for offset in (0, 4, 8):
+            self.renderer.draw_line(mx + mw - 18 + offset, my + mh - 8,
+                                    mx + mw - 8, my + mh - 18 + offset, Palette.muted2)
 
         title = Rect(mx + 24, my + 16, mw - 96, 34)
         title_text = (
@@ -65331,6 +65445,7 @@ class Widgets:
         close_r = Rect(mx + mw - 50, my + 16, 32, 32)
         if self.button("fp.close", close_r, "X") or self.inp.key_escape:
             self.state.file_picker_open = False
+            self.state.file_picker_resize_state = None
             self._file_picker_cache.discard()
             self._file_picker_tree.discard()
             clear_selection()
@@ -65340,7 +65455,7 @@ class Widgets:
             self.inp.mouse_consumed = True
             return None
 
-        header_h = 96 if allow_multi else 88
+        header_h = 62
         footer_h = 76
         footer = Rect(mx + 22, my + mh - footer_h + 18, mw - 44, footer_h - 28)
         body_top = my + header_h
@@ -65353,7 +65468,16 @@ class Widgets:
 
         current_dir = normalize_dir(self.state.file_picker_dir)
         self._draw_shape("folder", Rect(path_bar.x, path_bar.y + 8, 20, 20), Palette.muted2)
-        dir_rect = Rect(path_bar.x + 28, path_bar.y, max(220, path_bar.w - 188), 36)
+        toolbar_right = path_bar.x + path_bar.w
+        clear_rect = Rect(toolbar_right - 36, path_bar.y, 36, 36)
+        all_rect = Rect(clear_rect.x - 44, path_bar.y, 36, 36)
+        divider_x = all_rect.x - 12
+        nav_right = divider_x - 12 if allow_multi else toolbar_right
+        up_w = self.button_width("Up", min_width=66)
+        home_w = self.button_width("Home", min_width=68)
+        up_rect = Rect(nav_right - up_w, path_bar.y, up_w, 36)
+        home_rect = Rect(up_rect.x - 8 - home_w, path_bar.y, home_w, 36)
+        dir_rect = Rect(path_bar.x + 28, path_bar.y, max(1, home_rect.x - path_bar.x - 38), 36)
         self.state.file_picker_dir = self.text_input("fp.dir", dir_rect, self.state.file_picker_dir, "C:/path/to/folder or /path/to/folder")
         if self.state.active_widget == "fp.dir" and self.inp.key_enter:
             typed = Path(self.state.file_picker_dir.strip().strip('"')).expanduser()
@@ -65366,9 +65490,9 @@ class Widgets:
             if typed.is_dir():
                 open_directory(typed)
 
-        if self.button("fp.home", Rect(path_bar.x + path_bar.w - 150, path_bar.y, 68, 36), "Home"):
+        if self.button("fp.home", home_rect, "Home"):
             open_directory(Path.home())
-        if self.button("fp.up", Rect(path_bar.x + path_bar.w - 74, path_bar.y, 66, 36), "Up"):
+        if self.button("fp.up", up_rect, "Up"):
             pth = normalize_dir(self.state.file_picker_dir)
             open_directory(pth.parent if pth.parent != pth else pth)
 
@@ -65381,11 +65505,9 @@ class Widgets:
         file_paths = [str(row["path"]) for row in rows
                       if not row.get("_notice") and not row.get("is_dir") and row.get("path")]
         if allow_multi:
-            self.clipped_text(Rect(mx + 24, my + 54, max(1, mw - 228), 28),
-                              "Checkboxes, Ctrl/Cmd-click or Shift-click.", Palette.muted2,
-                              tooltip="Tick individual files without a modifier. Ctrl/Cmd-click toggles; Shift-click selects a range. Ctrl/Cmd+A selects listed files when the list has focus.")
-            select_all = self.button("fp.all", Rect(mx + mw - 192, my + 52, 94, 30), "Select all",
-                                     enabled=bool(file_paths), tooltip="Select every listed file in this folder, not subfolders.")
+            self.renderer.draw_line(divider_x, path_bar.y + 4, divider_x, path_bar.y + 32, Palette.border)
+            select_all = self.button("fp.all", all_rect, "", icon="select_all",
+                                     enabled=bool(file_paths), tooltip="Select all files in this folder, not subfolders (Ctrl/Cmd+A with the list focused).")
             keyboard_all = bool(self.inp.select_all and self.state.active_widget == "fp.list")
             if select_all or keyboard_all:
                 self.state.file_picker_selected_paths = list(file_paths)
@@ -65394,8 +65516,8 @@ class Widgets:
                 self.state.file_picker_manual = file_paths[0] if len(file_paths) == 1 else ""
                 self.state.active_widget = "fp.list"
                 self.inp.select_all = False
-            if self.button("fp.clear", Rect(mx + mw - 90, my + 52, 66, 30), "Clear",
-                           enabled=bool(self.state.file_picker_selected_paths)):
+            if self.button("fp.clear", clear_rect, "", icon="clear_selection",
+                           enabled=bool(self.state.file_picker_selected_paths), tooltip="Clear file selection."):
                 clear_selection()
                 self.state.active_widget = "fp.list"
 
@@ -65485,6 +65607,7 @@ class Widgets:
         self.state.file_picker_manual = new_manual
         if self.button("fp.cancel", Rect(footer.x + footer.w - 222, footer.y, 100, 36), "Cancel"):
             self.state.file_picker_open = False
+            self.state.file_picker_resize_state = None
             self._file_picker_cache.discard()
             self._file_picker_tree.discard()
             clear_selection()
@@ -66046,6 +66169,7 @@ class Panels:
         )
         self.state.scroll["fp.list"] = 0
         self.state.active_widget = None
+        self.state.file_picker_resize_state = None
         self.state.file_picker_open = True
 
     def _calendar_store(self) -> CalendarStore:
@@ -70244,11 +70368,18 @@ class Panels:
                 "status": {"type": "status_icon", "icon": "check" if item_state in (CHECKLIST_ITEM_DONE, CHECKLIST_ITEM_VERIFIED) else "dot" if item_state == CHECKLIST_ITEM_IN_PROGRESS else "",
                            "label": marker, "color": color, "tooltip": state_label},
                 "requirement_id": {"label": item_id, "color": Palette.muted2 if parent_id else Palette.text,
-                                   "indent": 18 if parent_id else 0, "tree_branch": bool(parent_id), "tooltip": tooltip},
+                                   "indent": 26 if parent_id else 0, "tree_branch": bool(parent_id),
+                                   "tree_children": bool(children and item_id not in collapsed), "tooltip": tooltip},
                 "requirement": {"label": str(row.get("text") or ""), "tooltip": tooltip},
                 "progress": {"label": progress, "tooltip": tooltip},
                 "_tooltip": tooltip,
             })
+        for index, item in enumerate(output):
+            parent_id = item["_parent_id"]
+            if parent_id:
+                item["requirement_id"]["tree_last"] = (
+                    index + 1 == len(output) or output[index + 1]["_parent_id"] != parent_id
+                )
         return output
 
     @staticmethod
@@ -72243,10 +72374,10 @@ class Panels:
                     tooltip="Shown while editing this endpoint. Errors, logs, exported debug reports, and header previews still redact the value.",
                 )
                 text_row("modal.endpoint.model", "Model", "model", "provider/model-id")
-                for price_key, price_label in zip(ENDPOINT_PRICE_FIELDS, ("Input USD / 1M", "Cache USD / 1M", "Output USD / 1M")):
+                for price_key, price_label in zip(ENDPOINT_PRICE_FIELDS, ("Input / 1M", "Cache / 1M", "Output / 1M")):
                     text_row("modal.endpoint." + price_key, price_label, price_key, "Blank = unpriced; 0 = free",
                              tooltip="USD per million tokens. Input means uncached input; cache means cache reads. "
-                             "List prices checked 2026-09-27. Local DSV4F Exp uses a theoretical Novita proxy. "
+                             "List prices checked 2026-09-27. Rates are editable for every endpoint. "
                              "GPT-6 long-context and explicit service-tier multipliers apply automatically. "
                              "Changes affect future requests only. Blank is unknown, not free.")
 
@@ -81199,7 +81330,7 @@ class Panels:
             (f"{float(percentages.get('cancelled', 0.0) or 0.0):.0f}% Cancelled ({cancelled:,})", Palette.warn, f"Cancelled: {cancelled:,}"),
         ])
 
-        cost_body = self._draw_agent_metric_card(cards[3], "Costs / 24h (USD)")
+        cost_body = self._draw_agent_metric_card(cards[3], "Costs / 24h")
         costs = stats.get("costs_24h") or {}
         cost_hint = token_cost_tooltip(costs) + "\nRolling 24 hours; recorded requests survive restarts and Task deletion. Top five endpoint types by cost, not token count."
         if costs.get("error"):
@@ -81837,7 +81968,7 @@ class Panels:
             ("output_tokens", "Output", 150, 150, "right"),
             ("input_tps", "IN t/s", 110, 110, "right"),
             ("generation_tps", "OUT t/s", 110, 110, "right"),
-            ("cost", "Est. USD", 140, 140, "right"),
+            ("cost", "Cost", 140, 140, "right"),
         ]
         preferred_fixed = sum(row[2] for row in fixed_columns)
         minimum_fixed = sum(row[3] for row in fixed_columns)
@@ -81868,7 +81999,7 @@ class Panels:
             {"key": "output_tokens", "title": "Output", "width": 150, "min_width": 150, "fixed_width": 150, "sort_type": "number", "align": "right", "sortable": False},
             {"key": "input_tps", "title": "IN t/s", "width": 110, "min_width": 110, "fixed_width": 110, "sort_type": "number", "align": "right", "sortable": False},
             {"key": "generation_tps", "title": "OUT t/s", "width": 110, "min_width": 110, "fixed_width": 110, "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "cost", "title": "Est. USD", "width": 140, "min_width": 140, "fixed_width": 140, "sort_type": "number", "align": "right", "sortable": False},
+            {"key": "cost", "title": "Cost", "width": 140, "min_width": 140, "fixed_width": 140, "sort_type": "number", "align": "right", "sortable": False},
         ]
         self.state.selected_llm_task_id, action = self.widgets.table_view(
             "dashboard.tasks", chat_table_rect, columns, task_rows,
@@ -82414,6 +82545,7 @@ class VeloxApp:
                 self.ui_state.modal = None
             elif self.ui_state.file_picker_open:
                 self.ui_state.file_picker_open = False
+                self.ui_state.file_picker_resize_state = None
                 self.ui_state.file_picker_save = False
                 self.ui_state.file_picker_save_context = None
             elif self.ui_state.open_dropdown:

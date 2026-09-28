@@ -1635,7 +1635,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('rows.sort(key=self._system_task_row_sort_key)', system_tasks)
 
         summary_cards = self._method_source(velox.Panels, "_draw_agent_summary_cards")
-        for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h (USD)", "Checklist statistics"):
+        for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h", "Checklist statistics"):
             self.assertIn(label, summary_cards)
         self.assertIn("card_h = max(232,", summary_cards)
         self.assertIn("Avg requirements/list", summary_cards)
@@ -2439,7 +2439,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 self.assertAlmostEqual(stats["average_task_seconds"], 70.0)
 
                 panel_source = self._method_source(velox.Panels, "_draw_agent_summary_cards")
-                for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h (USD)", "Checklist statistics"):
+                for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h", "Checklist statistics"):
                     self.assertIn(label, panel_source)
                 self.assertIn("Chat, Agent, Image, and System Tasks", panel_source)
                 self.assertNotIn("Tool call success", panel_source)
@@ -4543,7 +4543,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("SDL_RenderGeometry", ring)
         self.assertIn("outer0", buffers)
         summary = self._method_source(velox.Panels, "_draw_agent_summary_cards")
-        for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h (USD)", "Checklist statistics"):
+        for label in ("Task status", "Token usage", "Task outcomes", "Costs / 24h", "Checklist statistics"):
             self.assertIn(label, summary)
         dialog = self._method_source(velox.Panels, "draw_modals")
         self.assertIn('\"Output\"', dialog)
@@ -19348,7 +19348,7 @@ class TaskInspectorTests(unittest.TestCase):
     def test_cost_card_keeps_underlying_task_type_and_tool_statistics(self) -> None:
         source = inspect.getsource(velox.Panels._draw_agent_summary_cards)
         stats_source = inspect.getsource(velox.LLMTaskMonitor.statistics)
-        self.assertIn('cards[3], "Costs / 24h (USD)"', source)
+        self.assertIn('cards[3], "Costs / 24h"', source)
         self.assertIn('stats.get("costs_24h")', source)
         self.assertNotIn("Task mix", source)
         self.assertIn('"task_types": dict(collections.Counter', stats_source)
@@ -20409,7 +20409,7 @@ class ContextCapacityAndIdleWorkTests(unittest.TestCase):
             self.assertNotIn(forbidden, production)
         for required in (
             "LLMTaskMonitor", "LLMTaskRecord", "CHAT/AGENT TASKS", "SYSTEM TASKS",
-            "TASK TOOL POLICY", "Task status", "Task outcomes", "Costs / 24h (USD)",
+            "TASK TOOL POLICY", "Task status", "Task outcomes", "Costs / 24h",
             "fits_effective_context", "estimate_llm_request_input_tokens", "_draw_card_title_text",
         ):
             self.assertIn(required, production)
@@ -23437,7 +23437,7 @@ class DashboardRawAndTopToolsTests(_DataRootsIsolatedTestMixin, unittest.TestCas
     def test_cost_card_is_top_five_and_uses_table_terms(self) -> None:
         summary = inspect.getsource(velox.Panels._draw_agent_summary_cards)
         dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
-        self.assertIn('self._draw_agent_metric_card(cards[3], "Costs / 24h (USD)")', summary)
+        self.assertIn('self._draw_agent_metric_card(cards[3], "Costs / 24h")', summary)
         self.assertIn("ranked[:5]", summary)
         self.assertIn("token_cost_label", summary)
         self.assertIn("costs_24h", summary)
@@ -34592,7 +34592,7 @@ class _ReviewerWaitFixture(_WriterDataRootsIsolatedTestMixin, unittest.IsolatedA
         checklist = self.raw(cid)
         state, package, _path = velox._make_checklist_review_package(self.registry, self.owner, checklist,
             endpoint_profile_id=self.context().endpoint_profile_id)
-        payload = {"schema": f"checklist_reviewer_context.v{velox.SOURCE_REVISION}", "cycle": prepared["review_cycle"],
+        payload = {"schema": velox.data_schema("checklist_reviewer_context"), "cycle": prepared["review_cycle"],
             "checklist_id": cid, "owner": self.owner, "requirement_ids": [item["id"] for item in state["requirements"]],
             "snapshot_fingerprint": checklist["review_snapshot_fingerprint"],
             "handoff_path": package["handoff_path"], "context_path": package["context_path"]}
@@ -38379,7 +38379,7 @@ class NestedChecklistPresentationTests(_WriterDataRootsIsolatedTestMixin, unitte
         self.assertEqual([row['id'] for row in rows], ['C1', 'C1.1', 'C1.2', 'C2'])
         self.assertEqual([row['_depth'] for row in rows], [0, 1, 1, 0])
         self.assertEqual(state, before)
-        self.assertEqual(rows[1]['requirement_id']['indent'], 18)
+        self.assertEqual(rows[1]['requirement_id']['indent'], 26)
         self.assertTrue(rows[1]['requirement_id']['tree_branch'])
         self.assertEqual(rows[1]['_parent_id'], 'C1')
 
@@ -44186,11 +44186,11 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 
 class UnifiedReleaseVersionTests(_StorageFixture):
-    def test_current_and_supported_data_generation_are_311(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 311)
+    def test_current_version_312_preserves_data_generation_311(self) -> None:
+        self.assertEqual(velox.CURRENT_VERSION, 312)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 311)
-        self.assertEqual(velox.APP_VERSION, 'velox.v311')
-        self.assertEqual(velox.SOURCE_REVISION, '311')
+        self.assertEqual(velox.APP_VERSION, 'velox.v312')
+        self.assertEqual(velox.SOURCE_REVISION, '312')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v311')
 
     def test_all_exported_schema_constants_share_data_generation(self) -> None:
@@ -44210,7 +44210,7 @@ class UnifiedReleaseVersionTests(_StorageFixture):
         self.assertEqual(independent, [])
 
     def test_compatible_application_bump_does_not_change_data_format(self) -> None:
-        with mock.patch.object(velox, 'CURRENT_VERSION', 312):
+        with mock.patch.object(velox, 'CURRENT_VERSION', 313):
             self.assertEqual(velox.data_schema('chat'), 'chat.v311')
             self.assertEqual(velox.data_schema('web_visible_content'), 'web_visible_content.v311')
 
@@ -44589,7 +44589,7 @@ class EndpointTokenPricingTests(_StorageFixture):
         self.assertEqual(velox.token_cost_label(cost), 'Unpriced')
         row.update(dict.fromkeys(velox.ENDPOINT_PRICE_FIELDS, 0))
         cost = velox.estimate_token_cost(velox.endpoint_cost_pricing_snapshot(row), 100, 20, 0)
-        self.assertEqual(velox.token_cost_label(cost), '$0.0000')
+        self.assertEqual(velox.token_cost_label(cost), '$0.00')
         self.assertEqual(cost['unpriced_requests'], 0)
 
     def test_cache_reads_are_subtracted_from_input_not_charged_twice(self) -> None:
@@ -44633,8 +44633,8 @@ class EndpointTokenPricingTests(_StorageFixture):
             price = velox.endpoint_cost_pricing_snapshot(self.profile(pid))
             cost = velox.estimate_token_cost(price, 500000, 100000, 0)
             self.assertFalse(cost['long_context'])
-            self.assertEqual(cost['theoretical_requests'], int(pid == velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID))
-        self.assertIn('theoretical', velox.token_cost_tooltip(cost))
+            self.assertNotIn('theoretical_requests', cost)
+        self.assertNotIn('theoretical', velox.token_cost_tooltip(cost))
 
     def test_price_snapshot_contains_no_credentials_connection_or_prompt(self) -> None:
         row = self.profile(); row.update(api_key='SECRET_MUST_NOT_LEAK', system_prompt_addon='PRIVATE_PROMPT', base_url='https://private.example')
@@ -44662,11 +44662,12 @@ class EndpointTokenPricingTests(_StorageFixture):
         for key in velox.ENDPOINT_PRICE_FIELDS:
             self.assertNotIn(key.encode(), second)
 
-    def test_small_nonzero_cost_does_not_display_as_free(self) -> None:
-        self.assertNotEqual(velox.token_cost_label({'total_usd': .0000001}), '$0.0000')
-        self.assertIn('+ ?', velox.token_cost_label({'total_usd': 1, 'unpriced_requests': 1}))
-
-        self.assertEqual(velox.token_cost_label({"total_usd":1e-12}), "<$0.00000001")
+    def test_subcent_costs_round_for_display_without_changing_accounting(self) -> None:
+        cost = {'total_usd': .0000001}
+        self.assertEqual(velox.token_cost_label(cost), '$0.00')
+        self.assertEqual(cost['total_usd'], .0000001)
+        self.assertEqual(velox.token_cost_label({'total_usd': 1, 'unpriced_requests': 1}), '$1.00 + ?')
+        self.assertEqual(velox.token_cost_label({"total_usd": 1e-12}), "$0.00")
 
 
 class TokenCostLedgerTests(_StorageFixture):
@@ -44817,6 +44818,15 @@ class ChatChildLifecycleTests(_AsyncRuntimeFixture):
         self.aruntime.chat_runtime = self.runtime
         self.monitor = velox.LLMTaskMonitor(self.storage)
         self.runtime.monitor = self.aruntime.monitor = self.monitor
+
+    async def asyncTearDown(self) -> None:
+        await super().asyncTearDown()
+        # Stop persists Checklist cancellation off the event loop. Await those
+        # owned writes before TemporaryDirectory cleanup removes their Chat.
+        await asyncio.wait_for(self.runtime.wait_for_user_stops(), timeout=5)
+        pending = list(getattr(self.runtime, "_orphan_cleanup_tasks", set()))
+        if pending:
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5)
 
     def child(self, *, chat_id: str = '', parent: dict[str, Any] | None = None, pa: bool = False) -> dict[str, Any]:
         return self.agents.create_agent(chat_id or self.cid, 'Bounded read', endpoint_profile_id=self.eid,
@@ -45039,7 +45049,7 @@ class DashboardCostAndChecklistLayoutTests(_StorageFixture):
                 with mock.patch.object(panel,'_draw_agent_metric_card',side_effect=card), \
                      mock.patch.object(panel.widgets,'clipped_text',side_effect=lambda r,t,*a,**k:recorded.append((r,t))):
                     panel._draw_agent_summary_cards(velox.Rect(0,0,1920,2000), {'costs_24h':costs})
-                body=bodies['Costs / 24h (USD)']; rows=[(r,t) for r,t in recorded if t.startswith('Endpoint')]
+                body=bodies['Costs / 24h']; rows=[(r,t) for r,t in recorded if t.startswith('Endpoint')]
                 self.assertEqual(len(rows),5)
                 for rect,text in rows:
                     self.assertLessEqual(rect.y+rect.h,body.y+body.h,text)
@@ -45088,6 +45098,450 @@ class EndpointCostIntegrationTests(_StorageFixture):
             finally:
                 await scheduler.close()
         asyncio.run(scenario())
+
+
+
+class ResizableFilePickerTests(_AttachmentUiFixture, unittest.TestCase):
+    """Exercise the production modal, its pointer capture, and its toolbar."""
+
+    def tearDown(self) -> None:
+        tree = getattr(self.widgets, '_file_picker_tree', None)
+        if tree is not None:
+            tree.discard()
+        super().tearDown()
+
+    def pointer(self, x: int, y: int, *, pressed: bool = False,
+                down: bool = False, released: bool = False) -> None:
+        self.reset_input()
+        self.state.input.mouse_x, self.state.input.mouse_y = x, y
+        self.state.input.mouse_pressed, self.state.input.mouse_down = pressed, down
+        self.state.input.mouse_released = released
+
+    def geometry(self) -> Rect:
+        return self.widgets._file_picker_geometry(self.view)
+
+    def test_default_is_fifty_percent_larger_in_both_dimensions(self) -> None:
+        self.view = velox.Rect(0, 0, 1920, 1200)
+        self.assertEqual(self.geometry(), velox.Rect(270, 75, 1380, 1050))
+
+    def test_default_and_existing_size_clamp_to_viewport_with_nonzero_origin(self) -> None:
+        for view in (velox.Rect(0, 0, 1024, 768), velox.Rect(70, 90, 760, 560)):
+            with self.subTest(view=view):
+                self.view = view
+                self.state.file_picker_rect = None
+                self.assertEqual(self.geometry(), view.inset(16))
+                self.state.file_picker_rect = velox.Rect(-100, -100, 2500, 2500)
+                self.assertEqual(self.geometry(), view.inset(16))
+
+    def test_eight_edges_and_corners_request_matching_cursors(self) -> None:
+        self.view = velox.Rect(0, 0, 1920, 1200)
+        original = velox.Rect(250, 150, 1000, 700)
+        cases = ((250, 400, 'resize_x'), (1250, 400, 'resize_x'),
+                 (700, 150, 'resize_y'), (700, 850, 'resize_y'),
+                 (250, 150, 'resize_nwse'), (1250, 850, 'resize_nwse'),
+                 (1250, 150, 'resize_nesw'), (250, 850, 'resize_nesw'))
+        for x, y, cursor in cases:
+            with self.subTest(cursor=cursor, x=x, y=y):
+                self.state.file_picker_rect = original
+                self.pointer(x, y)
+                self.geometry()
+                self.assertEqual(self.state.requested_cursor, cursor)
+                self.assertIsNone(self.state.file_picker_resize_state)
+                self.assertFalse(self.state.input.mouse_consumed)
+
+    def test_all_resize_directions_keep_the_opposite_edge_fixed(self) -> None:
+        self.view = velox.Rect(0, 0, 1920, 1200)
+        initial = velox.Rect(250, 150, 1000, 700)
+        for edge in ('n', 's', 'w', 'e', 'nw', 'ne', 'sw', 'se'):
+            with self.subTest(edge=edge):
+                self.state.file_picker_rect = initial
+                self.state.file_picker_resize_state = None
+                x = 250 if 'w' in edge else 1250 if 'e' in edge else 700
+                y = 150 if 'n' in edge else 850 if 's' in edge else 400
+                self.pointer(x, y, pressed=True, down=True)
+                self.geometry()
+                self.assertEqual(self.state.file_picker_resize_state['edge'], edge)
+                self.assertTrue(self.state.input.mouse_consumed)
+                self.pointer(x + 50, y + 40, down=True)
+                actual = self.geometry()
+                expected = velox.Rect(300 if 'w' in edge else 250, 190 if 'n' in edge else 150,
+                                      950 if 'w' in edge else 1050 if 'e' in edge else 1000,
+                                      660 if 'n' in edge else 740 if 's' in edge else 700)
+                self.assertEqual(actual, expected)
+                self.assertTrue(self.state.input.mouse_consumed)
+                self.pointer(x + 60, y + 45, released=True)
+                final = self.geometry()
+                self.assertIsNone(self.state.file_picker_resize_state)
+                self.assertNotEqual(final, actual)
+
+    def test_resize_has_minimum_and_maximum_bounds(self) -> None:
+        self.view = velox.Rect(0, 0, 1920, 1200)
+        self.state.file_picker_rect = velox.Rect(250, 150, 1000, 700)
+        self.pointer(1250, 850, pressed=True, down=True); self.geometry()
+        self.pointer(-500, -500, down=True)
+        self.assertEqual(self.geometry(), velox.Rect(250, 150, 640, 400))
+        self.pointer(5000, 5000, down=True)
+        self.assertEqual(self.geometry(), velox.Rect(250, 150, 1654, 1034))
+
+    def test_window_shrink_during_drag_keeps_modal_on_screen(self) -> None:
+        self.view = velox.Rect(0, 0, 1920, 1200)
+        r = self.geometry()
+        self.pointer(r.x + r.w, r.y + r.h, pressed=True, down=True); self.geometry()
+        self.view = velox.Rect(0, 0, 760, 540)
+        self.pointer(2000, 2000, down=True)
+        r = self.geometry()
+        self.assertGreaterEqual(r.x, 16); self.assertGreaterEqual(r.y, 16)
+        self.assertLessEqual(r.x + r.w, 744); self.assertLessEqual(r.y + r.h, 524)
+        self.assertGreaterEqual(r.w, 640); self.assertGreaterEqual(r.h, 400)
+
+    def test_consumed_pointer_and_context_menu_cannot_start_resize(self) -> None:
+        for menu in (False, True):
+            self.state.file_picker_rect = velox.Rect(80, 60, 900, 600)
+            self.pointer(980, 660, pressed=True, down=True)
+            self.state.input.mouse_consumed = not menu
+            self.state.context_menu = {'id': 'overlay'} if menu else None
+            self.geometry()
+            self.assertIsNone(self.state.file_picker_resize_state)
+        self.state.context_menu = None
+
+    def test_loss_of_mouse_button_ends_capture_without_moving_modal(self) -> None:
+        r = self.geometry()
+        self.pointer(r.x + r.w, r.y + r.h, pressed=True, down=True); self.geometry()
+        self.pointer(5000, 5000)
+        self.assertEqual(self.geometry(), r)
+        self.assertIsNone(self.state.file_picker_resize_state)
+
+    def test_resizing_actual_modal_does_not_change_selected_files(self) -> None:
+        self.view = velox.Rect(0, 0, 1920, 1200)
+        self.picker(); self.row_click(self.files[2], checkbox=True)
+        before = list(self.state.file_picker_selected_paths)
+        r = self.state.file_picker_rect
+        self.pointer(r.x + r.w, r.y + r.h, pressed=True, down=True); self.draw_picker()
+        self.pointer(r.x + r.w - 200, r.y + r.h - 100, down=True); self.draw_picker()
+        self.assertEqual(self.state.file_picker_rect.w, r.w - 200)
+        self.assertEqual(self.state.file_picker_selected_paths, before)
+        self.assertTrue(self.state.input.mouse_consumed)
+        self.pointer(r.x + r.w - 200, r.y + r.h - 100, released=True); self.draw_picker()
+        self.assertIsNone(self.state.file_picker_resize_state)
+        self.click(self.buttons['fp.all']); self.draw_picker()
+        self.assertEqual(self.state.file_picker_selected_paths, [str(p) for p in self.files])
+        self.click(self.buttons['fp.clear']); self.draw_picker()
+        self.assertEqual(self.state.file_picker_selected_paths, [])
+
+    def test_toolbar_is_one_row_with_divider_and_icon_only_selection_controls(self) -> None:
+        self.picker()
+        with mock.patch.object(self.widgets, 'button', wraps=self.widgets.button) as button:
+            self.reset_input(); self.widgets.renderer.drawn.clear(); self.draw_picker()
+        by_id = {c.args[0]: c for c in button.call_args_list}
+        toolbar = [by_id[key].args[1] for key in ('fp.home', 'fp.up', 'fp.all', 'fp.clear')]
+        self.assertEqual(len({r.y for r in toolbar}), 1)
+        for key, icon, tip in (('fp.all', 'select_all', 'Select all'), ('fp.clear', 'clear_selection', 'Clear')):
+            self.assertEqual(by_id[key].args[2], '')
+            self.assertEqual(by_id[key].kwargs['icon'], icon)
+            self.assertTrue(by_id[key].kwargs['tooltip'].startswith(tip))
+        up, all_r = toolbar[1:3]
+        dividers = [args for name, args, kw in self.widgets.renderer.drawn
+                    if name == 'draw_line' and args[0] == args[2]
+                    and up.x + up.w < args[0] < all_r.x
+                    and args[1] == up.y + 4 and args[3] == up.y + 32]
+        self.assertEqual(len(dividers), 1)
+        self.assertNotIn('Checkboxes, Ctrl/Cmd-click or Shift-click.', self.cells)
+
+    def test_toolbar_and_footer_stay_inside_after_resizing(self) -> None:
+        self.picker()
+        for width, height in ((640, 400), (900, 650), (1248, 768)):
+            with self.subTest(width=width, height=height):
+                self.state.file_picker_rect = velox.Rect(16, 16, width, height)
+                self.reset_input(); self.draw_picker()
+                modal = self.state.file_picker_rect
+                for key in ('fp.home', 'fp.up', 'fp.all', 'fp.clear', 'fp.cancel', 'fp.select'):
+                    r = self.buttons[key]
+                    self.assertGreaterEqual(r.x, modal.x)
+                    self.assertGreaterEqual(r.y, modal.y)
+                    self.assertLessEqual(r.x + r.w, modal.x + modal.w, key)
+                    self.assertLessEqual(r.y + r.h, modal.y + modal.h, key)
+
+    def test_navigation_buttons_fit_their_labels_at_larger_font_widths(self) -> None:
+        self.picker()
+        for char_w in (8, 11, 14):
+            with self.subTest(char_w=char_w):
+                self.widgets.font.char_w = char_w
+                self.reset_input(); self.draw_picker()
+                for key, label in (("fp.home", "Home"), ("fp.up", "Up")):
+                    self.assertGreaterEqual(self.buttons[key].w, self.widgets.font.measure_text(label) + 32)
+
+    def test_save_mode_has_no_selection_buttons_but_is_resizable(self) -> None:
+        self.picker(save=True)
+        self.assertNotIn('fp.all', self.buttons); self.assertNotIn('fp.clear', self.buttons)
+        r = self.state.file_picker_rect
+        self.state.file_picker_manual = 'debug-report.txt'
+        self.pointer(r.x, r.y, pressed=True, down=True); self.draw_picker()
+        self.pointer(r.x + 60, r.y + 40, down=True); self.draw_picker()
+        self.assertEqual(self.state.file_picker_manual, 'debug-report.txt')
+        self.assertIsNotNone(self.state.file_picker_resize_state)
+
+    def test_close_and_reopen_retains_session_size_but_not_drag(self) -> None:
+        self.picker()
+        self.state.file_picker_rect = velox.Rect(50, 40, 900, 600)
+        self.reset_input(); self.draw_picker()
+        self.click(self.buttons['fp.close']); self.draw_picker()
+        self.assertFalse(self.state.file_picker_open)
+        self.picker()
+        self.assertEqual(self.state.file_picker_rect, velox.Rect(50, 40, 900, 600))
+        self.assertIsNone(self.state.file_picker_resize_state)
+
+
+class CostDisplayRoundingTests(_StorageFixture):
+    def test_money_rounds_to_nearest_cent_including_half_cent(self) -> None:
+        for amount, label in ((0, '$0.00'), (1e-12, '$0.00'), (.0049, '$0.00'),
+                              (.005, '$0.01'), (.015, '$0.02'), (2.675, '$2.68'),
+                              (1234.567, '$1,234.57'), (-1, '$0.00')):
+            with self.subTest(amount=amount):
+                cost = {'total_usd': amount}
+                before = copy.deepcopy(cost)
+                self.assertEqual(velox.token_cost_label(cost), label)
+                self.assertEqual(cost, before)
+
+    def test_large_finite_cost_still_formats_without_decimal_context_error(self) -> None:
+        self.assertTrue(velox.token_cost_label({'total_usd': 1e40}).endswith('.00'))
+
+    def test_unknown_prices_remain_distinct_from_zero_and_subcent_costs(self) -> None:
+        self.assertEqual(velox.token_cost_label({'unpriced_requests': 1}), 'Unpriced')
+        self.assertEqual(velox.token_cost_label({'total_usd': .001, 'unpriced_requests': 1}), '$0.00 + ?')
+        self.assertEqual(velox.token_cost_label({}), '$0.00')
+
+    def test_component_tooltips_use_same_cent_rounding_and_currency_only_in_tooltip(self) -> None:
+        cost = {'total_usd': .015, 'input_usd': .005, 'cached_input_usd': .005, 'output_usd': .005}
+        tip = velox.token_cost_tooltip(cost)
+        self.assertIn('(USD): $0.02', tip)
+        for label in ('Input', 'Cache read', 'Output'):
+            self.assertIn(label + ' $0.01', tip)
+        self.assertNotIn('USD', velox.token_cost_label(cost))
+
+    def test_local_and_hosted_same_rates_produce_same_cost_and_no_qualifier(self) -> None:
+        local = velox.endpoint_profile_ref(self.storage.load_config(), velox.DEFAULT_ENDPOINT_PROFILE_ID)
+        hosted = dict(local, provider=velox.ENDPOINT_PROVIDER_NOVITA)
+        costs = [velox.estimate_token_cost(velox.endpoint_cost_pricing_snapshot(p), 123456, 2345, 100000)
+                 for p in (local, hosted)]
+        self.assertEqual(costs[0], costs[1])
+        for p in (local, hosted):
+            self.assertNotIn('theoretical', json.dumps(velox.endpoint_cost_pricing_snapshot(p)))
+        self.assertNotIn('theoretical', json.dumps(costs))
+        self.assertNotIn('theoretical', velox.token_cost_tooltip(dict(costs[0], theoretical_requests=1)))
+
+    def test_compatible_cost_events_load_without_rewriting_retired_metadata(self) -> None:
+        now = time.time()
+        ledger = velox.TokenCostLedger(self.paths.root_dir)
+        prices = velox.endpoint_cost_pricing_snapshot(velox.endpoint_profile_ref(self.storage.load_config(), velox.DEFAULT_ENDPOINT_PROFILE_ID))
+        prices['theoretical'] = True  # Previously stored v311 metadata is tolerated, not migrated.
+        cost = velox.estimate_token_cost(prices, 10000, 2000, 8000)
+        cost['theoretical_requests'] = 1
+        event = {'schema': 'token_cost.v311', 'event_id': 'saved-v311-request', 'epoch': now - 1, 'pricing': prices, 'cost': cost}
+        path = ledger.directory / (datetime.fromtimestamp(now, timezone.utc).date().isoformat() + '.jsonl')
+        velox.append_jsonl(path, event)
+        before = path.read_bytes()
+        summary = ledger.summary(now=now)
+        self.assertEqual(summary['requests'], 1)
+        self.assertAlmostEqual(summary['total_usd'], cost['total_usd'])
+        self.assertEqual(summary['error'], '')
+        self.assertNotIn('theoretical_requests', summary)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_subcent_requests_are_summed_before_rounding(self) -> None:
+        ledger = velox.TokenCostLedger(self.paths.root_dir)
+        now = time.time()
+        prices = velox.endpoint_cost_pricing_snapshot({**dict(zip(velox.ENDPOINT_PRICE_FIELDS, (1., .1, 2.))), 'model': 'test'})
+        cost = velox.estimate_token_cost(prices, 4000, 0, 0)
+        self.assertEqual(velox.token_cost_label(cost), '$0.00')
+        live = [{'schema': velox.data_schema('token_cost'), 'event_id': str(i), 'epoch': now - 1,
+                 'pricing': prices, 'cost': cost} for i in range(3)]
+        total = ledger.summary(live, now=now)
+        self.assertAlmostEqual(total['total_usd'], .012)
+        self.assertEqual(velox.token_cost_label(total), '$0.01')
+
+    def test_dashboard_row_sorts_by_unrounded_cost_and_displays_only_cents(self) -> None:
+        panel = object.__new__(velox.Panels)
+        panel.widgets = ChecklistRenderingTests.widgets(); panel.state = panel.widgets.state
+        panel._dashboard_task_context_menu_items = lambda r: []
+        row = panel._dashboard_live_task_row(DashboardPresentationTests.metrics(token_cost={'total_usd': .0151}))
+        self.assertEqual(row['cost']['label'], '$0.02')
+        self.assertEqual(row['cost']['sort'], .0151)
+        self.assertIn('USD', velox.normalize_tooltip_text(row['_tooltip']))
+
+    def test_cost_ui_labels_do_not_expose_currency_or_removed_qualifier(self) -> None:
+        source = inspect.getsource(velox.Panels.draw_agents_panel)
+        self.assertIn('"title": "Cost"', source)
+        self.assertNotIn('Est. USD', source)
+        self.assertNotIn('USD', inspect.getsource(velox.Panels._draw_agent_summary_cards))
+        self.assertNotIn('theoretical', application_source())
+
+
+class TableHeaderAlignmentTests(unittest.TestCase):
+    def draw(self, align: str, *, sorted_column: bool = False, sortable: bool = True) -> tuple[Any, list[Any]]:
+        w = ChecklistRenderingTests.widgets()
+        if sorted_column:
+            w.state.table_sort['alignment'] = ('metric', True)
+        cols = [{'key': 'metric', 'title': 'Duration', 'width': 280, 'align': align, 'sortable': sortable, 'sort_type': 'number'}]
+        if sortable and not sorted_column:
+            cols.insert(0, {'key': 'name', 'title': 'Name', 'width': 80})
+        with mock.patch.object(w, 'clipped_text', wraps=w.clipped_text) as text:
+            w.table_view('alignment', velox.Rect(10, 20, 500, 200), cols,
+                         [{'id': '1', 'metric': {'label': '12', 'sort': 12}}])
+        return w, text.call_args_list
+
+    def test_unsorted_headers_share_alignment_and_insets_with_values(self) -> None:
+        for align in ('left', 'center', 'right'):
+            for sortable in (True, False):
+                with self.subTest(align=align, sortable=sortable):
+                    w, calls = self.draw(align, sortable=sortable)
+                    head = next(c for c in calls if c.args[1] == 'DURATION')
+                    value = next(c for c in calls if c.args[1] == '12')
+                    self.assertEqual(head.kwargs['align'], align)
+                    self.assertEqual(value.kwargs['align'], align)
+                    self.assertEqual((head.args[0].x, head.args[0].w), (value.args[0].x, value.args[0].w))
+
+    def test_sorted_right_header_keeps_numeric_right_edge_and_moves_marker_left(self) -> None:
+        w, calls = self.draw('right', sorted_column=True)
+        head = next(c.args[0] for c in calls if c.args[1] == 'DURATION')
+        value = next(c.args[0] for c in calls if c.args[1] == '12')
+        self.assertEqual(head.x + head.w, value.x + value.w)
+        self.assertGreater(head.x, value.x)
+        glyphs = {a[0]: a for n, a, k in w.renderer.drawn if n == 'draw_text' and a[0] in ('DURATION', '12')}
+        self.assertEqual(glyphs['DURATION'][1] + w.font.measure_text('DURATION'), glyphs['12'][1] + w.font.measure_text('12'))
+
+    def test_sorted_center_and_left_headers_keep_their_text_anchor(self) -> None:
+        for align in ('center', 'left'):
+            w, calls = self.draw(align, sorted_column=True)
+            head = next(c.args[0] for c in calls if c.args[1] == 'DURATION')
+            value = next(c.args[0] for c in calls if c.args[1] == '12')
+            if align == 'center':
+                self.assertEqual(head.x + head.w / 2, value.x + value.w / 2)
+            else:
+                self.assertEqual(head.x, value.x)
+
+    def test_sort_click_still_changes_order_and_direction(self) -> None:
+        w = ChecklistRenderingTests.widgets()
+        cols = [{'key': 'metric', 'title': 'Input', 'width': 280, 'align': 'right', 'sort_type': 'number'}]
+        rows = [{'id': 'a', 'metric': {'label': '2', 'sort': 2}}, {'id': 'b', 'metric': {'label': '1', 'sort': 1}}]
+        # The initial default sort is ascending on the first sortable column.
+        for expected, first in ((False, '2'), (True, '1')):
+            w.state.input = velox.UIInput(); w.state.input.mouse_x = 150; w.state.input.mouse_y = 30
+            w.state.input.mouse_pressed = True; w.state.input.mouse_down = True
+            with mock.patch.object(w, 'clipped_text', wraps=w.clipped_text) as text:
+                w.table_view('sorting', velox.Rect(0, 0, 500, 200), cols, rows)
+            self.assertEqual(w.state.table_sort['sorting'], ('metric', expected))
+            numbers = [c.args[1] for c in text.call_args_list if c.args[1] in ('1', '2')]
+            self.assertEqual(numbers[0], first)
+
+
+class ConnectedChecklistTreeTests(unittest.TestCase):
+    @staticmethod
+    def fixture() -> dict[str, Any]:
+        return {'items': [
+            {'id': 'C1', 'text': 'First requirement', 'state': 'done', 'subitems': [
+                {'id': 'C1.1', 'text': 'Read sources', 'state': 'done'},
+                {'id': 'C1.2', 'text': 'Build result', 'state': 'done'},
+                {'id': 'C1.3', 'text': 'Verify result', 'state': 'done'}]},
+            {'id': 'C2', 'text': 'Second requirement', 'state': 'done', 'subitems': [
+                {'id': 'C2.1', 'text': 'Deliver files', 'state': 'done'}]}]}
+
+    def render(self, *, collapse: set[str] | None = None, scroll: int = 0, height: int = 400) -> tuple[Any, list[Any], list[Any]]:
+        w = ChecklistRenderingTests.widgets(); w.state.scroll['connected'] = scroll
+        rows = velox.Panels._expert_mode_table_rows(self.fixture(), collapse)
+        with mock.patch.object(w, '_draw_table_tree_connector', wraps=w._draw_table_tree_connector) as branches, \
+             mock.patch.object(w, 'clipped_text', wraps=w.clipped_text) as text:
+            w.table_view('connected', velox.Rect(0, 0, 840, height), velox.Panels._expert_mode_table_columns(), rows, row_h=40)
+        return w, branches.call_args_list, text.call_args_list
+
+    def test_only_last_sibling_terminates_trunk(self) -> None:
+        state = self.fixture(); before = copy.deepcopy(state)
+        rows = velox.Panels._expert_mode_table_rows(state)
+        values = {r['id']: r['requirement_id'] for r in rows}
+        self.assertTrue(values['C1']['tree_children'])
+        self.assertFalse(values['C1.1']['tree_last']); self.assertFalse(values['C1.2']['tree_last'])
+        self.assertTrue(values['C1.3']['tree_last']); self.assertTrue(values['C2.1']['tree_last'])
+        self.assertEqual(state, before)
+
+    def test_trunks_join_parent_tail_and_siblings_without_vertical_gaps(self) -> None:
+        w, calls, text = self.render()
+        cells = {c.args[2]['label']: c.args[0] for c in calls}
+        lines = [a for name, a, kw in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted]
+        parent = cells['C1']; trunk = parent.x + 12
+        self.assertIn((trunk, parent.y + parent.h - 5, trunk, parent.y + parent.h, velox.Palette.muted), lines)
+        previous = parent
+        for key in ('C1.1', 'C1.2', 'C1.3'):
+            child = cells[key]
+            self.assertEqual(child.y, previous.y + previous.h)
+            end = child.y + child.h // 2 if key == 'C1.3' else child.y + child.h
+            self.assertIn((trunk, child.y, trunk, end, velox.Palette.muted), lines)
+            previous = child
+
+    def test_arrow_heads_leave_eight_pixels_before_id_text(self) -> None:
+        w, calls, texts = self.render()
+        text_rects = {c.args[1]: c.args[0] for c in texts}
+        lines = [a for name, a, kw in w.renderer.drawn if name == 'draw_line' and a[-1] == velox.Palette.muted]
+        for c in calls:
+            cell, indent, value = c.args
+            if not value.get('tree_branch'): continue
+            tip = text_rects[value['label']].x - 8
+            middle = cell.y + cell.h // 2
+            self.assertIn((tip - 4, middle - 3, tip, middle, velox.Palette.muted), lines)
+            self.assertIn((tip - 4, middle + 3, tip, middle, velox.Palette.muted), lines)
+            self.assertLess(cell.x + 12, tip)
+
+    def test_collapse_removes_hidden_branches_and_parent_tail(self) -> None:
+        w, calls, text = self.render(collapse={'C1'})
+        self.assertFalse(any(c.args[2]['label'].startswith('C1.') for c in calls))
+        self.assertFalse(any(c.args[2]['label'] == 'C1' for c in calls))
+        self.assertTrue(any(c.args[2]['label'] == 'C2.1' for c in calls))
+
+    def test_virtualized_middle_rows_keep_continuation_and_balanced_clipping(self) -> None:
+        w, calls, texts = self.render(scroll=85, height=160)
+        self.assertFalse(any(c.args[2]['label'] == 'C1' for c in calls))
+        first = calls[0]
+        self.assertEqual(first.args[2]['label'], 'C1.2')
+        self.assertFalse(first.args[2]['tree_last'])
+        depth = 0
+        for name, args, kwargs in w.renderer.drawn:
+            if name == 'push_clip': depth += 1
+            if name == 'pop_clip': depth -= 1
+            self.assertGreaterEqual(depth, 0)
+        self.assertEqual(depth, 0)
+
+    def test_requirement_text_is_not_indented_or_used_for_connectors(self) -> None:
+        w, calls, texts = self.render()
+        rects = {c.args[1]: c.args[0] for c in texts}
+        self.assertEqual(rects['First requirement'].x, rects['Read sources'].x)
+        self.assertGreaterEqual(rects['Read sources'].w, 500)
+        for c in calls:
+            cell = c.args[0]
+            self.assertLessEqual(cell.x + cell.w, rects['First requirement'].x)
+
+    def test_tiny_cells_do_not_leak_lines_or_clip_stack(self) -> None:
+        w = ChecklistRenderingTests.widgets()
+        for cell in (velox.Rect(0, 0, 0, 0), velox.Rect(0, 0, 24, 40), velox.Rect(0, 0, 100, 8)):
+            w.renderer.drawn.clear()
+            w._draw_table_tree_connector(cell, 26, {'tree_branch': True})
+            self.assertEqual(w.renderer.drawn, [])
+
+
+class FilePickerResizeCursorTests(unittest.TestCase):
+    def test_diagonal_cursors_resolve_sdl3_and_sdl2_constants_and_reuse_handles(self) -> None:
+        for names in (('SDL_SYSTEM_CURSOR_NWSE_RESIZE', 'SDL_SYSTEM_CURSOR_NESW_RESIZE'),
+                      ('SDL_SYSTEM_CURSOR_SIZENWSE', 'SDL_SYSTEM_CURSOR_SIZENESW')):
+            with self.subTest(names=names):
+                api = SimpleNamespace(**{names[0]: 11, names[1]: 12}, SDL_CreateSystemCursor=mock.Mock(side_effect=lambda n: n + 100), SDL_SetCursor=mock.Mock())
+                host = object.__new__(velox.SDLHost); host._cursor_kind = 'arrow'; host._cursor_cache = {}
+                with mock.patch.object(velox, 'sdl', api):
+                    host.set_cursor_kind('resize_nwse'); host.set_cursor_kind('resize_nesw'); host.set_cursor_kind('resize_nwse')
+                self.assertEqual(api.SDL_CreateSystemCursor.call_args_list, [mock.call(11), mock.call(12)])
+                self.assertEqual(api.SDL_SetCursor.call_args_list, [mock.call(111), mock.call(112), mock.call(111)])
+
+    def test_missing_cursor_api_is_nonfatal(self) -> None:
+        host = object.__new__(velox.SDLHost); host._cursor_kind = 'arrow'; host._cursor_cache = {}
+        with mock.patch.object(velox, 'sdl', SimpleNamespace()):
+            host.set_cursor_kind('resize_nwse')
+        self.assertEqual(host._cursor_kind, 'resize_nwse')
 
 
 def main() -> None:
