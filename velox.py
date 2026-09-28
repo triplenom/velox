@@ -21,8 +21,7 @@ transports and context fitting; EndpointInferenceScheduler admits requests only
 while they need inference capacity. ToolRegistry validates and dispatches calls.
 ChecklistStore persists requirements and review state. Storage and the record
 stores retain conversations and task data and validate persisted schemas.
-Panels, Widgets and Renderer provide
-the SDL interface. The application stays in this file; tests and their isolated
+Panels, Widgets and Renderer provide the SDL interface. The application stays in this file; tests and their isolated
 process runner live in test_velox.py.
 
 Run python velox.py from a separate application-data directory. Use --init-only
@@ -34,7 +33,6 @@ SECURITY.md describes tool permissions and credential storage.
 from __future__ import annotations
 
 import argparse
-import ast
 import calendar as calendar_module
 import base64
 import asyncio
@@ -88,7 +86,7 @@ import functools
 import fnmatch
 from email import policy as email_policy
 from email.header import decode_header
-from email.utils import format_datetime, getaddresses, parsedate_to_datetime
+from email.utils import getaddresses, parsedate_to_datetime
 
 
 import uuid
@@ -97,7 +95,7 @@ from decimal import Decimal, ROUND_HALF_UP, localcontext
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable, NoReturn, Optional
+from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
@@ -293,8 +291,8 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 314
-BACKWARD_COMPATIBLE_VERSION = 311
+CURRENT_VERSION = 315
+BACKWARD_COMPATIBLE_VERSION = 315
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
 WINDOW_TITLE_SUFFIX = f"[V{SOURCE_REVISION}]"
@@ -343,6 +341,7 @@ SCHEDULED_TASK_SCHEMA = data_schema('scheduled_task')
 CONTEXT_DOC_SCHEMA = data_schema('context_doc')
 CONTEXT_DOC_REVISION_SCHEMA = data_schema('context_doc_revision')
 TASK_ID_STATE_SCHEMA = data_schema('task_id_state')
+DASHBOARD_TASK_SCHEMA = data_schema('dashboard_task')
 # Checklist state must match the current record schema.
 EXPERT_MODE_SCHEMA = data_schema('velox_expert_mode')
 EXPERT_MODE_ACTIVE_CHAT_FILENAME = "chat_expert_mode.json"
@@ -379,36 +378,32 @@ CONTEXT_DOC_UPDATE_FREQUENCIES: tuple[str, ...] = ("hourly", "daily")
 CONTEXT_DOC_AUTOSAVE_DELAY_SECONDS = 0.35
 SCHEDULED_TASK_POLL_SECONDS = 0.5
 CONTEXT_DOC_FREQUENCY_MINUTES: dict[str, int] = {"hourly": 60, "daily": 24 * 60}
-# Stored record vocabulary is retained for archival records in compatible roots.
-# Only VAULT_SOURCE_ORDER exposes active connectors; archived records never sync.
-VAULT_SOURCE_TYPES: tuple[str, ...] = ("google_calendar", "google_drive", "gmail", "slack")
+VAULT_SOURCE_TYPES: tuple[str, ...] = ("google_calendar", "google_drive", "gmail")
 VAULT_CONNECTION_STATES: tuple[str, ...] = (
     "not_configured", "connected", "syncing", "error", "disabled",
 )
 VAULT_CONTAINER_TYPES: tuple[str, ...] = (
     "calendar", "google_drive", "google_drive_shared_drive", "google_drive_folder",
-    "mailbox", "slack_public_channel", "slack_private_channel",
-    "slack_direct_message", "slack_group_message",
+    "mailbox",
 )
 VAULT_ITEM_TYPES: tuple[str, ...] = (
-    "calendar_event", "google_drive_file", "gmail_message", "slack_message", "slack_thread_reply",
+    "calendar_event", "google_drive_file", "gmail_message",
 )
 VAULT_PARTICIPANT_ROLES: tuple[str, ...] = (
     "author", "sender", "recipient", "cc", "bcc", "organizer", "attendee",
-    "slack_user", "slack_bot",
 )
 VAULT_PARTICIPANT_TYPES: tuple[str, ...] = (
-    "person", "email_address", "user", "bot", "slack_user", "slack_bot", "unknown",
+    "person", "email_address", "user", "bot", "unknown",
 )
 VAULT_CURSOR_TYPES: tuple[str, ...] = (
     "generic", "google_calendar_list_sync_token", "google_calendar_event_sync_token",
     "google_drive_changes_page_token", "gmail_imap_uid", "gmail_uidvalidity",
-    "slack_latest_timestamp", "custom",
+    "custom",
 )
 VAULT_LOCAL_TIMEZONE_DEFAULT = "system"
 VAULT_CACHE_EXTERNAL_POLL_SECONDS = 1.0
 VAULT_RAW_PAYLOAD_MAX_BYTES = 16 * 1024 * 1024
-VAULT_SOURCE_ORDER: tuple[str, ...] = ("google_calendar", "google_drive", "gmail")
+VAULT_SOURCE_ORDER = VAULT_SOURCE_TYPES
 VAULT_SOURCE_LABELS: dict[str, str] = {
     "google_calendar": "Google Calendar",
     "google_drive": "Google Drive",
@@ -580,7 +575,6 @@ CONNECTOR_TRANSIENT_RETRY_COUNT = 2
 CONNECTOR_MAX_STATUS_EVENTS = 120
 CREDENTIAL_XOR_BYTE = 0x77
 CREDENTIAL_FILE_SCHEMA = data_schema('velox_account_credentials')
-GITHUB_CREDENTIAL_ACCOUNT = "github"
 GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT = "google_calendar"
 CURRENT_PANEL_NAMES = frozenset({"chat", "calendar", "agents", "context", "vault", "settings"})
 
@@ -1830,14 +1824,6 @@ def detect_chrome_executable(
         if resolved:
             return resolved
     return ""
-
-
-def _powershell_literal(value: Any) -> str:
-    return "'" + str(value or "").replace("'", "''") + "'"
-
-
-def _posix_shell_literal(value: Any) -> str:
-    return "'" + str(value or "").replace("'", "'\"'\"'") + "'"
 
 
 def build_web_programming_skill_markdown(
@@ -6162,23 +6148,6 @@ def append_system_prompt_addon(system_prompt: str, addon: str) -> str:
     return (base + "\n\n" + suffix).strip() if base else suffix
 
 
-def github_account_prompt_block(github: dict[str, Any] | None) -> str:
-    """Return configured GitHub credentials plus deliberate read/write guidance."""
-    values = github if isinstance(github, dict) else {}
-    username = str(values.get("username") or "").strip()
-    pat = str(values.get("pat") or "").strip()
-    if not username and not pat:
-        return ""
-    return (
-        "CONNECTED GITHUB ACCOUNT\n\n"
-        f"Username: {username or '[not set]'}\n"
-        f"Personal access token: {pat or '[not set]'}\n\n"
-        "Use this account for GitHub reads when they are relevant to the task. Be thoughtful about writes: "
-        "create, modify, push, merge, publish, or delete GitHub data only when there is a direct task reason, "
-        "ideally explicit direction from the user."
-    )
-
-
 def _agents_config(config: dict[str, Any] | None) -> dict[str, Any]:
     agents = (config or {}).get("agents") if isinstance(config, dict) else {}
     return agents if isinstance(agents, dict) else {}
@@ -7155,6 +7124,19 @@ def _write_owned_chat_snapshot(path: Path, payload: Any) -> None:
 
 
 CHAT_STREAM_SNAPSHOT_WRITER = CoalescingAtomicJSONWriter(_write_owned_chat_snapshot)
+
+
+def _write_owned_dashboard_snapshot(path: Path, payload: Any) -> None:
+    """Do not recreate a deleted root or write into a different format generation."""
+    with DATA_ROOTS.lock_for_path(path):
+        manifest = path.parent.parent / DATA_MANIFEST_NAME
+        if not manifest.is_file():
+            return
+        DATA_ROOTS.assert_supported(manifest.parent)
+        atomic_write_json(path, payload)
+
+
+DASHBOARD_SNAPSHOT_WRITER = CoalescingAtomicJSONWriter(_write_owned_dashboard_snapshot)
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -8687,14 +8669,6 @@ def _iter_debug_report_value_lines(value: Any, *, indent: int=0, key_name: str='
     return
 
 
-def _chat_debug_report_value_lines(*args: Any, **kwargs: Any) -> list[str]:
-    return list(_iter_debug_report_value_lines(*args, **kwargs))
-
-
-def _chat_debug_report_section(lines: list[str], title: str) -> None:
-    lines.extend(["", "=" * 88, str(title), "=" * 88])
-
-
 def iter_chat_debug_report_lines(chat: dict[str, Any], turns: Iterable[dict[str, Any]], *, endpoint: dict[str, Any] | None=None, tool_settings: dict[str, Any] | None=None, summary_record: dict[str, Any] | None=None, data_root: str='', generated_at: str | None=None) -> Iterable[str]:
     """Build a detailed, human-readable diagnostic report for one chat.
 
@@ -9502,7 +9476,7 @@ class DataRootRegistry:
         # Drain background writers while their data-root locks still exist. A
         # test may remove and recreate the same temporary path immediately after
         # this call; no old worker may append into that replacement root.
-        for writer_name in ("CHAT_STREAM_SNAPSHOT_WRITER", "APP_LOG_WRITER"):
+        for writer_name in ("CHAT_STREAM_SNAPSHOT_WRITER", "DASHBOARD_SNAPSHOT_WRITER", "APP_LOG_WRITER"):
             writer = globals().get(writer_name)
             if writer is not None:
                 try:
@@ -9552,17 +9526,8 @@ def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, locati
         raise UnsupportedDataVersionError(f"{location} must be a JSON object")
     expected = set(template)
     actual = set(value)
-    optional = {"default_chat_subagent_profile_id"} if location in {"settings.llm", "app.json.settings.llm"} else set()
-    missing = sorted(str(key) for key in expected.difference(actual).difference(optional))
-    # Archived connector settings remain inert and untouched in compatible roots.
-    # They are not part of defaults, the scheduler, credentials, tools or the UI.
-    archived = (set(VAULT_SOURCE_TYPES) - set(VAULT_SOURCE_ORDER)) if location in {
-        "settings.vault", "app.json.settings.vault",
-    } else set()
-    for key in actual.intersection(archived):
-        if not isinstance(value[key], dict):
-            raise UnsupportedDataVersionError(f"{location}.{key} must be a JSON object")
-    extra = sorted(str(key) for key in actual.difference(expected).difference(archived))
+    missing = sorted(str(key) for key in expected.difference(actual))
+    extra = sorted(str(key) for key in actual.difference(expected))
     if missing or extra:
         details: list[str] = []
         if missing:
@@ -9573,8 +9538,6 @@ def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, locati
             f"{location} fields do not match the current data model ({'; '.join(details)})"
         )
     for key, expected_value in template.items():
-        if key in optional and key not in value:
-            continue
         actual_value = value[key]
         child_location = f"{location}.{key}"
         if isinstance(expected_value, dict):
@@ -12975,8 +12938,6 @@ class AppPaths:
     def credentials_dir(self) -> Path:
         return self.root_dir / "credentials"
 
-    def github_credentials_file(self) -> Path:
-        return self.credentials_dir() / "github.cred"
 
     def google_calendar_credentials_file(self) -> Path:
         return self.credentials_dir() / "google_calendar.cred"
@@ -13235,7 +13196,6 @@ class CredentialStore:
     """
 
     _DEFAULTS: dict[str, dict[str, Any]] = {
-        GITHUB_CREDENTIAL_ACCOUNT: {"username": "", "pat": ""},
         GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT: {"client_id": "", "client_secret": "", "token": None},
         GOOGLE_DRIVE_CREDENTIAL_ACCOUNT: {"client_id": "", "client_secret": "", "token": None},
         GMAIL_CREDENTIAL_ACCOUNT: {"email_address": "", "app_password": ""},
@@ -13255,8 +13215,6 @@ class CredentialStore:
 
     def _path(self, account: str) -> Path:
         key = str(account or "").strip().lower()
-        if key == GITHUB_CREDENTIAL_ACCOUNT:
-            return self.paths.github_credentials_file()
         if key == GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT:
             return self.paths.google_calendar_credentials_file()
         if key == GOOGLE_DRIVE_CREDENTIAL_ACCOUNT:
@@ -13280,10 +13238,6 @@ class CredentialStore:
         defaults = self._DEFAULTS[account]
         if not isinstance(values, dict) or set(values) != set(defaults):
             raise ValueError(f"Malformed {account} credential fields")
-        if account == GITHUB_CREDENTIAL_ACCOUNT:
-            if not all(isinstance(values.get(key), str) for key in ("username", "pat")):
-                raise ValueError("Malformed GitHub credentials")
-            return {"username": str(values["username"]), "pat": str(values["pat"])}
         if account == GMAIL_CREDENTIAL_ACCOUNT:
             if not all(isinstance(values.get(key), str) for key in ("email_address", "app_password")):
                 raise ValueError("Malformed Gmail credentials")
@@ -13366,14 +13320,6 @@ class CredentialStore:
                 update(current)
                 return self._save(key, current)
 
-    def load_github(self) -> dict[str, str]:
-        return self._load(GITHUB_CREDENTIAL_ACCOUNT)
-
-    def save_github(self, username: str, pat: str) -> dict[str, str]:
-        return self._save(GITHUB_CREDENTIAL_ACCOUNT, {
-            "username": str(username or ""),
-            "pat": str(pat or ""),
-        })
 
     def load_google_calendar(self) -> dict[str, Any]:
         return self._load(GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT)
@@ -15460,7 +15406,6 @@ class ChatStore:
             atomic_write_json(summary_path, summary)
         _best_effort_lifecycle_log(self.storage, "chat.endpoint.updated", {"chat_id": cid, "endpoint_profile_id": selected})
         return saved
-
 
 
     def get_endpoint_profile_id(self) -> str:
@@ -19304,18 +19249,6 @@ class GmailConnector(BaseVaultConnector):
             )
         self._data_changed()
         return {"ok": True, "source": source}
-
-
-def _http_header_value(headers: Any, name: str, default: str = "") -> str:
-    target = str(name or "").casefold()
-    try:
-        rows = headers.items()
-    except Exception:
-        rows = []
-    for key, value in rows:
-        if str(key or "").casefold() == target:
-            return str(value or default)
-    return str(default)
 
 
 class VaultConnectorManager:
@@ -24204,7 +24137,6 @@ class LLMRequestTimeoutError(TimeoutError):
         )
 
 
-
 def llm_reported_reasoning_tokens(usage: Any) -> int | None:
     """A token count is accounting, not proof that reasoning text was returned."""
     if not isinstance(usage, dict):
@@ -25921,35 +25853,6 @@ def current_context_vision_handoffs_from_tool_results(
             continue
         visit(result)
     return rows
-
-
-def remove_current_context_vision_messages(messages: list[dict[str, Any]]) -> int:
-    """Remove older tool-injected images so a one-image endpoint can inspect the next one."""
-    before = len(messages)
-    messages[:] = [
-        message for message in messages
-        if not (isinstance(message, dict) and bool(message.get(CURRENT_CONTEXT_VISION_MESSAGE_MARKER)))
-    ]
-    return before - len(messages)
-
-
-def retain_latest_current_context_vision_message(messages: list[dict[str, Any]]) -> int:
-    """Normalize replayed Agent history to the newest direct-vision handoff window."""
-    marked = [
-        index for index, message in enumerate(messages)
-        if isinstance(message, dict) and bool(message.get(CURRENT_CONTEXT_VISION_MESSAGE_MARKER))
-    ]
-    if len(marked) <= 1:
-        return 0
-    keep = marked[-1]
-    before = len(messages)
-    messages[:] = [
-        message for index, message in enumerate(messages)
-        if index == keep or not (
-            isinstance(message, dict) and bool(message.get(CURRENT_CONTEXT_VISION_MESSAGE_MARKER))
-        )
-    ]
-    return before - len(messages)
 
 
 def build_current_context_vision_message(
@@ -29776,9 +29679,6 @@ Keep synthesis, decisions and the final answer here. Use direct tools for small 
                 self.SLEEP_GUIDANCE,
                 "INTERACTIVE TERMINALS\n\n" + self.TERMINAL_GUIDANCE,
             ])
-            account_block = github_account_prompt_block(CredentialStore(self.paths).load_github())
-            if account_block:
-                sections.append(account_block)
         else:
             sections.append(
                 "GENERAL BEHAVIOR\n\nComplete the user's requested outcome faithfully. Preserve explicit constraints, "
@@ -41425,9 +41325,7 @@ class ToolRegistry:
         reviewer_context = globals().get("_REVIEWER_CONTEXT")
         reviewer = bool(reviewer_context.get()) if reviewer_context is not None else False
         if not reviewer and agent_id:
-            reviewer_lookup = globals().get("_reviewer_agent_from_id")
-            if callable(reviewer_lookup):
-                reviewer = reviewer_lookup(self.storage, agent_id) is not None
+            reviewer = _reviewer_agent_from_id(self.storage, agent_id) is not None
         reviewer_denylist = globals().get("EXPERT_MODE_REVIEWER_READ_ONLY_TOOL_DENYLIST", frozenset())
         if reviewer and (
             name in reviewer_denylist
@@ -43493,11 +43391,6 @@ class AgentRuntime:
                     + " Any terminal sessions are private to this Agent Task and close automatically when it ends."
                 ),
             ])
-            account_block = github_account_prompt_block(
-                CredentialStore(self.storage.paths).load_github()
-            )
-            if account_block:
-                sections.append(account_block)
         else:
             sections.append(
                 "GENERAL BEHAVIOR\n\nComplete the assigned textual outcome faithfully. Preserve explicit constraints, "
@@ -46482,6 +46375,106 @@ class LLMTaskRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+class DashboardTaskStore:
+    """Small durable summaries, separate from transient prompts and provider streams.
+
+    Each task has one atomic checkpoint. Deleted rows keep only their accounting
+    tombstone so deleting a child cannot reduce its parent's already-incurred cost.
+    The shared writer coalesces updates off the UI thread.
+    """
+
+    TEXT_FIELDS = frozenset({
+        "task_type", "title", "endpoint_label", "endpoint_profile_id", "endpoint_provider",
+        "chat_id", "source_chat_id", "agent_id", "logical_identity", "recovery_note",
+    })
+    NUMBER_FIELDS = frozenset({
+        "display_id", "task_run_id", "active_seconds", "wall_seconds", "input_tokens",
+        "output_tokens", "prefill_seconds", "generation_seconds",
+        "prefill_measured_input_tokens", "generation_measured_output_tokens",
+        "inference_count", "session_count", "endpoint_wait_seconds", *CACHE_USAGE_FIELDS,
+    })
+    RECORD_FIELDS = frozenset({
+        "task_id", "scope_id", "created_at", "updated_at", "state", "description",
+        "task_kind", "metadata",
+    })
+
+    def __init__(self, storage: Storage):
+        self.storage = storage
+        self.directory = storage.paths.root_dir / "dashboard"
+
+    def path(self, task_id: str) -> Path:
+        # IDs originate from uuid_v4(), never a user-supplied path fragment.
+        if str(uuid.UUID(str(task_id))) != str(task_id):
+            raise ValueError("Invalid dashboard task ID")
+        return self.directory / ("task_" + str(task_id) + ".json")
+
+    @staticmethod
+    def _nonnegative_number(value: Any) -> bool:
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+    @classmethod
+    def _summary_metadata(cls, meta: dict[str, Any]) -> dict[str, Any]:
+        values = {key: meta[key] for key in cls.TEXT_FIELDS if isinstance(meta.get(key), str)}
+        values.update({key: meta[key] for key in cls.NUMBER_FIELDS
+                       if cls._nonnegative_number(meta.get(key))})
+        tools = meta.get("tool_calls_by_type")
+        for key, fields in (("token_cost", TOKEN_COST_SUM_FIELDS),
+                            ("tool_calls_by_type", tools if isinstance(tools, dict) else ())):
+            source = meta.get(key)
+            if isinstance(source, dict):
+                values[key] = {str(field): source[field] for field in fields
+                               if cls._nonnegative_number(source.get(field))}
+        return values
+
+    def save(self, record: LLMTaskRecord, *, deleted: bool = False) -> None:
+        summary = {field: getattr(record, field) for field in self.RECORD_FIELDS if field != "metadata"}
+        # Deliberate allowlist: no credentials, raw prompts, image bodies or streams.
+        summary["metadata"] = self._summary_metadata(record.metadata)
+        payload = {"schema": DASHBOARD_TASK_SCHEMA, "deleted": bool(deleted), "record": summary}
+        DASHBOARD_SNAPSHOT_WRITER.submit(self.path(record.task_id), payload)
+
+    def flush(self, *, timeout: float = 15.0) -> None:
+        # Also include pending first writes that have not created a file yet.
+        writer = DASHBOARD_SNAPSHOT_WRITER
+        with writer._condition:
+            paths = {path for path in writer._generations if path.parent == self.directory}
+        if not writer.flush(paths, timeout=timeout):
+            raise TimeoutError("Dashboard history did not finish saving")
+        errors = [writer.last_error(path) for path in paths if writer.last_error(path)]
+        if errors:
+            raise OSError("Dashboard history could not be saved: " + errors[0])
+
+    def load(self) -> tuple[list[tuple[LLMTaskRecord, bool]], list[str]]:
+        self.flush()
+        records: list[tuple[LLMTaskRecord, bool]] = []
+        errors: list[str] = []
+        for path in sorted(self.directory.glob("task_*.json")):
+            try:
+                payload = read_json(path)
+                if (not isinstance(payload, dict) or set(payload) != {"schema", "deleted", "record"}
+                        or payload["schema"] != DASHBOARD_TASK_SCHEMA or type(payload["deleted"]) is not bool):
+                    raise ValueError("Unsupported dashboard history record")
+                row = payload["record"]
+                if not isinstance(row, dict) or set(row) != self.RECORD_FIELDS:
+                    raise ValueError("Malformed dashboard history fields")
+                if self.path(row["task_id"]) != path or row["state"] not in {"running", "completed", "cancelled", "failed"}:
+                    raise ValueError("Invalid dashboard identity or state")
+                if row["task_kind"] not in {"chat", "agent", "image", "system", "summary", "compaction"}:
+                    raise ValueError("Invalid dashboard task kind")
+                if not all(isinstance(row[key], str) for key in ("created_at", "updated_at", "description")):
+                    raise ValueError("Invalid dashboard text fields")
+                if row["scope_id"] is not None and not isinstance(row["scope_id"], str):
+                    raise ValueError("Invalid dashboard scope")
+                if not isinstance(row["metadata"], dict) or self._summary_metadata(row["metadata"]) != row["metadata"]:
+                    raise ValueError("Invalid dashboard metadata")
+                if int(row["metadata"].get("display_id", 0)) < 1:
+                    raise ValueError("Missing dashboard display ID")
+                records.append((LLMTaskRecord(**row), payload["deleted"]))
+            except (ValueError, TypeError, OSError, KeyError, OverflowError) as exc:
+                errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+        return records, errors
+
+
 class LLMTaskMonitor:
     """Track every logical Chat, Agent, Image, and System LLM Task for the Dashboard.
 
@@ -46510,7 +46503,7 @@ class LLMTaskMonitor:
         self._identity_to_task_id: dict[str, str] = {}
         self._inference_metric_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
         # Exactly one live Chat/Agent/Image Task may own the user-pinned first
-        # priority slot. The pointer is process-local like the live Task records.
+        # priority slot. The pointer is process-local; historical rows do not own live priority.
         self._cost_prices: dict[tuple[str, str], dict[str, Any]] = {}
         self._cost_events: dict[tuple[str, str], dict[str, Any]] = {}
         # Keep request-local costs on records. Chat rollups are a separate view,
@@ -46523,6 +46516,58 @@ class LLMTaskMonitor:
         self._lock = threading.RLock()
         self._revision = 0
         self._lifecycle_listeners: list[Callable[[str, str, str], Any]] = []
+        self.history = DashboardTaskStore(storage)
+        self._history_checkpoint_at: dict[str, float] = {}
+        self.history_errors: list[str] = []
+        self._restore_history()
+
+    def _restore_history(self) -> None:
+        records, self.history_errors = self.history.load()
+        for rec, deleted in records:
+            if deleted:
+                self._retain_deleted_cost_locked(rec)
+                continue
+            if rec.state == "running":
+                rec.state = "cancelled"
+                rec.metadata["recovery_note"] = "Interrupted when Velox closed; duration and usage stop at the last saved checkpoint."
+                self.history.save(rec)
+            rec.metadata.update(phase=rec.state, phase_started_monotonic=None,
+                                wall_started_monotonic=None, activity="inactive",
+                                history_restored=True, pause_requested=False,
+                                queue_priority=0, pinned_priority=False)
+            self._records[rec.task_id] = rec
+            identity = str(rec.metadata.get("logical_identity") or "")
+            if identity:
+                self._identity_to_task_id[identity] = rec.task_id
+        if records:
+            self._revision += 1
+        for error in self.history_errors:
+            self.storage.append_app_log("dashboard.history_load_failed", {"error": error})
+
+    def _retain_deleted_cost_locked(self, rec: LLMTaskRecord) -> None:
+        chat_id = self._cost_owner_chat_id(rec)
+        if chat_id and rec.metadata.get("token_cost"):
+            bucket = "chat" if rec.task_kind == "chat" else "subagents"
+            retired = self._retired_chat_costs.setdefault(chat_id, {})
+            retired[bucket] = sum_token_costs([retired.get(bucket, {}), rec.metadata["token_cost"]])
+
+    def _checkpoint_locked(self, rec: LLMTaskRecord, *, force: bool = False, deleted: bool = False) -> None:
+        now_mono = time.monotonic()
+        last = self._history_checkpoint_at.get(rec.task_id)
+        if not force and last is not None and now_mono - last < 5.0:
+            return
+        snapshot = self._snapshot_record(rec)
+        # Project elapsed time into the copy; never reset the live timing spans.
+        self._close_active_span_locked(snapshot, now_mono)
+        self._close_wall_span_locked(snapshot, now_mono)
+        self.history.save(snapshot, deleted=deleted)
+        self._history_checkpoint_at[rec.task_id] = now_mono
+
+    def flush_history(self) -> None:
+        with self._lock:
+            for rec in self._records.values():
+                self._checkpoint_locked(rec, force=True)
+        self.history.flush()
 
     @property
     def revision(self) -> int:
@@ -46671,7 +46716,6 @@ class LLMTaskMonitor:
                 rec.metadata["activity_started_monotonic"] = None
                 rec.metadata["activity_last_progress_monotonic"] = None
                 rec.metadata["activity_detail"] = ""
-                rec.metadata["activity_last_progress_monotonic"] = None
                 rec.metadata["prompt_progress_percent"] = None
                 rec.metadata["prompt_tokens_processed"] = None
                 rec.metadata["prompt_tokens_total"] = None
@@ -46680,6 +46724,8 @@ class LLMTaskMonitor:
                 rec.metadata["queue_state"] = "ready"
                 rec.metadata["pinned_priority"] = self._priority_task_id == rec.task_id
                 rec.metadata["logical_identity"] = identity
+                rec.metadata.pop("recovery_note", None)
+                rec.metadata.pop("history_restored", None)
                 self._cancel_callbacks.pop(rec.task_id, None)
                 self._pause_callbacks.pop(rec.task_id, None)
                 self._resume_callbacks.pop(rec.task_id, None)
@@ -47302,6 +47348,7 @@ class LLMTaskMonitor:
                 rec.metadata["pause_requested"] = False
             rec.updated_at = now_iso()
             self._revision += 1
+            self._checkpoint_locked(rec)
             event = self._snapshot_record(rec)
         if persist:
             self._append(event)
@@ -47439,6 +47486,7 @@ class LLMTaskMonitor:
             self._inference_metric_snapshots[key] = current
             rec.updated_at = now_iso()
             self._revision += 1
+            self._checkpoint_locked(rec, force=final)
         return True
 
     def add_inference_metrics(
@@ -47482,6 +47530,7 @@ class LLMTaskMonitor:
             meta["inference_count"] = max(0, int(meta.get("inference_count") or 0)) + 1
             rec.updated_at = now_iso()
             self._revision += 1
+            self._checkpoint_locked(rec, force=False)
         return True
 
     def update(
@@ -47564,7 +47613,7 @@ class LLMTaskMonitor:
             return bool(rec and rec.state in self.TERMINAL_STATES)
 
     def delete_task(self, task_id: str | None) -> bool:
-        """Remove one terminal process-local Dashboard Task and inspector history."""
+        """Hide a terminal Dashboard row and its inspector, retaining incurred costs."""
         if not task_id:
             return False
         rid = str(task_id)
@@ -47573,11 +47622,8 @@ class LLMTaskMonitor:
             if rec is None or rec.state not in self.TERMINAL_STATES:
                 return False
             snapshot = self._snapshot_record(rec)
-            chat_id = self._cost_owner_chat_id(rec)
-            if chat_id and rec.metadata.get("token_cost"):
-                bucket = "chat" if rec.task_kind == "chat" else "subagents"
-                retired = self._retired_chat_costs.setdefault(chat_id, {})
-                retired[bucket] = sum_token_costs([retired.get(bucket, {}), rec.metadata["token_cost"]])
+            self._checkpoint_locked(rec, force=True, deleted=True)
+            self._retain_deleted_cost_locked(rec)
             self._records.pop(rid, None)
             self._cancel_callbacks.pop(rid, None)
             self._pause_callbacks.pop(rid, None)
@@ -47866,7 +47912,8 @@ class LLMTaskMonitor:
             str(row.get("endpoint_name") or "Unassigned").casefold(),
             1 if str(row.get("state") or "") in terminal else 0,
             int(row.get("priority") or 1_000_000) if int(row.get("priority") or 0) > 0 else 1_000_000,
-            -float((row.get("metadata") or {}).get("created_monotonic") or 0.0),
+            -float(_iso_timestamp_epoch(row.get("created_at")) or 0.0),
+            -int(row.get("display_id") or 0),
         ))
         if limit is None:
             return rows
@@ -47912,12 +47959,6 @@ class LLMTaskMonitor:
                 clean_name = str(tool_name or "").strip()
                 if clean_name and count:
                     tool_counts[clean_name] += count
-        top_tools = [
-            {"tool_name": tool_name, "count": count}
-            for tool_name, count in sorted(
-                tool_counts.items(), key=lambda item: (-int(item[1]), str(item[0]).casefold())
-            )[:10]
-        ]
         succeeded = int(counts.get("completed", 0))
         failed = int(counts.get("failed", 0))
         cancelled = int(counts.get("cancelled", 0))
@@ -47950,7 +47991,6 @@ class LLMTaskMonitor:
             },
             "task_types": dict(collections.Counter(str(row.get("task_type") or "System") for row in rows)),
             "tool_calls_by_type": dict(tool_counts),
-            "top_tools": top_tools,
             "costs_24h": costs_24h,
         }
 
@@ -47993,6 +48033,12 @@ class LLMTaskMonitor:
         return cancelled
 
     def _append(self, rec: LLMTaskRecord) -> None:
+        # Resolve the latest record under the lock: a delayed lifecycle event must
+        # not overwrite a newer terminal checkpoint or a deletion tombstone.
+        with self._lock:
+            current = self._records.get(rec.task_id)
+            if current is not None:
+                self._checkpoint_locked(current, force=True)
         self.storage.append_app_log(
             "llm_task." + str(rec.state or "updated"),
             {
@@ -53421,9 +53467,9 @@ CALENDAR_RIGHT_STACK_DIVIDER_HOVER_HALF_PX = 4
 CHAT_COLUMN_GAP_PX = 12
 CHAT_ACTIVITY_PULSE_SECONDS = 1.95
 CHAT_ACTIVITY_GLOW_RANGE_MULTIPLIER = 1.20
-CHAT_LIST_WIDTH_DEFAULT = 830
+CHAT_LIST_WIDTH_DEFAULT = 1104  # 33% wider than the former 830px default.
 CHAT_LIST_WIDTH_MIN = 260
-CHAT_LIST_MAX_WIDTH_FRACTION = 0.50
+CHAT_LIST_MAX_WIDTH_FRACTION = 0.60
 CHAT_LIST_ROW_RIGHT_GUTTER_PX = 20
 CHAT_MAIN_WIDTH_MIN = 420
 CHAT_DIVIDER_HOVER_HALF_PX = 4
@@ -53468,10 +53514,14 @@ def chat_layout_for_rect(rect: Rect, *, chat_list_width: int | None = None) -> C
         # On narrow windows, retain more room for the primary conversation
         # surface. The list remains usable but cannot swallow most of the page.
         minimum = max(80, min(CHAT_LIST_WIDTH_MIN, int(round(available * 0.28))))
-    # Bound against the current viewport, not an absolute pixel ceiling. Subtract
-    # the divider first, so even at the limit the transcript owns at least half
-    # of the usable width. On very narrow windows the sidebar floor yields too.
-    maximum = max(1, int(available * CHAT_LIST_MAX_WIDTH_FRACTION))
+    # Let the wider default fit a normal desktop, instead of silently capping it
+    # at the old 50% divider limit. Preserve the transcript's readable minimum;
+    # genuinely narrow windows still reserve at least half for the conversation.
+    if available >= CHAT_LIST_WIDTH_MIN + CHAT_MAIN_WIDTH_MIN:
+        maximum = max(1, min(int(available * CHAT_LIST_MAX_WIDTH_FRACTION),
+                             available - CHAT_MAIN_WIDTH_MIN))
+    else:
+        maximum = max(1, available // 2)
     minimum = min(minimum, maximum)
     list_w = int(clamp(requested, minimum, maximum))
     main_w = max(1, available - list_w)
@@ -76197,7 +76247,6 @@ class Panels:
             "settings.accounts.gmail.sync_interval_minutes": ("vault", "gmail", "sync_interval_minutes"),
 
 
-
         }
         if widget in exact:
             return exact[widget]
@@ -76719,17 +76768,6 @@ class Panels:
         meshy_h = self._settings_card_height_for_content(self._settings_rows_height(5))
         return llm_h, comfy_h, meshy_h
 
-    def _github_settings_card_height(self, column_width: int) -> int:
-        inner_w = self._settings_inner_width_for_column(column_width)
-        description_h = self._settings_wrapped_text_height(
-            "Store one GitHub username and personal access token for chats and agents to use through ordinary shell or terminal workflows.", inner_w,
-        )
-        note_h = self._settings_wrapped_text_height(
-            "Reads are available when relevant. Writes should have a direct task reason, ideally explicit direction from the user.", inner_w,
-        )
-        return self._settings_card_height_for_content(
-            description_h + SETTINGS_BLOCK_GAP + self._settings_rows_height(2) + SETTINGS_BLOCK_GAP + note_h
-        )
 
     @staticmethod
     def _account_connector_card_heights() -> tuple[int, int, int]:
@@ -76764,14 +76802,13 @@ class Panels:
         general_cards = self._general_settings_card_heights(content_width)
         endpoint_cards = self._endpoint_settings_card_heights(content_width)
         agent_card_h, pa_card_h = self._agent_settings_card_heights(content_width)
-        github_h = self._github_settings_card_height(content_width)
         calendar_h, drive_h, gmail_h = self._account_connector_card_heights()
         defaults_h = self._settings_card_height_for_content(self._settings_rows_height(6))
         heights = {
             "General": sum(general_cards) + gap * (len(general_cards) - 1) + 8,
             "Appearance": self._settings_card_height_for_content(self._settings_rows_height(10)) + 20,
             "Endpoints": sum(endpoint_cards) + gap * (len(endpoint_cards) - 1) + 20,
-            "Accounts": github_h + gap + calendar_h + gap + drive_h + gap + gmail_h + 24,
+            "Accounts": calendar_h + gap + drive_h + gap + gmail_h + 24,
             "Agents": agent_card_h + gap + pa_card_h + gap + 360 + gap + 360 + 20,
             "Skills": 1240 + 20,
             "Tools": (
@@ -77263,61 +77300,8 @@ class Panels:
         if credential_store is None:
             credential_store = CredentialStore(self.services.storage.paths)
             self.services.credentials = credential_store
-        try:
-            github = credential_store.load_github()
-        except Exception as exc:
-            github = {"username": "", "pat": ""}
-            self._append_google_calendar_event(f"Credential error: {type(exc).__name__}: {exc}")
         calendar_card_h, drive_card_h, gmail_card_h = self._account_connector_card_heights()
         y = col.y
-        card = self._settings_card_rect(col, y, self._github_settings_card_height(col.w))
-        inner = self._draw_settings_card_shell(card, "GitHub")
-        description_h = self._settings_wrapped_text_height(
-            "Store one GitHub username and personal access token for chats and agents to use through ordinary shell or terminal workflows.",
-            inner.w,
-        )
-        self.widgets.clipped_text(
-            Rect(inner.x, inner.y, inner.w, description_h),
-            "Store one GitHub username and personal access token for chats and agents to use through ordinary shell or terminal workflows.",
-            Palette.muted2,
-            tooltip="The configured values are included in chat and agent system prompts.",
-        )
-        cy = inner.y + description_h + SETTINGS_BLOCK_GAP
-        label_w = min(190, max(130, int(inner.w * 0.28)))
-        input_x = inner.x + label_w + 10
-        input_w = min(SETTINGS_LONG_INPUT_W, max(1, inner.x + inner.w - input_x))
-        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Username", Palette.muted2)
-        next_github_username = self.widgets.text_input(
-            "settings.accounts.github.username",
-            Rect(input_x, cy, input_w, SETTINGS_CONTROL_H),
-            str(github.get("username") or ""),
-            "GitHub username",
-            tooltip="GitHub username included in chat and agent system prompts.",
-        )
-        cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
-        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Personal access token", Palette.muted2)
-        next_github_pat = self.widgets.text_input(
-            "settings.accounts.github.pat",
-            Rect(input_x, cy, input_w, SETTINGS_CONTROL_H),
-            str(github.get("pat") or ""),
-            "github_pat_...",
-            password=True,
-            tooltip="GitHub PAT included in chat and agent system prompts for relevant repository work.",
-        )
-        if next_github_username != str(github.get("username") or "") or next_github_pat != str(github.get("pat") or ""):
-            try:
-                github = credential_store.save_github(next_github_username, next_github_pat)
-            except Exception as exc:
-                self.state.add_toast("GitHub credentials could not be saved", f"{type(exc).__name__}: {exc}", "error")
-        cy += SETTINGS_CONTROL_H + SETTINGS_BLOCK_GAP
-        self.widgets.clipped_text(
-            Rect(inner.x, cy, inner.w, max(1, inner.y + inner.h - cy)),
-            "Reads are available when relevant. Writes should have a direct task reason, ideally explicit direction from the user.",
-            Palette.muted2,
-            tooltip="Velox tells the LLM to be deliberate before creating, modifying, pushing, merging, publishing, or deleting GitHub data.",
-        )
-
-        y += card.h + SETTINGS_CARD_GAP_Y
         try:
             google_cfg = credential_store.load_google_calendar()
         except Exception as exc:
@@ -77334,7 +77318,7 @@ class Panels:
             tooltip=google_intro + "\nScope: " + GOOGLE_CALENDAR_SCOPES[0],
         )
         cy = inner.y
-        # Match the GitHub username geometry exactly so account fields align.
+        # Use the same label and input geometry for every account.
         label_w = min(190, max(130, int(inner.w * 0.28)))
         value_x = inner.x + label_w + 10
         value_w = min(SETTINGS_LONG_INPUT_W, max(1, inner.x + inner.w - value_x))
@@ -79257,6 +79241,8 @@ class Panels:
                 f"Cached Input: {cache_label} | Cache reporting: {cache_detail}\n"
                 f"IN t/s: {input_tps:,.1f} | OUT t/s: {generation_tps:,.1f} | Task ID: {task_id}\n"
                 + cost_tooltip
+                + ("\n" + str(rec["metadata"]["recovery_note"])
+                   if (rec.get("metadata") or {}).get("recovery_note") else "")
             ),
         }
 
@@ -79493,8 +79479,10 @@ class Panels:
     def _draw_agent_summary_cards(self, rect: Rect, stats: dict[str, Any]) -> int:
         """Four cards, weighted 0.5 : 1.5 : 1 : 2 on a full-width Dashboard."""
         gap = 12
+        # Keep the pre-bar-chart height. Width weights must not enlarge cards
+        # vertically; additional cost bars use the existing chart scrollbar.
         card_h = max(232, self.f.line_h + 64 + 5 * max(27, self.f.line_h + 3),
-                     self.f.line_h + 61 + max(23, self.f.line_h + 3) + 5 * max(33, self.f.line_h + 14))
+                     self.f.line_h + 60 + 6 * max(23, self.f.line_h + 1))
         cards = self._dashboard_summary_card_rects(rect, card_h,
             min_standard_width=2 * (max(self.widgets._text_width("TASK STATUS"), self.widgets._text_width("0 Inferencing")) + 32))
         row_count = len({card.y for card in cards})
@@ -79535,8 +79523,13 @@ class Panels:
 
         def ring_layout(body: Rect) -> tuple[Rect, int, int]:
             size = max(88, min(body.h - 8, int((min(cards[1].w, cards[2].w) - 28) * 0.43)))
+            # At larger text sizes preserve the outcome counts, not an oversized
+            # donut. Heights and the explicit 24-pixel legend gap stay fixed.
+            legend_width = max(self.widgets._text_width(text) for text, _color, _tip in outcome_lines)
+            common_body_width = min(cards[1].w, cards[2].w) - 28
+            size = min(size, max(88, common_body_width - 24 - 16 - legend_width))
             ring = Rect(body.x, body.y + max(0, (body.h - size) // 2), size, size)
-            legend_x = ring.x + ring.w + 14
+            legend_x = ring.x + ring.w + 24
             return ring, legend_x, max(1, body.x + body.w - legend_x)
 
         stalled = int(counts.get("stalled", 0) or 0)
@@ -79565,6 +79558,16 @@ class Panels:
             (f"{paused:,} Paused", Palette.warn, "User-paused or pausing Tasks"),
         ])
 
+        completed = int(counts.get("completed", 0) or 0)
+        failed = int(counts.get("failed", 0) or 0)
+        cancelled = int(counts.get("cancelled", 0) or 0)
+        percentages = stats.get("outcome_percentages") if isinstance(stats.get("outcome_percentages"), dict) else {}
+        outcome_lines = [
+            (f"{float(percentages.get('completed', 0.0) or 0.0):.0f}% Complete ({completed:,})", Palette.ok, f"Completed: {completed:,}"),
+            (f"{float(percentages.get('failed', 0.0) or 0.0):.0f}% Failed ({failed:,})", Palette.danger, f"Failed: {failed:,}"),
+            (f"{float(percentages.get('cancelled', 0.0) or 0.0):.0f}% Cancelled ({cancelled:,})", Palette.warn, f"Cancelled: {cancelled:,}"),
+        ]
+
         input_tokens = int(stats.get("input_tokens", 0) or 0)
         output_tokens = int(stats.get("output_tokens", 0) or 0)
         total_tokens = int(stats.get("total_tokens", 0) or 0)
@@ -79582,10 +79585,6 @@ class Panels:
             (f"Total {total_tokens:,}", Palette.text, f"Total tokens: {total_tokens:,}"),
         ])
 
-        completed = int(counts.get("completed", 0) or 0)
-        failed = int(counts.get("failed", 0) or 0)
-        cancelled = int(counts.get("cancelled", 0) or 0)
-        percentages = stats.get("outcome_percentages") if isinstance(stats.get("outcome_percentages"), dict) else {}
         outcomes_body = self._draw_agent_metric_card(cards[2], "Task outcomes")
         ring, legend_x, legend_w = ring_layout(outcomes_body)
         self._draw_ring_chart(
@@ -79593,11 +79592,7 @@ class Panels:
             center_text=f"{float(percentages.get('completed', 0.0) or 0.0):.0f}%",
             center_tooltip=f"Completion rate across {terminal_tasks:,} terminal Tasks",
         )
-        draw_bullet_lines(outcomes_body, legend_x, legend_w, [
-            (f"{float(percentages.get('completed', 0.0) or 0.0):.0f}% Complete ({completed:,})", Palette.ok, f"Completed: {completed:,}"),
-            (f"{float(percentages.get('failed', 0.0) or 0.0):.0f}% Failed ({failed:,})", Palette.danger, f"Failed: {failed:,}"),
-            (f"{float(percentages.get('cancelled', 0.0) or 0.0):.0f}% Cancelled ({cancelled:,})", Palette.warn, f"Cancelled: {cancelled:,}"),
-        ])
+        draw_bullet_lines(outcomes_body, legend_x, legend_w, outcome_lines)
 
         self._draw_dashboard_cost_card(cards[3], stats.get("costs", stats.get("costs_24h", {})) or {})
         return row_count * card_h + (row_count - 1) * gap
@@ -80334,6 +80329,9 @@ class VeloxApp:
             credentials=self.credentials,
         )
         self.ui_state = UIState()
+        if self.monitor.history_errors:
+            self.ui_state.add_toast("Some dashboard history could not be loaded",
+                                    "See the application log for the affected records.", "error")
         self.chat.set_visibility_provider(
             lambda chat_id: (
                 normalize_active_panel(self.ui_state.active_panel) == "chat"
@@ -80739,6 +80737,8 @@ class VeloxApp:
                 await self.agent_runtime.shutdown()
             async with cleanup_step('terminal shutdown'):
                 await asyncio.to_thread(self.tools.terminal_runtime.shutdown_all, reason="Velox closed; active terminal session ended.")
+            async with cleanup_step('dashboard history'):
+                await asyncio.to_thread(self.monitor.flush_history)
             async with cleanup_step('log drain'):
                 await asyncio.to_thread(APP_LOG_WRITER.flush)
             async with cleanup_step('font teardown'):
@@ -81138,7 +81138,6 @@ class RecoveryService:
                 errors.append({"path": str(candidate), "error": str(exc)})
         credential_store = CredentialStore(self.storage.paths)
         for account, path, loader in (
-            (GITHUB_CREDENTIAL_ACCOUNT, self.storage.paths.github_credentials_file(), credential_store.load_github),
             (GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT, self.storage.paths.google_calendar_credentials_file(), credential_store.load_google_calendar),
             (GOOGLE_DRIVE_CREDENTIAL_ACCOUNT, self.storage.paths.google_drive_credentials_file(), credential_store.load_google_drive),
             (GMAIL_CREDENTIAL_ACCOUNT, self.storage.paths.gmail_credentials_file(), credential_store.load_gmail),
@@ -82016,45 +82015,6 @@ def _exit_expert_task(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
     return _save_expert_state(self, state)
 
 
-def _expert_rows(self: Any, state: Any = None, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
-    if state is None or not isinstance(state, dict):
-        state = _load_expert_state(self)
-    return _expert_rows_from_state(state)
-
-
-def _format_expert_state(self: Any, state: Any = None, *args: Any, **kwargs: Any) -> str:
-    if state is None or not isinstance(state, dict):
-        state = _load_expert_state(self)
-    return _format_expert_rows(state) if state else "Checklist is not active for this Task."
-
-
-def _expert_progress_snapshot(self: Any, state: Any = None, *args: Any, **kwargs: Any) -> str:
-    if state is None or not isinstance(state, dict):
-        state = _load_expert_state(self)
-    if not state:
-        return ""
-    if state.get("checklist_task_memory"):
-        return str(state["checklist_task_memory"])
-    counts = _expert_state_counts(state)
-    lines = [
-        "CURRENT CHECKLISTS PROGRESS",
-        f"{counts['verified']}/{counts['total']} requirements verified; "
-        f"{counts['done']} awaiting review; {counts['in_progress']} in progress; "
-        f"{counts['not_started']} not started.",
-    ]
-    for item in state.get("requirements") or []:
-        status = str(item.get("status") or "")
-        if status == EXPERT_MODE_REQUIREMENT_IN_PROGRESS:
-            lines.append(f"- {item['id']}: {item['requirement']}")
-            lines.append(f"  Progress: {item.get('progress','')}")
-            lines.append(f"  Next: {item.get('next_step','')}")
-        elif status == EXPERT_MODE_REQUIREMENT_NOT_STARTED:
-            lines.append(f"- {item['id']}: {item['requirement']} (not started)")
-        elif status == EXPERT_MODE_REQUIREMENT_DONE:
-            lines.append(f"- {item['id']}: done, awaiting independent review. {item.get('progress','')}")
-    return "\n".join(lines)
-
-
 def _expert_task_memory_class(cls: Any, task_facts: Any, state: Any = None) -> str:
     sections = [str(task_facts or "").strip()]
     if isinstance(state, dict) and str(state.get("status") or "") == "active":
@@ -82341,14 +82301,6 @@ def _reviewer_agent_from_id(storage: Any, agent_id: Any) -> dict[str, Any] | Non
     except Exception:
         return None
     return agent if _is_reviewer_agent(agent) else None
-
-
-def _blocked_role_tool_result(name: str) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "error": f"Checklist Reviewer is read-only and cannot execute mutating tool {name!r}.",
-        "reviewer_read_only": True,
-    }
 
 
 # Reviewer tool filtering and execution enforcement are integrated at the existing
@@ -82959,34 +82911,6 @@ async def _call_maybe_async(callable_value: Any, *args: Any, **kwargs: Any) -> A
     return result
 
 
-def _bind_expert_call(function: Any, available: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
-    signature = inspect.signature(function)
-    positional: list[Any] = []
-    keyword: dict[str, Any] = {}
-    for parameter in signature.parameters.values():
-        if parameter.name in {"self", "cls"}:
-            continue
-        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
-            continue
-        if parameter.name in available:
-            value = available[parameter.name]
-        elif parameter.default is not inspect.Parameter.empty:
-            continue
-        elif "agent" in parameter.name and "id" in parameter.name:
-            value = available.get("agent_id", "")
-        elif "request" in parameter.name and "id" in parameter.name:
-            value = available.get("request_id", uuid.uuid4().hex)
-        elif parameter.annotation is bool:
-            value = False
-        else:
-            value = available.get("task", "")
-        if parameter.kind == parameter.POSITIONAL_ONLY:
-            positional.append(value)
-        else:
-            keyword[parameter.name] = value
-    return positional, keyword
-
-
 def _find_agent_runtime(runtime: Any) -> Any:
     if runtime.__class__.__name__ == "AgentRuntime":
         return runtime
@@ -83482,15 +83406,6 @@ def _append_checklist_jsonl(path: Path, value: dict[str, Any]) -> None:
                 os.fsync(handle.fileno())
             except OSError:
                 pass
-
-
-def _bind_checklist_arguments(function: Any, self_obj: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    try:
-        signature = inspect.signature(function)
-        bound = signature.bind_partial(self_obj, *args, **kwargs)
-        return dict(bound.arguments)
-    except Exception:
-        return dict(kwargs)
 
 
 def _call_supported_arguments(method: Any, values: dict[str, Any]) -> Any:
@@ -84508,16 +84423,6 @@ _EXPERT_PROGRESS_BASE_DESCRIPTOR = ExpertModeStore.__dict__.get("progress_snapsh
 _EXPERT_HISTORY_BASE = getattr(ExpertModeStore, "history", None)
 
 
-def _checklist_owner_from_bound(bound: dict[str, Any], state: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    state = state or {}
-    return {
-        "owner_kind": str(bound.get("owner_kind") or state.get("owner_kind") or ("agent" if bound.get("agent_id") or state.get("agent_id") else "chat")),
-        "chat_id": str(bound.get("chat_id") or state.get("chat_id") or ""),
-        "agent_id": str(bound.get("agent_id") or state.get("agent_id") or ""),
-        "task_run_id": int(bound.get("task_run_id") or state.get("task_run_id") or 0),
-    }
-
-
 def _canonical_checklists(store: Any) -> tuple[ChecklistStore, dict[str, Any]]:
     """Bind a read-only runtime facade to its canonical Chat/Agent Checklist store."""
     owner = {
@@ -84576,7 +84481,6 @@ def _expert_checklist_history(self: Any, *args: Any, **kwargs: Any) -> Any:
 
 if _EXPERT_HISTORY_BASE is not None:
     ExpertModeStore.history = _expert_checklist_history
-
 
 
 class ChecklistStatisticsCache:

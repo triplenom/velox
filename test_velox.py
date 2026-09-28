@@ -9,12 +9,10 @@ from __future__ import annotations
 
 import argparse
 import ast
-import calendar as calendar_module
 import base64
 import asyncio
 import copy
 import contextlib
-import bisect
 import codecs
 import collections
 import ctypes
@@ -24,17 +22,12 @@ import html
 import http.server
 import http.client
 import imaplib
-import itertools
 import inspect
 import io
-import ipaddress
 import ssl
-import secrets
 import signal
-import unicodedata
 import json
 import math
-import mimetypes
 import platform
 import os
 import re
@@ -45,26 +38,17 @@ import sys
 import time
 import threading
 import tempfile
-import textwrap
 import struct
 import urllib.parse
 import urllib.request
 import urllib.error
 import zlib
-import webbrowser
-import traceback
-import weakref
 import unittest
-import email
-import functools
-import fnmatch
-from email import policy as email_policy
-from email.header import decode_header
-from email.utils import format_datetime, getaddresses, parsedate_to_datetime
+from email.utils import format_datetime, parsedate_to_datetime
 from unittest import mock
 import uuid
-from dataclasses import dataclass, field
-from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from dataclasses import field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, NoReturn, Optional
@@ -73,7 +57,6 @@ from typing import Any, Callable, Iterable, NoReturn, Optional
 _TIMING_PERF = time.perf_counter
 _TIMING_TIME = time.time
 _CHILD_STARTED = _TIMING_PERF()
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Prefer this test file's matching application, even beside an older velox.py.
 # Register the normal module name so dataclasses, mocks and child tests agree.
@@ -85,6 +68,20 @@ if _application_spec is None or _application_spec.loader is None:
 velox = importlib.util.module_from_spec(_application_spec)
 sys.modules["velox"] = velox
 _application_spec.loader.exec_module(velox)
+
+
+class _TemporaryDataDirectory(tempfile.TemporaryDirectory):
+    """Drain task-summary checkpoints before disposing a test-owned directory.
+
+    Tests may create a monitor inside a local ``with`` rather than a shared
+    runtime fixture. Always finish its background writes before rmtree, including
+    on assertion failure, so runner timing cannot race directory destruction.
+    """
+
+    def cleanup(self) -> None:
+        if not velox.DASHBOARD_SNAPSHOT_WRITER.flush(timeout=15.0):
+            raise TimeoutError("Test dashboard checkpoints did not drain")
+        super().cleanup()
 
 
 def _legacy_endpoint_fixture_profiles() -> list[dict[str, Any]]:
@@ -322,7 +319,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
     def test_successful_replace_and_first_creation(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -336,7 +333,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
             self._assert_no_temp_files(fresh)
 
     def test_partial_temp_write_then_exception_keeps_prior_target(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -359,7 +356,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
             self._assert_no_temp_files(fresh)
 
     def test_short_write_without_exception_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -398,7 +395,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
         self.assertEqual(bytes(handle.collected), payload)
 
     def test_flush_failure_aborts_before_replace(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -437,7 +434,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
             self._assert_no_temp_files(target)
 
     def test_fsync_failure_aborts_before_replace(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -448,7 +445,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
             self._assert_no_temp_files(target)
 
     def test_permanent_replace_failure_propagates_without_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -474,7 +471,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
             self._assert_no_temp_files(target)
 
     def test_transient_replace_failures_then_success(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -497,7 +494,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
             self._assert_no_temp_files(target)
 
     def test_exhausted_transient_retries_leave_prior_target_intact(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -525,7 +522,7 @@ class PlainAtomicWriteBytesTests(unittest.TestCase):
             self._assert_no_temp_files(target)
 
     def test_secondary_temp_cleanup_failure_preserves_primary_error(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "state.json"
             target.write_bytes(b"before")
@@ -806,7 +803,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("Color(255, 205, 96)", color_source)
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_visible_glyph_bounds_center_title_and_token_ink_not_baseline_box(self) -> None:
@@ -819,7 +816,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertGreater(draw_y, 100 + (30 - font.line_h) // 2)
 
     def test_resource_settings_are_strict_without_additive_fill(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths = velox.AppPaths(root)
             root.mkdir(parents=True, exist_ok=True)
@@ -829,7 +826,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             with self.assertRaisesRegex(velox.UnsupportedDataVersionError, "missing"):
                 velox.Storage(paths).load_config()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             missing = storage.load_config()
             missing["web"].pop("fetch_max_bytes")
@@ -881,11 +878,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             runtime.cancel(str(result["agent_id"]))
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_config_and_app_state_round_trip_inside_app_json(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats = _make_test_chat_stack(Path(td))
             config = storage.load_config()
             config["history"]["first_message_context_max_chars"] = 22222
@@ -900,7 +897,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertFalse((Path(td) / "app_state.json").exists())
 
     def test_cross_instance_manifest_and_stale_chat_writes_preserve_newer_data(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths_a = velox.AppPaths(root)
             storage_a = velox.Storage(paths_a)
@@ -948,7 +945,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(fresh["stats"]["tool_calls_by_type"]["fs_read"]["succeeded"], 1)
 
     def test_manifest_writes_keep_exact_schema_and_reject_unknown_state_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats = _make_test_chat_stack(Path(td))
             original = storage.load_config()
 
@@ -992,7 +989,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             velox.Storage._validate_current_manifest(manifest)
 
     def test_settings_blank_click_commits_focused_numeric_draft(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             panel = velox.Panels.__new__(velox.Panels)
             panel.services = type("ServicesStub", (), {"storage": storage})()
@@ -1029,7 +1026,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(panel.state.active_widget, "settings.web.default_search_results")
 
     def test_store_cache_isolation_stats_preservation_and_atomic_turn_rewrites(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._chat(Path(td))
             chat_id = str(chat["chat_id"])
 
@@ -1087,7 +1084,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_other_schema_roots_are_rejected_without_mutation_and_credentials_remain_portable(self) -> None:
         for old_version in ("v246", "v243", "v141", "v140", "v138", "v137", "v136", "v133", "v130", "v117", "v99"):
-            with self.subTest(old_version=old_version), tempfile.TemporaryDirectory() as td:
+            with self.subTest(old_version=old_version), _TemporaryDataDirectory() as td:
                 root = Path(td)
                 old = velox.default_app_manifest()
                 old["schema"] = f"velox_app.{old_version}"
@@ -1117,7 +1114,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_chat_directory_has_required_files_and_subdirectories(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, _chats, chat = self._chat(Path(td))
             chat_dir = paths.chat_dir(chat["chat_id"])
             for name in ("chat.json", "turns.jsonl", "summary.json"):
@@ -1133,7 +1130,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIsNone(persisted["week_start_date"])
 
     def test_chat_turn_copy_and_branch_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, chats, chat = self._chat(root)
             source = root / "blue-folder.txt"
@@ -1168,7 +1165,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue((paths.chat_dir(branch["chat_id"]) / branch_attachment["path"]).is_file())
 
     def test_chat_feature_model_includes_locked_tool_categories_without_persisted_autoscroll(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, chats, chat = self._chat(Path(td))
             features = chats.load_chat(chat["chat_id"])["features"]
             self.assertEqual(set(features), {
@@ -1193,7 +1190,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                     chats.set_chat_feature(velox.APP_SCOPE_ID, chat["chat_id"], removed, True)
 
     def test_single_root_log_uses_error_warning_info_severities(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, _chats = _make_test_chat_stack(root)
             storage.append_app_log("test.info", {"message": "all good unique"})
@@ -1254,7 +1251,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(velox.history_context_max_chars_from_config({"history": {"first_message_context_max_chars": 9999999}}), 9999999)
 
     def test_all_chat_summaries_are_newest_first_and_whole_block_capped(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats = _make_test_chat_stack(Path(td))
             newest = chats.create_chat("Newest")
             middle = chats.create_chat("Middle")
@@ -1280,7 +1277,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(none_text, "")
 
     def test_first_message_history_snapshot_is_chronological_stable_and_capped(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             history_chat = chats.create_chat("History")
             self._write_chat_summary(paths, history_chat["chat_id"], "- Durable prior decision")
@@ -1313,7 +1310,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(runtime._build_messages(velox.APP_SCOPE_ID, current["chat_id"])[0]["content"], first_system)
 
     def test_disabled_first_message_history_is_not_appended(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             try:
                 history_chat = chats.create_chat("History")
@@ -1388,11 +1385,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("chat_history_context_enabled", user_turns[1])
             self.assertIn("Snapshot context", runtime._first_message_history_context(velox.APP_SCOPE_ID, chat_id, turns))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_context_prompt_has_general_paths_agent_no_poll_guidance_and_no_permissions(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, _chats, chat = self._chat(Path(td))
             content = velox.ContextAssembler(paths).assemble_chat_context(velox.APP_SCOPE_ID, chat["chat_id"])[0]["content"]
             for expected in (
@@ -1423,7 +1420,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertFalse((root / "summary.json").exists())
             self.assertFalse((root / "all_chats_summary.json").exists())
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_file_tools_use_general_paths_and_absolute_chat_workspace_defaults(self) -> None:
@@ -1451,7 +1448,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             finally:
                 external.unlink(missing_ok=True)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_relative_shell_and_python_cwds_are_chat_local(self) -> None:
@@ -1475,11 +1472,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             workspace = paths.chat_workspace_dir(chat["chat_id"]).resolve()
             self.assertEqual(seen_cwds, [workspace, workspace])
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_attachments_are_chat_local(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, _chats, chat = self._chat(root)
             source = root / "source.txt"
@@ -1491,7 +1488,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(meta["chat_id"], chat["chat_id"])
 
     def test_search_is_app_chat_centric(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._chat(Path(td), "Search target")
             chats.append_turn(velox.APP_SCOPE_ID, chat["chat_id"], velox.make_turn(chat["chat_id"], "user", "needle phrase"))
             velox.atomic_write_text(paths.chat_workspace_dir(chat["chat_id"]) / "notes.txt", "another needle phrase")
@@ -1501,7 +1498,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(any(hit.get("type") == "file" for hit in app_hits))
 
     def test_recovery_rebuilds_only_chat_owned_derived_state(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td) / "app"
             paths, storage, _chats, chat = self._chat(root)
             shutil.rmtree(paths.chat_temp_dir(chat["chat_id"]))
@@ -1576,10 +1573,8 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('elif section == "Skills"', body)
 
         accounts = self._method_source(velox.Panels, "_draw_accounts_settings_content")
-        self.assertIn('"GitHub"', accounts)
-        self.assertIn('settings.accounts.github.username', accounts)
-        self.assertIn('settings.accounts.github.pat', accounts)
-        self.assertIn('direct task reason', accounts)
+        for name in ('"Google Calendar"', '"Google Drive"', '"Gmail"'):
+            self.assertIn(name, accounts)
 
         data_card = self._method_source(velox.Panels, "_draw_app_data_card")
         for label in ("Working directory", "app.json", "Chats", "Agents", "Skills", "Log"):
@@ -1704,7 +1699,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b"")
 
         velox.MARKDOWN_IMAGE_CACHE.clear_for_tests()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             image_path = root / "local image.png"
             image_path.write_bytes(png_bytes())
@@ -1837,7 +1832,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             await agent_runtime.shutdown()
             chat_runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_timeout_pauses_reports_and_resume_doubles_budget(self) -> None:
@@ -1903,11 +1898,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             await runtime.shutdown()
             chat_runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_store_layout_filtering_counts_and_restart_recovery(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, chats = _make_test_chat_stack(root)
             chat_a = chats.create_chat("Agent source A")
@@ -2024,7 +2019,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertFalse(runtime.is_running(agent_id))
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_runtime_persists_failure_diagnostic_and_user_cancellation(self) -> None:
@@ -2078,7 +2073,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertFalse(cancel_tasktime.cancel(cancel_id))
             await cancel_tasktime.shutdown()
 
-        with tempfile.TemporaryDirectory() as failure_td, tempfile.TemporaryDirectory() as cancel_td:
+        with _TemporaryDataDirectory() as failure_td, _TemporaryDataDirectory() as cancel_td:
             asyncio.run(scenario(Path(failure_td), Path(cancel_td)))
 
 
@@ -2148,7 +2143,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             def __init__(self, host: ClipboardHost) -> None:
                 self.host = host
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths = velox.AppPaths(root)
             storage = velox.Storage(paths)
@@ -2302,7 +2297,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             await web.search(velox.ToolContext(velox.APP_SCOPE_ID), {"query": "fallback"})
             self.assertEqual(len(web._search_request_timestamps), 2)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -2311,7 +2306,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         one, bullets = velox.parse_generated_chat_summary('{"one_sentence_summary":"Done.","bullet_summary_markdown":"- A"}')
         self.assertEqual(one, "Done.")
         self.assertEqual(bullets, "- A")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "events.jsonl"
             for index in range(7):
                 velox.append_jsonl(path, {"index": index})
@@ -2387,7 +2382,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             )
             self.assertEqual(set(registry.tools["fs_write"].parameters["properties"]), {"path", "content"})
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -2420,7 +2415,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_agent_statistics_cover_outcomes_tokens_and_average_duration(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, chat = self._chat(Path(td))
             try:
                 store = velox.AgentStore(storage)
@@ -2447,7 +2442,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 _drain_storage_log_writer(storage)
 
     def test_settings_timeout_minutes_widths_and_endpoint_editor_validation(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             _install_legacy_endpoint_fixtures(storage)
             panel = velox.Panels.__new__(velox.Panels)
@@ -2505,7 +2500,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(velox.SETTINGS_NUMERIC_INPUT_W, 150)
 
     def test_font_size_and_external_settings_updates_survive_draft_autosave(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, storage, _chats = _make_test_chat_stack(root)
             panel = velox.Panels.__new__(velox.Panels)
@@ -2559,12 +2554,12 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             )
 
             credentials = velox.CredentialStore(storage.paths)
-            credentials.save_github("octocat", "github_pat_test")
+            credentials.save_gmail("test@example.com", "app-password")
             panel.state.active_widget = None
             panel._autosave_settings_if_changed(panel.state.config_draft)
             self.assertEqual(
-                velox.CredentialStore(storage.paths).load_github(),
-                {"username": "octocat", "pat": "github_pat_test"},
+                velox.CredentialStore(storage.paths).load_gmail(),
+                {"email_address": "test@example.com", "app_password": "app-password"},
             )
             self.assertNotIn("accounts", storage.load_config())
 
@@ -2586,7 +2581,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         tools_settings = self._method_source(velox.Panels, "_draw_tools_settings_content")
         self.assertIn("_draw_meshy_settings_card", endpoints)
         self.assertNotIn("_draw_meshy_settings_card", tools_settings)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             cfg = storage.load_config()
             cfg["meshy"]["timeout_seconds"] = 123
@@ -2704,7 +2699,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             rebuilt, _iteration = runtime._conversation_from_transcript(agents.load_agent(agent_id))
             self.assertEqual(rebuilt, messages)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_compaction_settings_defaults_clamps_and_endpoint_context(self) -> None:
@@ -2758,7 +2753,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("`time_now`", markdown)
             self.assertIn("`fs_read`", markdown)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_tool_usage_statistics_reject_coercion_and_unknown_fields(self) -> None:
@@ -2791,7 +2786,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             velox.Storage(velox.AppPaths(root)).ensure_first_run_files()
 
         with self.subTest(record="summary"):
-            with tempfile.TemporaryDirectory() as td:
+            with _TemporaryDataDirectory() as td:
                 root = Path(td)
                 paths, _storage, _chats, chat = self._chat(root)
                 summary = velox.read_json(paths.chat_summary_json(chat["chat_id"]))
@@ -2800,7 +2795,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 with self.assertRaises(velox.UnsupportedDataVersionError):
                     reopen_and_validate(root)
         with self.subTest(record="turn"):
-            with tempfile.TemporaryDirectory() as td:
+            with _TemporaryDataDirectory() as td:
                 root = Path(td)
                 paths, _storage, chats, chat = self._chat(root)
                 chats.append_turn(velox.APP_SCOPE_ID, chat["chat_id"], velox.make_turn(chat["chat_id"], "user", "hello"))
@@ -2811,7 +2806,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 with self.assertRaises(velox.UnsupportedDataVersionError):
                     reopen_and_validate(root)
         with self.subTest(record="agent event"):
-            with tempfile.TemporaryDirectory() as td:
+            with _TemporaryDataDirectory() as td:
                 root = Path(td)
                 paths, storage, _chats, chat = self._chat(root)
                 agents = velox.AgentStore(storage)
@@ -2824,7 +2819,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                     reopen_and_validate(root)
 
     def test_meshy_tools_registered_and_async_task_flow(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._chat(Path(td))
             config = storage.load_config()
             config["meshy"]["api_token"] = "msy_test"
@@ -2904,7 +2899,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(problems, [])
 
     def test_endpoint_url_normalization_keeps_vllm_and_repairs_novita(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             client = velox.LLMClient(storage)
             cases = {
@@ -2920,7 +2915,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("local", velox.ENDPOINT_PROVIDERS)
 
     def test_endpoint_auth_payloads_and_provider_compatibility(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             request = velox.LLMRequest(
                 scope_id=velox.APP_SCOPE_ID,
@@ -3096,7 +3091,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(chunks[-1].usage, {"prompt_tokens": 5, "completion_tokens": 2})
 
         try:
-            with tempfile.TemporaryDirectory() as td:
+            with _TemporaryDataDirectory() as td:
                 asyncio.run(scenario(Path(td)))
         finally:
             server.shutdown()
@@ -3220,7 +3215,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn(secret, log_text)
             self.assertNotIn("Authorization: Bearer", log_text)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_nonstream_protocol_http_and_transport_failures_are_diagnostic(self) -> None:
@@ -3327,7 +3322,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn(effective, transport_error)
             self.assertNotIn("remote-test-secret", transport_error)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_stream_parser_handles_sse_metadata_errors_and_empty_done(self) -> None:
@@ -3415,7 +3410,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 chunks = await collect(client, request)
             self.assertIn("connection closed before a complete provider response", str(chunks[-1].error))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_endpoint_diagnostic_helpers_redact_and_decode(self) -> None:
@@ -3453,7 +3448,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertFalse(any("Set-Cookie" in row for row in rows))
 
     def test_legacy_endpoint_settings_are_rejected_without_conversion(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, _chats = _make_test_chat_stack(Path(td))
             manifest = velox.default_app_manifest()
             manifest["settings"]["llm"] = {
@@ -3469,7 +3464,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 velox.Storage(paths).load_config()
 
     def test_direct_endpoint_profiles_and_validation(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             config = storage.load_config()
             shared = velox.new_endpoint_profile("Shared Novita")
@@ -3533,7 +3528,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             velox.normalize_endpoint_profile(empty)
 
     def test_endpoint_optional_generation_parameters_and_extra_body(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             config = storage.load_config()
             profile = velox.endpoint_profile_ref(config, velox.DEFAULT_ENDPOINT_PROFILE_ID)
@@ -3622,7 +3617,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("DNT", bot)
         self.assertEqual(desktop["Accept-Encoding"], "gzip, deflate")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             config = storage.load_config()
             config["web"]["user_agent_mode"] = "mobile_firefox"
@@ -3674,10 +3669,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("draw_chat_endpoints_panel", chat_sidebar)
 
         self.assertIn("CredentialStore", accounts)
-        self.assertIn("save_github", accounts)
         self.assertIn("save_google_oauth_client", accounts)
-        self.assertIn("settings.accounts.github.username", accounts)
-        self.assertIn("settings.accounts.github.pat", accounts)
         self.assertIn("settings.agents.timeout_minutes", agents)
         self.assertIn("settings.agents.auto_compaction_enabled", agents)
         self.assertNotIn("persistence_enabled", agents)
@@ -3710,7 +3702,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("if not saw_valid_payload", raw_stream)
         self.assertIn('payload.strip() == b"[DONE]"', frame_source)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             client = velox.LLMClient(storage)
             self.assertEqual(client.resolve_endpoint(velox.DEFAULT_ENDPOINT_PROFILE_ID)["model"], "model")
@@ -3747,7 +3739,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn(velox.DEFAULT_ENDPOINT_PROFILE_ID, str(caught.exception))
             self.assertIn(f"{velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT} seconds", str(caught.exception))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_llm_request_limits_are_configurable_and_context_clamped(self) -> None:
@@ -3803,7 +3795,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("response.readline(limit + 1)", frame_source)
             self.assertIn("if total > limit", frame_source)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_budget_wait_preserves_inner_timeout_type(self) -> None:
@@ -3822,7 +3814,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIsInstance(caught.exception, velox.AgentTimeoutError)
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_request_timeouts_retry_pause_report_and_resume(self) -> None:
@@ -3908,7 +3900,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             if pending_chat_tasks:
                 await asyncio.gather(*pending_chat_tasks, return_exceptions=True)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_streaming_errors_remain_errors_and_agent_reports_use_durable_fallback(self) -> None:
@@ -3976,7 +3968,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("[error]", response["text"])
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_normal_shutdown_pauses_running_agent_and_restart_can_resume_it(self) -> None:
@@ -4034,11 +4026,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("Resumed successfully", final["final_message"])
             await resumed_runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_invalid_numeric_settings_keep_last_valid_custom_values(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             config = storage.load_config()
             config["llm"]["comfy"]["timeout_seconds"] = 3600
@@ -4085,7 +4077,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(storage.load_config()["web"]["default_search_results"], 999)
 
     def test_manifest_types_registry_lock_and_jsonl_read_lock_are_robust(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, _chats = _make_test_chat_stack(root)
             original_text = paths.app_json_path.read_text(encoding="utf-8")
@@ -4264,11 +4256,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("MESSAGE SENT TO THE LLM (EXACT)", transcript)
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_jsonl_torn_tail_is_ignored_and_repaired_before_append(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             velox.DATA_ROOTS.register(root)
             path = root / "events.jsonl"
@@ -4303,7 +4295,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_configured_tool_timeouts_are_hard_caps_and_compound_budgets_are_safe(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, storage, _chats, _chat = self._chat(root)
             config = storage.load_config()
@@ -4330,7 +4322,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(velox.MeshyTools(storage)._timeout({"timeout_seconds": 5000}), 70)
 
     def test_chat_turn_edits_touch_metadata_only_when_a_turn_changes(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats, chat = self._chat(Path(td))
             chat_id = chat["chat_id"]
             user_turn = velox.make_turn(chat_id, "user", "original user text")
@@ -4441,7 +4433,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("store.attach_file", panel_source)
             self.assertNotIn("path.read_bytes", panel_source)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_compaction_uses_reported_context_preserves_latest_boundaries_and_reconciles_counts(self) -> None:
@@ -4529,7 +4521,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn(task, compacted_text)
             self.assertIn("NEWEST THINKING BLOCK", compacted_text)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -4575,7 +4567,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('\"title\": \"OUT t/s\"', dashboard)
 
     def test_file_and_system_toggles_exhaustively_control_their_tool_groups(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats, chat = self._chat(Path(td))
             registry = velox.ToolRegistry(storage)
             for name in registry.tools:
@@ -4671,7 +4663,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn('Store final work in workspace', context_prompt)
             self.assertIn("Use the exact absolute workspace path above", agent_prompt)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_compaction_rejects_tiny_output_and_displays_literal_new_context(self) -> None:
@@ -4742,12 +4734,12 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("Most recent reasoning block", literal)
             self.assertIn("fs_list", literal)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
     def test_new_chat_receives_all_prior_one_line_summaries_newest_first(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             oldest = chats.create_chat("Oldest")
             missing = chats.create_chat("No Summary Yet")
@@ -4803,7 +4795,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("Here's recent chats for context", agent_prompt)
 
     def test_deletion_cascades_linked_agents_and_restricts_direct_agent_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             source = chats.create_chat("Source")
             other = chats.create_chat("Other")
@@ -4908,11 +4900,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(agents.list_agents(chat["chat_id"]), [])
             await agent_runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_failed_chat_delete_restores_background_summary_eligibility(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Deletion failure")
             chat_id = str(chat["chat_id"])
@@ -5004,7 +4996,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertFalse(paths.chat_json(chat_id).exists())
             await agent_runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_yolo_delete_default_current_schema_fill_and_confirmation_wiring(self) -> None:
@@ -5014,7 +5006,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with self.assertRaises(velox.UnsupportedDataVersionError):
             velox.Storage._validate_current_manifest(manifest)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             cfg = storage.load_config()
             cfg["ui"]["yolo_deletes"] = True
@@ -5034,7 +5026,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('"YOLO deletes"', settings)
 
     def test_skill_create_edit_validation_cache_and_ui_workflow(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats = _make_test_chat_stack(Path(td))
             store = velox.SkillStore(storage)
             created = store.create_skill("Pitch Deck")
@@ -5100,7 +5092,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("omitted", result["message"].lower())
             self.assertFalse(any(not str(row.get("instructions") or "") for row in result["skills"]))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -5170,7 +5162,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                     raise subprocess.TimeoutExpired("fake-cmd", timeout or 0)
                 return self.returncode
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat_a = chats.create_chat("Terminal owner A")
             chat_b = chats.create_chat("Terminal owner B")
@@ -5277,7 +5269,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(any(row.get("kind") == "system" and "restarted" in str(row.get("text")) for row in events))
 
     def test_agent_terminal_state_closes_private_terminals(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._chat(Path(td))
             agents = velox.AgentStore(storage)
             tools = velox.ToolRegistry(storage)
@@ -5372,11 +5364,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("chat.model_termination_mismatch_ignored", log_text)
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_chat_turn_compare_and_set_blocks_late_stream_and_final_writers(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats, chat = self._chat(Path(td))
             turn = velox.make_turn(chat["chat_id"], "assistant", "partial", status="streaming")
             chats.append_turn(velox.APP_SCOPE_ID, chat["chat_id"], turn, mark_stale=False)
@@ -5411,7 +5403,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertGreaterEqual(log_text.count("chat.turn.stale_write_ignored"), 2)
 
     def test_task_monitor_and_agent_store_keep_first_terminal_state(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._chat(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             request_id = monitor.start(velox.APP_SCOPE_ID, "Race test", task_kind="chat")
@@ -5502,7 +5494,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(final["stats"]["finish_reason"], "length")
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_chat_empty_completion_is_immediate_visible_error(self) -> None:
@@ -5539,7 +5531,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("no active checklist state requested continuation", final["text"].lower())
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_empty_completion_fails_and_reports_to_source_chat(self) -> None:
@@ -5592,7 +5584,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertFalse(any(event.get("kind") == "llm_continuation_recovery" for event in events))
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_truncation_fails_without_automatic_continuation(self) -> None:
@@ -5643,7 +5635,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(sink.reports, [(agent_id, "terminal")])
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -5739,7 +5731,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             ))
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_model_type_presets_fill_editor_but_allow_overrides(self) -> None:
@@ -5836,7 +5828,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                     raise subprocess.TimeoutExpired("fake-powershell", timeout or 0)
                 return self.returncode
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("PowerShell terminal")
             runtime = velox.TerminalRuntime(
@@ -5948,7 +5940,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             def close(self) -> None:
                 self.terminate()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Interactive terminal")
             runtime = velox.TerminalRuntime(
@@ -6033,7 +6025,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(screen.key_sequence("ctrl_c"), b"\x03")
 
     def test_terminal_prompt_tool_has_only_terminal_id_and_text(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Simple terminal prompt tool")
             registry = velox.ToolRegistry(storage)
@@ -6082,7 +6074,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("press_enter", converted["arguments"])
 
     def test_endpoint_editor_autosaves_and_fits_default_height(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             panel = velox.Panels.__new__(velox.Panels)
             panel.state = velox.UIState()
@@ -6155,7 +6147,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_data_root_registry_rechecks_manifest_after_registration(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             velox.DATA_ROOTS.assert_supported(root)
@@ -6167,7 +6159,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_requested_minimal_tool_surface_has_no_legacy_variants(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             registry = velox.ToolRegistry(storage)
             expected = {
@@ -6213,7 +6205,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("$$TOOLCALL:", production_source)
 
     def test_tool_produced_images_remain_textual_for_vision_callers(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, chats, chat = self._chat(root)
             chat_id = str(chat["chat_id"])
@@ -6296,7 +6288,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5.0)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_no_missing_tool_classifier_or_recovery_prompt_remains(self) -> None:
@@ -6309,7 +6301,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("No active Checklist state requested continuation", source)
 
     def test_chat_turn_terminal_state_is_monotonic_against_stale_stream_writes(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, chats, chat = self._chat(Path(td))
             turn = velox.make_turn(
                 chat["chat_id"], "assistant", "partial", status="streaming",
@@ -6352,7 +6344,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(loaded_cancelled["text"], "stopped")
 
     def test_task_monitor_first_terminal_transition_wins(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             cancelled_id = monitor.start(velox.APP_SCOPE_ID, "cancel race")
@@ -6375,7 +6367,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(completed["state"], "completed")
 
     def test_agent_terminal_state_cannot_be_reopened_by_stale_worker(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, chat = self._chat(Path(td))
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(chat["chat_id"], "Do one task.")
@@ -6445,7 +6437,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(display.count("Final answer."), 1)
             self.assertEqual(chunks[-1].finish_reason, "stop")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_compaction_does_not_duplicate_reasoning_metadata_and_display_text(self) -> None:
@@ -6497,7 +6489,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("Reason exactly once.", card["compaction_summary"])
             self.assertEqual(card["compaction_details"].count("Reason exactly once."), 1)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_chat_task_cleanup_does_not_remove_a_newer_owner(self) -> None:
@@ -6517,7 +6509,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         asyncio.run(scenario())
 
     def test_entering_chat_always_selects_or_creates_a_chat(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, chats = _make_test_chat_stack(root)
 
@@ -6566,7 +6558,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_transient_manifest_and_plain_reads_retry_without_ui_crash(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, _chats = _make_test_chat_stack(root)
             target = root / "locked.txt"
@@ -6654,7 +6646,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("reasoning_only_recovery", log_text)
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_without_expert_mode_does_not_recover_reasoning_only_stop(self) -> None:
@@ -6701,7 +6693,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("I intended to finish", str((output_event.get("data") or {}).get("raw_text") or ""))
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_browser_visual_evidence_always_delegates_every_screenshot(self) -> None:
@@ -6769,7 +6761,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                     self.assertNotIn(forbidden, review)
                     self.assertTrue(all(forbidden not in row for row in review["reviews"]))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_visual_review_and_3d_control_guidance_are_explicit(self) -> None:
@@ -6883,7 +6875,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         return paths, storage, chats, calendar, panel, services
 
     def test_item_creation_supports_exact_statuses_priorities_and_backlog_invariant(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar = self._stack(Path(td))
             created: list[dict[str, Any]] = []
             for status in velox.ITEM_STATUSES:
@@ -6911,7 +6903,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 calendar.create_item("Backlog duration", duration_minutes=30)
 
     def test_item_schedule_reschedule_default_duration_and_backlog_preserve_linked_data(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats, calendar = self._stack(root)
             event = calendar.upsert_event(self._event_payload())
@@ -6952,7 +6944,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(paths.calendar_item_json(item["item_id"]).is_file())
 
     def test_context_links_and_attachments_serialize_round_trip_and_remove_cleanly(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, _storage, _chats, calendar = self._stack(root)
             first_path = str(root / "report.pdf")
@@ -6993,7 +6985,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(loaded["attachments"], [second_path])
 
     def test_event_upsert_is_stable_tracks_recurrence_and_cancellation_without_losing_items(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar = self._stack(Path(td))
             first = calendar.upsert_event(self._event_payload())
             changed_payload = self._event_payload(title="Updated Matrix Review")
@@ -7020,7 +7012,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(calendar.get_event(first["event_id"])["status"], "cancelled")
 
     def test_event_date_ranges_handle_all_day_and_cross_midnight_events(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, calendar = self._stack(Path(td))
             storage.update_config(lambda config: config["vault"].__setitem__("local_timezone", "America/Toronto"))
             all_day = calendar.upsert_event(self._event_payload(
@@ -7042,7 +7034,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 calendar.list_events("2026-08-02", "2026-07-30")
 
     def test_week_chat_is_lazy_normal_searchable_openable_and_persistent(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, chats, calendar = self._stack(root)
             self.assertFalse(calendar.has_week_chat("2026-07-30"))
@@ -7082,7 +7074,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(mapping["week_start_to_chat_id"]["2026-07-26"], chat_id)
 
     def test_atomic_item_save_reload_and_backup_recovery(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, _chats, calendar = self._stack(root)
             item = calendar.create_item("Initial title", "first")
@@ -7106,7 +7098,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(recovery_events)
 
     def test_malformed_optional_calendar_data_is_sanitized_but_core_invariants_are_strict(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar = self._stack(Path(td))
             payload = self._event_payload("sanitized")
             payload["organizer"] = "not an object"
@@ -7149,7 +7141,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 calendar.upsert_event(bad_all_day)
 
     def test_item_agent_link_unlink_delete_and_done_timestamp(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats, calendar = self._stack(Path(td))
             chat = chats.create_chat("Agent source")
             agent = velox.AgentStore(storage).create_agent(chat["chat_id"], "Produce the artifact")
@@ -7169,7 +7161,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 calendar.get_item(item["item_id"])
 
     def test_week_chat_context_is_compact_and_ordinary_chats_do_not_receive_it(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, chats, calendar = self._stack(root)
             week_chat = calendar.get_or_create_week_chat("2026-07-30")
@@ -7328,7 +7320,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('self.inp.wheel_y', dropdown_source)
 
     def test_calendar_app_state_date_navigation_persists_without_backlog_pin(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, storage, _chats, _calendar, panel, _services = self._panel_stack(root)
             self.assertEqual(panel.state.calendar_selected_date, "2026-07-30")
@@ -7356,7 +7348,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 storage.write_app_state({**saved, "calendar_backlog_pinned": True})
 
     def test_item_editor_create_edit_schedule_and_backlog_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, _storage, _chats, calendar, panel, _services = self._panel_stack(root)
             event = calendar.upsert_event(self._event_payload("editor-event"))
@@ -7412,7 +7404,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(unscheduled["attachments"]), 2)
 
     def test_drag_backlog_item_onto_day_applies_default_duration_and_selection(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, panel, _services = self._panel_stack(Path(td))
             item = calendar.create_item("Schedule by dragging", priority="P1")
             panel.state.calendar_drag_item_id = item["item_id"]
@@ -7438,7 +7430,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(calendar.has_week_chat("2026-07-30"))
 
     def test_drag_reschedule_preserves_duration_then_backlog_preserves_linked_data(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, _storage, _chats, calendar, panel, _services = self._panel_stack(root)
             event = calendar.upsert_event(self._event_payload("drag-event"))
@@ -7486,7 +7478,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(backlog["attachments"], [str(root / "result.docx")])
 
     def test_drag_item_onto_event_links_without_changing_schedule(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, panel, _services = self._panel_stack(Path(td))
             event = calendar.upsert_event(self._event_payload("link-drop-event"))
             item = calendar.create_item("Link while remaining in Backlog")
@@ -7508,7 +7500,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIsNone(linked["duration_minutes"])
 
     def test_week_chat_lazy_creation_date_switching_drafts_and_normal_chat_open(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, chats, calendar, panel, _services = self._panel_stack(Path(td))
             ordinary = chats.create_chat("Ordinary before Calendar")
             panel.state.active_chat_id = ordinary["chat_id"]
@@ -7551,7 +7543,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn(first_id, {row["chat_id"] for row in chats.list_chats()})
 
     def test_calendar_refresh_callback_guard_success_and_failure_states(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, _calendar, panel, services = self._panel_stack(Path(td))
             calls: list[str] = []
 
@@ -7586,7 +7578,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn('else "Refresh"', inspect.getsource(velox.Panels._draw_calendar_week_header))
 
     def test_selected_event_is_read_only_and_surfaces_preparation_and_related_files(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, storage, _chats, calendar, panel, _services = self._panel_stack(root)
             payload = self._event_payload("selected-event")
@@ -7625,7 +7617,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             def draw_rect(self, rect: Rect, *_args: Any, **_kwargs: Any) -> None:
                 self.rects.append(rect)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, _calendar, panel, _services = self._panel_stack(Path(td))
             renderer = RecordingRenderer()
             panel.widgets.renderer = renderer
@@ -7681,7 +7673,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn(token, modal_source)
 
     def test_recovery_service_includes_calendar_records(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, _chats, calendar = self._stack(root)
             item = calendar.create_item("Recovery scan")
@@ -7810,7 +7802,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_upsert_identity_participants_attachments_and_source_specific_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _calendar, vault, query = self._stack(Path(td))
             source, mailbox = self._gmail(vault)
             payload = {
@@ -7850,7 +7842,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(velox.gmail_stable_external_id({"uid": "2", "uidvalidity": "3"}), "imap:3:2")
 
     def test_calendar_projection_recurrence_all_day_and_cancellation(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, calendar, vault, query = self._stack(Path(td), "America/Toronto")
             first = calendar.upsert_event(self._calendar_payload(
                 "recurring", occurrence="20260731T140000Z",
@@ -7882,7 +7874,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(calendar.get_event(first["event_id"])["status"], "cancelled")
 
     def test_inclusive_date_filters_and_configured_local_timezone(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _calendar, vault, query = self._stack(Path(td), "America/Toronto")
             source, mailbox = self._gmail(vault)
             for external_id, stamp in (
@@ -7908,7 +7900,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 storage.write_config(config)
 
     def test_search_is_case_insensitive_combines_with_dates_and_does_not_leak_sources(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, calendar, vault, query = self._stack(Path(td), "America/Toronto")
             calendar.upsert_event(self._calendar_payload("search", title="PUMA Review"))
             calendar_source = vault.find_data_source("google_calendar", "mike@example.com")
@@ -7928,7 +7920,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(query.list_gmail_messages(gmail["id"], None, None, ""), query.list_gmail_messages(gmail["id"]))
 
     def test_aggregations_ordering_threads_and_visible_counts(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, calendar, vault, query = self._stack(Path(td), "UTC")
             calendar.upsert_event(self._calendar_payload(
                 "day-two", "2026-08-02T12:00:00Z", "2026-08-02T13:00:00Z",
@@ -7952,7 +7944,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_tombstones_require_completed_reconciliation_and_failed_sync_keeps_cursor(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _calendar, vault, query = self._stack(Path(td))
             source, mailbox = self._gmail(vault)
             one = {"x_gm_msgid": "one", "subject": "One", "internal_received_timestamp": "2026-08-01T10:00:00Z"}
@@ -7986,7 +7978,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(next_state["consecutive_failures"], 0)
 
     def test_atomic_backup_recovery_and_recovery_service_cover_vault(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _calendar, vault, _query = self._stack(root)
             source, mailbox = self._gmail(vault)
@@ -8014,7 +8006,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(any(row["path"] == str(path) for row in errors))
 
     def test_raw_payload_malformed_optional_fields_and_strict_required_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, _calendar, vault, _query = self._stack(Path(td))
             reference = vault.store_raw_payload({"provider": "fixture", "rows": [1, 2, 3]})
             self.assertEqual(reference, vault.store_raw_payload({"provider": "fixture", "rows": [1, 2, 3]}))
@@ -8043,7 +8035,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 vault.upsert_gmail_message(gmail["id"], mailbox["id"], {"x_gm_msgid": "missing-time"})
 
     def test_unique_source_container_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _calendar, vault, query = self._stack(Path(td), "UTC")
             first_source = vault.upsert_data_source("gmail", "Work Mail", "mike@example.com")
             second_source = vault.upsert_data_source("gmail", "Renamed Mail", "mike@example.com")
@@ -8060,7 +8052,7 @@ class VaultTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_query_api_surface_and_connector_contract_are_source_independent(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _calendar, vault, query = self._stack(Path(td))
             self.assertEqual(query.list_data_sources(), vault.list_data_sources())
             for name in (
@@ -8218,7 +8210,7 @@ class VaultUITests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertGreater(controller.query_count, 6)
 
     def test_vault_calendar_and_gmail_detail_views_are_read_only(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, calendar_store, vault, query = self._real_stack(Path(td), "UTC")
             event_payload = VaultTests._calendar_payload(
                 "recurring-one", "2026-07-31T10:00:00Z", "2026-07-31T10:30:00Z",
@@ -8431,7 +8423,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         return service
 
     def test_google_sync_state_is_strict_atomic_recoverable_and_scanned(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats, calendar, _integration = self._stack(Path(td))
             initial = calendar.get_google_sync_state()
             self.assertEqual(initial["schema"], velox.GOOGLE_CALENDAR_SYNC_SCHEMA)
@@ -8501,7 +8493,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             velox.google_calendar_event_payload(malformed, calendar_row, "mike@example.com")
 
     def test_malformed_event_warning_is_persisted_and_visible(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             service = _FakeGoogleService(
                 lambda kwargs, _index: {
@@ -8539,7 +8531,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(any('"events_skipped":1' in message for message in log_messages))
 
     def test_sparse_cancelled_tombstone_preserves_event_details_and_linked_item(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, _integration = self._stack(Path(td))
             calendar_row = velox.normalize_google_calendar_row(self._calendar_resource())
             original = calendar.upsert_event(
@@ -8566,7 +8558,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(calendar.get_item(item["item_id"])["linked_event_id"], original["event_id"])
 
     def test_initial_paginated_sync_imports_calendars_events_and_tokens(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
 
             def calendars(kwargs: dict[str, Any], _index: int) -> dict[str, Any]:
@@ -8631,7 +8623,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(service.events_resource.calls[0]["showDeleted"])
 
     def test_incremental_calendar_and_event_sync_merge_without_duplicates(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             self._seed_one_calendar(integration)
             original = calendar.list_all_events()[0]
@@ -8660,7 +8652,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(state["calendars"][0]["sync_token"], "event-token-2")
 
     def test_event_sync_http_410_full_resync_preserves_items_and_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             self._seed_one_calendar(integration)
             original = calendar.list_all_events()[0]
@@ -8691,7 +8683,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(service.events_resource.calls), 2)
 
     def test_calendar_list_http_410_falls_back_to_full_list_sync(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             self._seed_one_calendar(integration)
 
@@ -8717,7 +8709,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(service.calendar_list_resource.calls), 2)
 
     def test_full_resync_marks_missing_event_cancelled_and_preserves_link(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             self._seed_one_calendar(integration)
             row = velox.normalize_google_calendar_row(self._calendar_resource())
@@ -8747,7 +8739,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(calendar.list_all_events()), 2)
 
     def test_deleted_calendar_cancels_retained_events_without_deleting_items(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             self._seed_one_calendar(integration)
             event = calendar.list_all_events()[0]
@@ -8771,7 +8763,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(service.events_resource.calls, [])
 
     def test_calendar_enablement_and_partial_failure_preserve_valid_data(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             team_row = velox.normalize_google_calendar_row(
                 self._calendar_resource("team@example.com", summary="Team", primary=False, access_role="reader")
@@ -8818,7 +8810,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             )
 
     def test_connect_refresh_token_and_disconnect_are_easy_local_and_read_only(self) -> None:
-        with tempfile.TemporaryDirectory() as root_td:
+        with _TemporaryDataDirectory() as root_td:
             root = Path(root_td)
             paths, storage, chats, calendar, _unused = self._stack(root)
             credential_store = velox.CredentialStore(paths)
@@ -8933,7 +8925,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(calendar.get_item(item["item_id"])["linked_event_id"], event["event_id"])
 
     def test_expired_access_token_refreshes_locally_before_sync(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats, calendar, _unused = self._stack(Path(td))
             velox.CredentialStore(paths).save_google_token({"token": "old", "refresh_token": "refresh"})
             captures: dict[str, Any] = {"refreshes": 0}
@@ -8988,7 +8980,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(captures["scopes"], list(velox.GOOGLE_CALENDAR_SCOPES))
 
     def test_missing_dependencies_direct_oauth_configuration_and_concurrency_fail_cleanly(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, calendar, _unused = self._stack(Path(td))
 
             def missing() -> GoogleCalendarDependencies:
@@ -9030,7 +9022,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 self.assertEqual(env_integration._configured_oauth_client(), ("env-client", "env-secret", "environment"))
 
     def test_connect_auto_installs_missing_google_dependencies_once(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats, calendar, _unused = self._stack(Path(td))
             velox.CredentialStore(paths).save_google_oauth_client("client-id", "client-secret")
             state = {"installed": False, "install_calls": 0, "load_calls": 0}
@@ -9281,7 +9273,7 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_connector_credentials_are_revision_independent_xor_files(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _vault, credentials, _query = _make_test_connector_stack(Path(td))
             credentials.save_gmail("mike@example.com", "abcd efgh ijkl mnop")
             gmail_raw = velox.file_read_bytes(paths.gmail_credentials_file())
@@ -9310,7 +9302,7 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertFalse(html_payload["is_unread"])
 
     def test_gmail_initial_incremental_uidvalidity_and_read_only_behavior(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, vault, credentials, query = _make_test_connector_stack(Path(td))
             credentials.save_gmail("mike@example.com", "app password")
             config = storage.load_config()
@@ -9349,7 +9341,7 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(next(row for row in sync_states if row["cursor_type"] == "gmail_uidvalidity")["cursor_value"], "888")
 
     def test_gmail_missing_all_mail_auth_failure_cancellation_and_disconnect_preserve_data(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, vault, credentials, _query = _make_test_connector_stack(Path(td))
             credentials.save_gmail("mike@example.com", "password")
             auth_fake = self._FakeIMAP({}, login_error=True)
@@ -9387,7 +9379,7 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_calendar_gmail_vault_refresh_and_selection(self) -> None:
         """Exercise both normalized sources through sync, query, and UI-controller refresh."""
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, vault, credentials, query = _make_test_connector_stack(Path(td))
             config = storage.load_config()
             config["vault"]["gmail"]["enabled"] = True
@@ -9508,7 +9500,7 @@ class ConnectorTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(sorted(changes), ["gmail"])
             await manager.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_settings_connector_controls_and_read_only_contract(self) -> None:
@@ -9716,7 +9708,7 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
         self.assertNotIn("Kimi K2.6 (vLLM)", labels)
         self.assertNotIn("(Local vLLM)", "\n".join(labels))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -9810,7 +9802,7 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
             await manager.shutdown()
             self.assertEqual(manager.tasks, {})
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -9837,9 +9829,9 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
         self.assertEqual(invalid_path_calls, [])
 
     def test_credential_lock_order_prevents_direct_save_mutation_deadlock(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, _vault, credentials, _query = _make_test_connector_stack(Path(td))
-            credentials.save_github("initial", "pat")
+            credentials.save_gmail("initial@example.com", "password")
             credentials.save_google_drive_oauth_client("client", "secret")
             entered_validation = threading.Event()
             release_validation = threading.Event()
@@ -9848,7 +9840,7 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
 
             def gated_validate(account: str, values: Any) -> dict[str, Any]:
                 if (
-                    account == velox.GITHUB_CREDENTIAL_ACCOUNT
+                    account == velox.GMAIL_CREDENTIAL_ACCOUNT
                     and threading.current_thread().name == "credential-direct-save"
                 ):
                     entered_validation.set()
@@ -9858,7 +9850,7 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
 
             def direct_save() -> None:
                 try:
-                    credentials.save_github("updated", "new-pat")
+                    credentials.save_gmail("updated@example.com", "new-password")
                 except BaseException as exc:
                     errors.append(exc)
 
@@ -9886,13 +9878,13 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
             self.assertFalse(direct_thread.is_alive())
             self.assertFalse(mutate_thread.is_alive())
             self.assertEqual(errors, [])
-            self.assertEqual(credentials.load_github(), {"username": "updated", "pat": "new-pat"})
+            self.assertEqual(credentials.load_gmail(), {"email_address": "updated@example.com", "app_password": "new-password"})
             self.assertEqual(
                 credentials.load_google_drive()["token"], {"token": "updated-token"},
             )
 
     def test_credential_read_modify_write_is_thread_safe_and_keeps_xor_payload_valid(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, _vault, credentials, _query = _make_test_connector_stack(Path(td))
             client_store = credentials
             token_store = velox.CredentialStore(paths)
@@ -9991,7 +9983,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
         with self.assertRaisesRegex(ValueError, "HH:MM"):
             velox.validate_agent_settings(invalid)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             skill_names = {row["name"] for row in velox.SkillStore(storage).list_skills(include_disabled=True, refresh=True)}
             self.assertIn(velox.DEFAULT_GENERAL_AGENT_SKILL_NAME, skill_names)
@@ -10053,7 +10045,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             monitor.complete(first_id); monitor.complete(old_id); monitor.complete(new_id)
             self.assertEqual(scheduler.snapshot()["queue-endpoint"]["active"], [])
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_tool_phase_releases_capacity_and_next_provider_round_requeues(self) -> None:
@@ -10089,7 +10081,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             await second.release()
             monitor.complete(active_id); monitor.complete(waiting_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_cancelling_a_queued_agent_cannot_leave_a_stale_fifo_head(self) -> None:
@@ -10111,7 +10103,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             self.assertFalse(snap.get("active"))
             self.assertFalse(snap.get("queued"))
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_pausing_a_queued_agent_removes_it_from_runnable_fifo_until_resume(self) -> None:
@@ -10150,7 +10142,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             await paused_lease.release()
             monitor.complete(holder_id); monitor.complete(next_id); monitor.complete(paused_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_paused_task_cannot_reacquire_after_tool_boundary_until_resume(self) -> None:
@@ -10186,7 +10178,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             await resumed.release()
             monitor.complete(chat_id); monitor.complete(agent_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_personal_assistant_scheduler_failure_is_logged_without_crashing_the_app_tick(self) -> None:
@@ -10249,11 +10241,11 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             self.assertEqual(len(fake.started), 2)
             self.assertTrue(chats.list_chats(velox.APP_SCOPE_ID))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_personal_assistant_terminal_output_is_saved_as_daily_report_and_loaded_for_later_days(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("PA report")
             agents = velox.AgentStore(storage)
@@ -10327,7 +10319,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
                 manager.start(velox.GOOGLE_DRIVE_SOURCE_TYPE, "sync")
             self.assertFalse(any(row["source_type"] == velox.GOOGLE_DRIVE_SOURCE_TYPE for row in vault.list_data_sources()))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_drive_download_writes_binary_and_workspace_exports_without_indexing_vault(self) -> None:
@@ -10385,7 +10377,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
                 for row in velox.VaultStore(storage).list_data_sources()
             ))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_vault_tools_search_cached_gmail_but_not_drive(self) -> None:
@@ -10407,7 +10399,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             with self.assertRaisesRegex(ValueError, "google_calendar or gmail"):
                 await tools.tool_vault_search(velox.ToolContext(velox.APP_SCOPE_ID), {"source": "google_drive", "query": "roadmap"})
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_vault_toolbar_uses_two_three_dropdown_date_pickers_and_includes_ad_hoc_drive(self) -> None:
@@ -10458,7 +10450,7 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         )
 
     def test_streaming_updates_patch_stable_memory_without_rewriting_history(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats, chat = self._stack(Path(td))
             chat_id = str(chat["chat_id"])
             turn = velox.make_turn(chat_id, "assistant", "", status="streaming")
@@ -10499,7 +10491,7 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(paths.chat_stream_snapshot_json(chat_id).is_file())
 
     def test_terminal_transition_commits_once_and_removes_live_sidecar(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._stack(Path(td))
             chat_id = str(chat["chat_id"])
             turn = velox.make_turn(chat_id, "assistant", "", status="streaming")
@@ -10539,7 +10531,7 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(reloaded[-1]["text"].endswith("complete"))
 
     def test_live_sidecar_recovers_streaming_text_and_malformed_sidecar_is_discarded(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._stack(Path(td))
             chat_id = str(chat["chat_id"])
             turn = velox.make_turn(chat_id, "assistant", "", status="streaming")
@@ -10866,7 +10858,7 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(accumulator.materialize(), prior + "final")
 
     def test_coalescing_snapshot_writer_is_nonblocking_and_keeps_latest_payload(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "streaming_turn.json"
             started = threading.Event()
             release = threading.Event()
@@ -10893,7 +10885,7 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             writer.clear_for_tests()
 
     def test_large_chat_checkpoint_runs_serialization_off_the_update_thread(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats, chat = self._stack(Path(td))
             chat_id = str(chat["chat_id"])
             turn = velox.make_turn(chat_id, "assistant", "", status="streaming")
@@ -10932,7 +10924,7 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 writer.clear_for_tests()
 
     def test_warm_streaming_update_does_not_poll_filesystem_signatures(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats, chat = self._stack(Path(td))
             chat_id = str(chat["chat_id"])
             snapshot_path = paths.chat_stream_snapshot_json(chat_id)
@@ -11101,7 +11093,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIs(result_messages, messages)
             self.assertEqual(result_messages, original)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_progress_control_requires_final_100_percent_or_failed_action(self) -> None:
@@ -11135,10 +11127,10 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("persistence_enabled", agents["personal_assistant"])
 
     def test_chat_and_calendar_splitter_geometry_is_responsive_and_persisted(self) -> None:
-        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, 830)
-        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, round(624 * 1.33))
+        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, 1104)
+        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, round(830 * 1.33))
         default_columns = velox.chat_layout_for_rect(velox.Rect(0, 0, 1400, 800))
-        self.assertEqual(default_columns.chats.w, (1400 - velox.CHAT_COLUMN_GAP_PX) // 2)
+        self.assertEqual(default_columns.chats.w, int((1400 - velox.CHAT_COLUMN_GAP_PX) * .60))
         rect = velox.Rect(10, 20, 1200, 800)
         columns = velox.chat_layout_for_rect(rect, chat_list_width=420)
         self.assertEqual(columns.chats.w, 420)
@@ -11221,7 +11213,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             (-1, -1, -1, -1),
         )
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             state = storage.load_app_state()
@@ -11394,7 +11386,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("update this skill", web.lower())
         self.assertNotIn("update this skill", cpp.lower())
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             with mock.patch.object(velox, "build_web_programming_skill_markdown", return_value=web), mock.patch.object(
                 velox, "build_cpp_programming_skill_markdown", return_value=cpp,
@@ -11409,7 +11401,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_machine_specific_path_discovery_preserves_executable_invocation_aliases(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             target = root / "compiler-real"
             target.write_text("tool", encoding="utf-8")
@@ -11423,7 +11415,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotEqual(velox._absolute_existing_path(alias), str(target.resolve()))
 
     def test_windows_browser_and_visual_studio_detection_use_multiple_reliable_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             program_files = root / "Program Files"
             local_app_data = root / "User" / "AppData" / "Local"
@@ -11544,7 +11536,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             ))
             self.assertFalse(request.native_tools)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_tool_rows_show_live_and_terminal_execution_seconds(self) -> None:
@@ -11852,7 +11844,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("chat.context_overflow_recovered", log_text)
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_overflow_compacts_and_preserves_latest_user_exactly(self) -> None:
@@ -12001,7 +11993,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(recoveries), 1)
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_initial_chat_input_is_never_compacted_and_retries_with_smaller_output(self) -> None:
@@ -12114,7 +12106,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertGreaterEqual(log_text.count("chat.context_overflow_output_reduced"), 2)
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_nested_chat_compaction_reuses_retained_scheduler_slot_without_deadlock(self) -> None:
@@ -12216,7 +12208,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             runtime.cancel_all()
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_thinking_and_ai_stats_are_separate_and_header_metadata_is_tooltip_only(self) -> None:
@@ -12415,7 +12407,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             agent_messages = [{"role": "system", "content": "AGENT SYSTEM"}, {"role": "user", "content": "Stay within capacity"}, {"role": "assistant", "content": "y" * 8000}]
             self.assertFalse(await agent_runtime._maybe_compact_agent_context(agent["agent_id"], agent_messages, force=False))
             self.assertEqual(fake.calls, 0)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_calendar_agent_tasks_filter_and_right_rail_layout(self) -> None:
@@ -12722,11 +12714,11 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(fallback["reasoning_fallback"])
             self.assertEqual(fallback["analysis"], "Inspecting exact pixels and labels.")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_image_analysis_timeout_uses_the_configured_analysis_endpoint_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             cfg = storage.load_config()
@@ -12781,7 +12773,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("The user cancelled this tool call", payload)
             self.assertIn("Elapsed before cancellation", payload)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_stopping_chat_cancels_all_owned_tool_operations(self) -> None:
@@ -12823,7 +12815,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("stopped this conversation", str(snapshot.get("error") or ""))
             self.assertTrue(runtime.chats.load_chat(chat_id)["agent_reports_suspended"])
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_llm_stream_cancel_closes_active_endpoint_response(self) -> None:
@@ -12884,7 +12876,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                     await asyncio.wait_for(task, timeout=3.0)
             self.assertTrue(response.close_called)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_tool_ui_stream_details_and_cancel_control_contract(self) -> None:
@@ -12940,7 +12932,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(velox.normalize_endpoint_reasoning_level(velox.ENDPOINT_MODEL_TYPE_KIMI_K2_6, "off"), "on")
         self.assertEqual(velox.normalize_endpoint_reasoning_level(velox.ENDPOINT_MODEL_TYPE_KIMI_K3, "low"), "max")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             _install_legacy_endpoint_fixtures(storage)
@@ -13055,7 +13047,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             }
         ))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             _install_legacy_endpoint_fixtures(storage)
@@ -13262,7 +13254,7 @@ class IOAndChatTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             path.unlink(missing_ok=True)
 
     def test_delayed_log_batch_never_recreates_a_removed_data_root(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td) / "ephemeral-root"
             root.mkdir(parents=True)
             path = root / velox.LOG_FILE_NAME
@@ -13276,7 +13268,7 @@ class IOAndChatTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             writer.clear_for_tests()
 
     def test_small_stream_checkpoints_also_use_the_snapshot_worker(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats, chat = self._stack(Path(td))
             chat_id = str(chat["chat_id"])
             turn = velox.make_turn(chat_id, "assistant", "", status="streaming")
@@ -13355,7 +13347,7 @@ class IOAndChatTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         asyncio.run(scenario())
 
     def test_combined_state_and_geometry_commit_uses_one_manifest_replacement(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats, _chat = self._stack(Path(td))
             state = velox.default_app_state()
             state["active_panel"] = "settings"
@@ -13439,7 +13431,7 @@ class IOAndChatTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             )
             return chats.load_turns(velox.APP_SCOPE_ID, chat_id), fake
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             turns, fake = asyncio.run(run_case(Path(td)))
             assistants = [turn for turn in turns if turn.get("role") == "assistant"]
             self.assertEqual(len(assistants), 1)
@@ -13595,7 +13587,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             self.assertNotIn("q" * 1000, json.dumps(agent_messages))
             self.assertEqual(len(agent_meta["compaction_passes"]), agent_meta["passes_used"])
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_irreducible_chat_and_agent_compaction_preserve_original_messages(self) -> None:
@@ -13680,7 +13672,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
                 for row in agents.load_transcript(agent_id)
             ))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_orphaned_chat_tasks_terminalize_error_and_cancellation(self) -> None:
@@ -13731,11 +13723,11 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             self.assertIn("[cancelled]", cancelled_turn["text"])
             self.assertNotIn(chat2_id, runtime.running)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_background_writer_shutdown_flushes_and_joins_workers(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             json_path = root / "snapshot.json"
             coalesced = velox.CoalescingAtomicJSONWriter()
@@ -13916,7 +13908,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
 
 
     def test_browser_tool_contract_keeps_artifacts_in_chat_temp(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, _chats, chat = self._stack(Path(td))
             registry = velox.ToolRegistry(storage)
             self.assertIn("browser_run_headless", registry.tools)
@@ -13988,7 +13980,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
                 self.calls.append((method, time.monotonic(), dict(params or {})))
                 return {}
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -14240,7 +14232,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         return FakeResponse()
 
     def test_gpt_sol_uses_responses_and_other_endpoints_keep_chat_completions(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
@@ -14266,7 +14258,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertIn("function", payload["tools"][0])
 
     def test_responses_payload_supports_text_images_reasoning_and_function_tools(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
@@ -14302,7 +14294,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertEqual([row["type"] for row in content], ["input_text", "input_image"])
 
     def test_responses_replay_preserves_reasoning_items_calls_and_outputs(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             client = velox.LLMClient(storage)
             output_items = [
@@ -14353,7 +14345,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertEqual(result["tool_calls"][0]["id"], "call_1")
             self.assertEqual(result["response_output_items"], raw["output"])
             self.assertEqual(result["finish_reason"], "tool_calls")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_responses_stream_emits_partial_and_final_function_state(self) -> None:
@@ -14403,7 +14395,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertEqual(terminal.native_tool_calls[0]["function"]["arguments"], "{}")
             self.assertEqual(terminal.response_output_items, final_output)
             self.assertEqual(terminal.finish_reason, "tool_calls")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_function_construction_uses_blue_non_cancelable_tool_row(self) -> None:
@@ -14478,7 +14470,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         self.assertEqual(custom["api_transport"], velox.ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS)
 
     def test_transport_url_normalization_is_bidirectional_and_provider_neutral(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             client = velox.LLMClient(storage)
             self.assertEqual(
@@ -14503,7 +14495,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             )
 
     def test_selected_transport_routes_every_model_family(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
@@ -14537,7 +14529,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertEqual(payload["max_completion_tokens"], 128000)
 
     def test_gpt_responses_reasoning_is_model_specific(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
@@ -14605,7 +14597,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             def command(self, method: str, _params: Any = None, **_kwargs: Any) -> dict[str, Any]:
                 self.last_method = method
                 return {"result": {"value": '{"camera":{"yaw":1.5},"player":{"x":2,"y":3}}'}}
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             shot = Path(td) / "frame.png"
             sidecar = velox.BrowserTools._capture_snapshot_data_sidecar(
                 FakeWebSocket(), shot, time.monotonic() + 5,
@@ -14626,7 +14618,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         class BrokenWebSocket:
             def command(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
                 raise RuntimeError("page hook failed")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             sidecar = velox.BrowserTools._capture_snapshot_data_sidecar(
                 BrokenWebSocket(), Path(td) / "frame.png", time.monotonic() + 5,
             )
@@ -14695,7 +14687,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         ):
             with self.assertRaises(ValueError):
                 velox.BrowserTools._bounded_integer(value, name, low, high)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             tools = velox.ToolRegistry(storage)
             for tool_name in ("browser_run_headless", "browser_demo_playback"):
@@ -14709,7 +14701,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         self.assertIn("3820x2160", web_skill)
 
     def test_chat_list_order_is_created_at_stable_not_updated_at(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             older = chats.create_chat("Older")
             newer = chats.create_chat("Newer")
@@ -14777,7 +14769,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
                 self.params = params
                 self.kwargs = kwargs
                 return {"data": base64.b64encode(payload).decode("ascii")}
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             output = Path(td) / "capture.png"
             websocket = FakeWebSocket()
             # Calling through the class reproduced the previous classmethod binding
@@ -14797,7 +14789,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             from PIL import Image, ImageDraw  # type: ignore
         except Exception as exc:  # pragma: no cover - Pillow is a Velox dependency
             self.skipTest(f"Pillow unavailable: {exc}")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Image probes")
             chat_id = str(chat["chat_id"])
@@ -14873,7 +14865,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             })
             self.assertIn("result_unavailable_in_snapshot", old_snapshot_text)
             self.assertNotEqual(old_snapshot_text.strip(), "null")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_streaming_chat_reuses_unchanged_sections(self) -> None:
@@ -15062,7 +15054,7 @@ class CalendarLayoutAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             'CALENDAR_RIGHT_SPLIT_MAX',
         ):
             self.assertIn(token, source)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, _calendar, _integration = self._stack(Path(td))
             state = storage.load_app_state()
             state["calendar_right_split_fraction"] = 0.41
@@ -15101,7 +15093,7 @@ class CalendarLayoutAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertIn("self.state.calendar_backlog_expanded = not expanded", source)
 
     def test_calendar_sync_window_and_missing_sync_token_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, calendar, integration = self._stack(Path(td))
             config = storage.load_config()
             config["vault"]["google_calendar"]["sync_window_days"] = 180
@@ -15179,7 +15171,7 @@ class CalendarLayoutAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertIn("header.y + line_box_h", source)
 
     def test_week_chat_is_one_chat_for_every_date_in_the_week(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, _integration = self._stack(Path(td))
             monday = calendar.get_or_create_week_chat("2026-08-10")
             saturday = calendar.get_or_create_week_chat("2026-08-15")
@@ -15224,7 +15216,7 @@ class CalendarLayoutAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
                 self.assertNotEqual(current, previous, f"duplicate statement at source line {index + 1}")
 
     def test_calendar_event_cache_avoids_reloading_unchanged_records(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, _chats, calendar, _integration = self._stack(Path(td))
             saved = calendar.upsert_event({
                 "source_type": "test", "external_account_id": "account-1",
@@ -15349,7 +15341,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
         self.assertEqual(velox.CALENDAR_RIGHT_SPLIT_DEFAULT, 0.80)
 
     def test_gmail_history_window_filters_and_prunes_existing_messages(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, vault, credentials = self._stack(Path(td))
             credentials.save_gmail("mike@example.com", "app password")
             config = storage.load_config()
@@ -15383,7 +15375,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
             self.assertTrue(any("X-GM-RAW" in " ".join(call) for call in fake.search_calls))
 
     def test_calendar_list_missing_token_and_timezone_window_are_nonfatal(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -15452,7 +15444,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
         self.assertIn("calendar_backlog_expanded = not expanded", rail_source)
 
     def test_drive_full_text_search_omits_forbidden_sort_and_list_keeps_sort(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -15478,7 +15470,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(kwargs["orderBy"], "modifiedTime desc,name")
 
     def test_drive_lists_my_drive_and_paginated_shared_drives(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -15496,7 +15488,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(calls[1]["pageToken"], "p2")
 
     def test_drive_listing_tools_are_exposed_read_only(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -15515,7 +15507,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(velox.GOOGLE_DRIVE_DEFAULT_RESULT_LIMIT, 100)
 
     def test_drive_root_and_children_use_direct_parent_queries(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -15571,7 +15563,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
         guidance = inspect.getsource(velox.ToolRegistry)
         for token in ("drive_list_root", "drive_list_children", "folders_only=true", "1 through 1000"):
             self.assertIn(token, guidance)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -15610,7 +15602,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
         self.assertIn("for row in reversed(render_rows)", source)
 
     def test_native_drive_optional_arguments_are_actually_optional(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -15631,7 +15623,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(searched["arguments"], {"query": "roadmap"})
 
     def test_drive_shared_root_uses_shared_drive_corpus_and_flags(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -15678,7 +15670,7 @@ class CalendarGridAndGoogleSyncTests(_DataRootsIsolatedTestMixin, unittest.TestC
                 self.calls.append(("download", file_id, Path(directory), max_bytes))
                 return {"path": str(Path(directory) / "report.txt")}
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             fake = FakeDrive()
@@ -15722,7 +15714,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         ):
             self.assertEqual(hosted[key], local[key], key)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             _install_legacy_endpoint_fixtures(storage)
@@ -15788,7 +15780,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         sanitized = panel._sanitized_settings_config(draft)
         self.assertEqual(sanitized["llm"]["stall_detection_minutes"], 22.5)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             monitor = velox.LLMTaskMonitor(storage)
@@ -15844,7 +15836,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertEqual(profile["frequency_penalty"], 0.0)
         self.assertTrue(profile["preserve_thinking"])
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             _install_legacy_endpoint_fixtures(storage)
@@ -15882,7 +15874,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertEqual(json.loads(body.decode("utf-8")), payload)
 
     def test_endpoint_system_prompt_addon_precedes_both_transports(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             _install_legacy_endpoint_fixtures(storage)
@@ -16054,7 +16046,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertIn("prior_calendar_ids = frozenset(existing)", calendar_list_source)
         self.assertIn("existing_ids=prior_calendar_ids", calendar_list_source)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             calendar = velox.CalendarStore(storage)
@@ -16083,7 +16075,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         cfg = velox.default_config()
         self.assertNotIn("max_concurrent_running", cfg["agents"])
         self.assertEqual(velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)["max_concurrent_requests"], 4)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td)); storage = velox.Storage(paths); storage.ensure_first_run_files()
             chats = velox.ChatStore(storage); chat = chats.create_chat("Progress estimates")
             agents = velox.AgentStore(storage); tools = velox.ToolRegistry(storage)
@@ -16114,7 +16106,6 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
 
         accounts_source = inspect.getsource(velox.Panels._draw_accounts_settings_content)
         for widget_id in (
-            "settings.accounts.github.pat",
             "settings.accounts.google_calendar.client_secret",
             "settings.accounts.google_drive.client_secret",
             "settings.accounts.gmail.app_password",
@@ -16122,7 +16113,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             start = accounts_source.index(widget_id)
             segment = accounts_source[start:start + 650]
             self.assertIn("password=True", segment, widget_id)
-        self.assertGreaterEqual(accounts_source.count("password=True"), 4)
+        self.assertGreaterEqual(accounts_source.count("password=True"), 3)
 
     def test_long_task_limits_are_twenty_times_higher_without_web_rate_changes(self) -> None:
         self.assertEqual(velox.LONG_TASK_LIMIT_MULTIPLIER, 20)
@@ -16198,7 +16189,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertIn("draw_text_run", markdown_source)
 
     def test_chat_workspace_menu_toolbar_and_opening_share_one_path(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             panel = velox.Panels.__new__(velox.Panels)
             panel.services = SimpleNamespace(storage=SimpleNamespace(paths=paths))
@@ -16343,7 +16334,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             self.assertFalse(runtime.is_pause_requested(chat_id))
             self.assertFalse(runtime.is_paused(chat_id))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
         loop_source = inspect.getsource(velox.ChatRuntime._run_assistant_loop)
@@ -16421,7 +16412,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             with registry._active_tool_lock:
                 registry._active_tool_executions.pop(tool_id, None)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
         progress_source = inspect.getsource(velox.ToolRegistry.execute_tool_call)
@@ -16672,7 +16663,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertNotEqual(terminal, first)
 
     def test_chat_store_reports_earliest_changed_turn_for_streaming_suffix(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -16779,7 +16770,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             self.assertFalse(runtime.is_paused(chat_id))
             self.assertFalse(runtime.is_pause_requested(chat_id))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_new_chat_settings_layout_plain_task_label_and_spacing(self) -> None:
@@ -16809,7 +16800,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertNotIn("CHAT SETTINGS", sidebar)
 
     def test_cpu_hot_paths_reuse_validated_views_cached_counts_and_wrapped_rows(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             with mock.patch.object(
@@ -16973,7 +16964,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
 
 
     def test_visual_studio_and_cmake_discovery_preserves_all_installations(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             program_files = root / "Program Files"
             vs_base = program_files / "Microsoft Visual Studio"
@@ -17058,7 +17049,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             self.assertIn(os.path.abspath(str(standalone_cmake)), skill)
 
     def test_chat_composer_drafts_are_isolated_per_chat(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, _storage, chats, _calendar, panel, _services = (
                 CalendarTests._panel_stack(Path(td))
             )
@@ -17200,7 +17191,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
         self.assertNotIn('"stats": self._make_stats', update_source)
 
     def test_streaming_turn_updates_do_not_deepcopy_unchanged_giant_turn(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -17279,7 +17270,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual({str(row["state"]) for row in rows}, {"cancelled"})
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_terminal_monitor_state_does_not_release_live_inference_slot(self) -> None:
@@ -17321,11 +17312,11 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             monitor.complete(second_id)
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_dashboard_and_statistics_never_truncate_operational_records(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             monitor = velox.LLMTaskMonitor(storage)
@@ -17405,7 +17396,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             monitor.complete(request_id)
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_compaction_rejects_provider_inflated_expansion(self) -> None:
@@ -17461,7 +17452,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             )
             self.assertEqual(data["state"], "ineffective")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_four_chat_streams_complete_with_two_endpoint_slots(self) -> None:
@@ -17530,7 +17521,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             self.assertEqual(sum(row["state"] == "completed" for row in rows), 4)
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -17596,7 +17587,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
                 for removed in ("image_sha256", "material_findings", "acceptance_blocked", "visual_evidence", "strategy_reset_required"):
                     self.assertNotIn(removed, result)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -17607,7 +17598,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             "Keep the child's writable scope untouched until its automatic return", 'Inspect and integrate',
         ):
             self.assertIn(phrase, guidance)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -17632,7 +17623,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
 
 
     def test_cpp_skill_refreshes_from_live_machine_discovery_every_startup(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             module = velox
             with mock.patch.object(module, "build_cpp_programming_skill_markdown", return_value="first live machine skill"):
@@ -17648,7 +17639,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
         cfg = velox.default_config()
         self.assertEqual(cfg["tools"]["shell_timeout_minutes"], 60.0)
         self.assertEqual(cfg["tools"]["python_timeout_minutes"], 60.0)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -17665,7 +17656,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
         guidance = velox.ContextAssembler.EXECUTION_TIMEOUT_GUIDANCE
         for phrase in ('supplies a positive finite timeout_minutes', "positive finite", 'sized for the operation', 'rather than merely enlarging the timeout'):
             self.assertIn(phrase, guidance)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -17749,11 +17740,11 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             self.assertFalse(snapshot.get("paused"))
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_task_wall_metrics_include_waits_and_active_rates_use_measured_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             clock = [0.0]
@@ -17807,7 +17798,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             self.assertEqual(metadata["phase"], "ready")
             self.assertIsNone(metadata["phase_started_monotonic"])
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_disabled_automatic_capacity_fitting_defers_to_provider_overflow(self) -> None:
@@ -17859,7 +17850,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             self.assertIn("unchanged oversized request", response["text"])
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
         chat_loop = inspect.getsource(velox.ChatRuntime._run_assistant_loop)
@@ -17951,11 +17942,11 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             finally:
                 _drain_storage_log_writer(storage)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_resume_before_safe_pause_boundary_keeps_inference_clock_open(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             clock = [0.0]
@@ -18016,11 +18007,11 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             await next_lease.release()
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_cancel_callback_rejection_or_failure_keeps_request_live(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             request_id = monitor.start(velox.APP_SCOPE_ID, "cancel control", task_kind="chat")
@@ -18042,7 +18033,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             self.assertEqual(monitor.record_state(request_id), "cancelled")
 
     def test_queue_priority_is_single_pin_then_chat_fifo_agent_and_system(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             scheduler = velox.EndpointInferenceScheduler(storage, lambda _pid: {}, monitor)
@@ -18130,7 +18121,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             self.assertEqual(fake.calls, 0)
             self.assertEqual(agents.load_agent(agent_id)["last_context_tokens"], 7_000)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_stale_paused_release_callback_cannot_cancel_reacquired_request(self) -> None:
@@ -18161,7 +18152,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             await reacquired.release()
             monitor.complete(first_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_stream_bridge_timing_is_private_and_provider_usage_is_exact(self) -> None:
@@ -18280,7 +18271,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             await third.release()
             for task_id in ids: monitor.complete(task_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestCase):
@@ -18304,7 +18295,7 @@ class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unit
         self.assertNotIn(".pop(0)", production)
 
     def test_shared_record_helpers_and_calendar_signature_are_exact(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             records = root / "records"
             records.mkdir()
@@ -18389,7 +18380,7 @@ class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unit
             PerformanceTests, ToolPolicyAndImageExecutionTests,
             EndpointRecoveryTests, TranscriptScrollingAndToolRowsTests,
             RateLimitEncodingAndDecisionTests, TextWrappingUsageAndPromptTests,
-            DashboardRawAndTopToolsTests, VisionEndpointAndRoutingTests,
+            DashboardRawAndToolUsageTests, VisionEndpointAndRoutingTests,
         )
         for test_type in isolated_test_types:
             with self.subTest(test_type=test_type.__name__):
@@ -18397,7 +18388,7 @@ class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unit
                 self.assertNotIn("setUp", test_type.__dict__)
                 self.assertNotIn("tearDown", test_type.__dict__)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             storage = _make_test_storage(root)
             self.assertIsInstance(storage, velox.Storage)
@@ -18470,7 +18461,7 @@ class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unit
         self.assertNotIn("_acquire_agent_slot", inspect.getsource(velox.AgentRuntime))
 
     def test_log_compaction_reads_only_the_bounded_tail(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             log_path = storage.paths.log_jsonl_path
             velox.APP_LOG_WRITER.flush((log_path,), timeout=3.0)
@@ -18489,7 +18480,7 @@ class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unit
                 json.loads(raw_line.decode("utf-8"))
 
     def test_invalid_test_class_exits_two_without_starting_the_app(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             completed = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "--test-class", "DefinitelyMissingTestClass"],
                 cwd=td, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
@@ -18504,7 +18495,7 @@ class TaskInspectorTests(unittest.TestCase):
 
 
     def test_monitor_snapshot_captures_exact_live_provider_content(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             monitor = velox.LLMTaskMonitor(_make_test_storage(Path(td)))
             task_id = monitor.start(
                 velox.APP_SCOPE_ID, "Inspector Task", task_kind="chat",
@@ -18567,7 +18558,7 @@ class TaskInspectorTests(unittest.TestCase):
 
 
     def test_raw_formatter_preserves_thinking_tools_results_and_output(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             monitor = velox.LLMTaskMonitor(_make_test_storage(Path(td)))
             task_id = monitor.start(velox.APP_SCOPE_ID, "Two rounds", task_kind="system")
             system = {"role": "system", "content": "SYSTEM MESSAGE"}
@@ -18616,7 +18607,7 @@ class TaskInspectorTests(unittest.TestCase):
         self.assertNotIn("llm_task_snapshot_to_chat_turns", application_source())
 
     def test_auto_created_image_task_keeps_image_endpoint_and_source_metadata(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             profile = velox.default_endpoint_profile(
@@ -18932,7 +18923,7 @@ class TaskInspectorTests(unittest.TestCase):
             "Checklist remains active", "R1",
         ):
             self.assertIn(phrase, raw)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td))
             storage = velox.Storage(paths)
             storage.ensure_first_run_files()
@@ -18959,7 +18950,7 @@ class TaskInspectorTests(unittest.TestCase):
         self.assertIn('stats.get("costs", stats.get("costs_24h", {})', source)
         self.assertNotIn("Task mix", source)
         self.assertIn('"task_types": dict(collections.Counter', stats_source)
-        self.assertIn('"top_tools": top_tools', stats_source)
+        self.assertIn('"tool_calls_by_type": dict(tool_counts)', stats_source)
 
 
 class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestCase):
@@ -18967,7 +18958,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
 
 
     def test_chat_identity_reuses_one_dashboard_task_and_accumulates_metrics(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             chat_id = velox.uuid_v4()
@@ -19001,7 +18992,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(monitor.statistics()["task_types"].get("Chat"), 1)
 
     def test_fresh_root_has_no_default_context_docs_or_tasks(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage).list_docs()
             self.assertEqual(docs, [])
@@ -19015,7 +19006,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertNotIn("dashboard_show_system_tasks", storage.load_app_state())
 
     def test_each_context_doc_owns_exactly_one_managed_update_task(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage)
             schedules = docs.scheduled_tasks
@@ -19063,7 +19054,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             )
 
     def test_context_doc_limit_daily_revision_and_prompt_budget_are_strict(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage)
             doc = docs.create_doc("Bounded", "Retain one bounded test fact.", 1000)
@@ -19081,7 +19072,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
                 self.assertLessEqual(len(prompt), budget)
 
     def test_context_revision_uses_capture_day_not_stale_document_update_day(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage)
             created = docs.create_doc("Capture day", "Retain one fact.", 2000)
@@ -19102,7 +19093,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual((revisions[0].get("doc") or {}).get("content"), "old current content")
 
     def test_context_autosave_flush_never_overtakes_an_inflight_older_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage)
             created = docs.create_doc("Serialized autosave", "Keep edits ordered.", 2000)
@@ -19167,7 +19158,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertIn(unique, request_text)
             self.assertIn("Retain the exact source-supported test fact", request_text)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_context_docs_reach_no_tools_chat_and_agent_prompts(self) -> None:
@@ -19175,7 +19166,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             def resolve_endpoint(self, endpoint_profile_id: str) -> dict[str, Any]:
                 return {"profile_id": endpoint_profile_id, "vision": "disabled"}
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             chats = velox.ChatStore(storage)
             chat = chats.create_chat("No tools context")
@@ -19211,7 +19202,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertIn(marker, agent_prompt)
 
     def test_scheduled_and_context_tool_schemas_are_strict_and_crud_works(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             chats = velox.ChatStore(storage)
             chat = chats.create_chat("Schedule tool source")
@@ -19353,7 +19344,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             untouched = schedules.get_task(str(later_task["scheduled_task_id"]))
             self.assertEqual(untouched.get("run_count"), 0)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_due_one_off_inherits_chat_policy_and_resume_does_not_duplicate_trigger(self) -> None:
@@ -19420,7 +19411,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(resumed.get("next_run_at"), "")
             self.assertEqual(agents.load_agent(agent_id).get("status"), "running")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -19462,7 +19453,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
 
 
     def test_context_doc_revisions_edit_restore_delete_and_lock_contract(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage)
             created = docs.create_doc("Editable", "Preserve durable facts.", 2000)
@@ -19506,7 +19497,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertTrue(docs.revision_rows(doc_id)[0].get("is_current"))
 
     def test_context_autosave_accepts_transient_blank_goal_and_shutdown_flushes(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage)
             created = docs.create_doc("Autosave", "Keep the valid goal.", 2000)
@@ -19564,7 +19555,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(len(results), 1)
             self.assertEqual(refreshed_ids, [str(hourly["context_doc_id"])])
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_manual_and_due_context_refreshes_share_one_document_inference(self) -> None:
@@ -19601,7 +19592,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             self.assertEqual(fake.calls, 1)
             self.assertEqual(docs.get_doc(str(doc["context_doc_id"])).get("content"), "deduplicated content")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_context_ui_has_editable_docs_frequency_lock_and_current_revision(self) -> None:
@@ -19644,7 +19635,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
         self.assertNotIn("SEED_DOCS", store)
 
     def test_context_documents_table_delete_menu_respects_lock_and_opens_confirmation(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             docs = velox.ContextDocStore(storage)
             doc = docs.create_doc("Delete me", "Temporary context.", 2000)
@@ -19716,7 +19707,7 @@ class PerformanceTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
         return storage, tasks, docs
 
     def test_context_and_schedule_hot_views_reuse_validated_objects_without_io(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _storage, tasks, docs = self._stores(Path(td))
             for index in range(4):
                 created = docs.create_doc(f"Doc {index}", f"Goal {index}", 20_000)
@@ -19736,7 +19727,7 @@ class PerformanceTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIsNot(tasks.list_tasks(), task_view)
 
     def test_context_schedule_reconciliation_reads_one_task_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _storage, tasks, docs = self._stores(Path(td))
             for index in range(8):
                 docs.create_doc(f"Doc {index}", f"Goal {index}", 12_000)
@@ -19749,7 +19740,7 @@ class PerformanceTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(tasks.list_tasks_view()), len(rows))
 
     def test_json_reads_bytes_and_large_writes_are_compact(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "large.json"
             payload = {"name": "context", "content": "z" * 250_000, "rows": list(range(100))}
             velox.atomic_write_json(path, payload)
@@ -19764,7 +19755,7 @@ class PerformanceTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("file_read_bytes(path)", inspect.getsource(velox.read_json))
 
     def test_owned_log_submission_avoids_deepcopy_and_double_compaction(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             writer = velox.BatchedJSONLWriter(batch_delay_seconds=10.0, write_batch=lambda _path, _rows: None)
             target = Path(td) / "log.jsonl"
             row = {"severity": "info", "level": 2, "datetime": velox.now_iso(), "log msg": "bounded"}
@@ -20069,7 +20060,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         qwen36 = velox.endpoint_profile_ref(config, velox.DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID)
         self.assertNotIn("native_" + "image_analysis", qwen36)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             _install_legacy_endpoint_fixtures(storage)
@@ -20157,7 +20148,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             (1.0, 0.95, 20, 0.0, 0.0, 1.0),
         )
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             client = velox.LLMClient(storage)
@@ -20265,7 +20256,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             self.assertIn("data:image/png;base64,", request_json)
             self.assertNotIn("task-main-chat", json.dumps(request.task_metadata or {}))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_terminal_dashboard_task_delete_clears_monitor_and_scheduler_slot(self) -> None:
@@ -20329,7 +20320,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             )
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_five_way_tool_categories_filter_native_schemas(self) -> None:
@@ -20345,7 +20336,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             ),
         )
         self.assertEqual(velox.CHAT_TOOL_FEATURE_KEYS, tuple(key for key, _label in velox.CHAT_TOOL_CATEGORY_LABELS))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage, chats, chat = self._storage(Path(td))
             chat_id = str(chat["chat_id"])
             registry = velox.ToolRegistry(storage)
@@ -20545,7 +20536,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             self.assertIn("Parallel image evidence received.", str(turns[-1].get("text") or ""))
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_image_endpoint_scheduler_bounds_parallel_calls_to_profile_capacity(self) -> None:
@@ -20586,7 +20577,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             self.assertEqual(snapshot.get("queued", []), [])
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_uses_durable_concurrent_isolated_image_batches(self) -> None:
@@ -20600,7 +20591,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         self.assertIn("len(pending_group) > 1", loop_source)
 
     def test_brand_toggles_developer_mode_and_fps_overlay_together(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             panel = velox.Panels.__new__(velox.Panels)
@@ -20690,7 +20681,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         self.assertIn("chat_search_active", terms_source)
 
     def test_dashboard_round_metrics_publish_estimates_then_reconcile_exact_usage(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             monitor = velox.LLMTaskMonitor(storage)
@@ -20771,7 +20762,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             loop.close()
 
     def test_request_activity_advances_without_per_token_monitor_churn(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             monitor = velox.LLMTaskMonitor(storage)
@@ -20819,7 +20810,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             self.assertIn("HTTP 500", failed["activity_detail"])
 
     def test_chat_toolbar_status_covers_all_execution_phases(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             monitor = velox.LLMTaskMonitor(storage)
@@ -20935,7 +20926,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             monitor.complete(task_id)
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_empty_terminal_usage_cannot_erase_an_earlier_snapshot(self) -> None:
@@ -20989,7 +20980,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_endpoint_response_close_is_dispatched_off_the_ui_loop(self) -> None:
@@ -21064,7 +21055,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
                 self.assertIn("dispatch_close_active_response()", source)
                 self.assertNotIn("finally:\n            close_active_response()", source)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_tool_defaults_card_reserves_all_five_toggle_rows(self) -> None:
@@ -21130,7 +21121,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             definition = registry.tools["programming_toolchain_discover"]
             self.assertIn("one coherent compatible", definition.description)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_image_analysis_has_no_finding_parser_or_persistent_workflow_state(self) -> None:
@@ -21171,7 +21162,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         self.assertGreaterEqual(websocket.calls, 3)
 
     def test_browser_playback_releases_held_input_after_timeout(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage, _chats, chat = self._storage(Path(td))
             browser = velox.BrowserTools(storage, SimpleNamespace())
 
@@ -21200,7 +21191,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             self.assertEqual(key_events, ["keyDown", "keyUp"])
 
     def test_browser_outer_watchdog_covers_adjusted_playback_and_image_reviews(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage, _chats, _chat = self._storage(Path(td))
             registry = velox.ToolRegistry(storage)
             args = {
@@ -21281,7 +21272,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             for removed in ("materialFindingCount", "acceptanceBlocked", "acceptanceStatus", "strategyResetRequired"):
                 self.assertNotIn(removed, review)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_game_visual_skills_use_proportional_coverage_without_fixed_quotas(self) -> None:
@@ -21399,7 +21390,7 @@ def _normalized_prompt_budget_sample(storage: velox.Storage, chat_id: str) -> st
 class StallAndProgressTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     @contextlib.contextmanager
     def _temporary_directory(self):
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             try:
                 yield td
             finally:
@@ -21817,7 +21808,7 @@ class EndpointRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         asyncio.run(_test_agent_recovery_contract(self, failures=1))
 
     def test_fs_grep_literal_regex_globs_and_context(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             (root / "a.cpp").write_text("alpha\nJsonSaveFile(path, value, true, err)\nomega\n", encoding="utf-8")
             (root / "skip.txt").write_text("JsonSaveFile hidden\n", encoding="utf-8")
@@ -22321,7 +22312,7 @@ class ChecklistToolsAndTaskIdentityTests(_DataRootsIsolatedTestMixin, unittest.T
         self.assertEqual(instance.positional_arguments, ())
         with self.assertRaisesRegex(TypeError, "positional_arguments cannot be None"):
             velox.ToolDefinition("bad", "Bad", {}, lambda _ctx, _args: None, None)  # type: ignore[arg-type]
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, _chat = self._fixture(Path(td))
             registry = velox.ToolRegistry(storage)
             self.assertEqual(len(registry.tools), len(velox.TOOL_POSITIONAL_SIGNATURES))
@@ -22367,11 +22358,11 @@ class ChecklistToolsAndTaskIdentityTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertIn("Chat send completed", turns[-1]["text"])
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_native_tool_schema_builds_without_none_positional_arguments(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._fixture(Path(td))
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(
@@ -22389,7 +22380,7 @@ class ChecklistToolsAndTaskIdentityTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertTrue(all(isinstance(definition.positional_arguments, tuple) for definition in runtime.tools.tools.values()))
 
     def test_expert_mode_tool_surface_is_strict_and_implementer_cannot_verify(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats, _chat = self._fixture(Path(td))
             registry = velox.ToolRegistry(storage)
             expected = {"checklist_create", "checklist_status", "checklist_item_update", "verify_checklist"}
@@ -22402,7 +22393,7 @@ class ChecklistToolsAndTaskIdentityTests(_DataRootsIsolatedTestMixin, unittest.T
 
 
     def test_chat_and_agent_state_paths_are_owner_specific(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats, chat = self._fixture(Path(td))
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(str(chat["chat_id"]), "Delegated task")
@@ -22413,7 +22404,7 @@ class ChecklistToolsAndTaskIdentityTests(_DataRootsIsolatedTestMixin, unittest.T
 
 
     def test_reviewer_native_schema_omits_mutating_and_expert_tools(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats, chat = self._fixture(Path(td))
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(
@@ -22442,7 +22433,7 @@ class ChecklistToolsAndTaskIdentityTests(_DataRootsIsolatedTestMixin, unittest.T
 
 
     def test_strict_predecessor_root_is_rejected_without_migration(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats, _chat = self._fixture(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -22526,7 +22517,7 @@ class TranscriptScrollingAndToolRowsTests(_DataRootsIsolatedTestMixin, unittest.
             self.assertNotIn(removed, production)
 
     def test_image_analysis_schemas_require_only_path_and_prompt(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -22580,7 +22571,7 @@ class TranscriptScrollingAndToolRowsTests(_DataRootsIsolatedTestMixin, unittest.
                 ):
                     self.assertNotIn(removed, row)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_browser_review_passes_only_path_and_prompt_and_returns_text(self) -> None:
@@ -22620,12 +22611,12 @@ class TranscriptScrollingAndToolRowsTests(_DataRootsIsolatedTestMixin, unittest.
                 self.assertNotIn(removed, review)
             self.assertNotIn("warning", result)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
     def test_image_tool_descriptions_are_simple_and_direct(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -22672,7 +22663,7 @@ class RateLimitEncodingAndDecisionTests(_DataRootsIsolatedTestMixin, unittest.Te
             self.assertIn("err-prefix", result.stderr)
             self.assertIn("err-suffix", result.stderr)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
         source = inspect.getsource(velox.run_cancellable_subprocess)
         self.assertNotIn("text=True", source)
@@ -22822,11 +22813,11 @@ class RateLimitEncodingAndDecisionTests(_DataRootsIsolatedTestMixin, unittest.Te
             self.assertNotIn("image_sha256", probe)
             self.assertNotIn("visual_evidence_context", probe)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_visual_tool_schema_has_no_mandatory_research_or_recovery_packet(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -22900,7 +22891,7 @@ class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.Test
         self.assertEqual(aggregate["cached_input_tokens"], 40)
         self.assertEqual(aggregate["cache_reported_rounds"], 1)
         self.assertEqual(aggregate["cache_total_rounds"], 2)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td)); monitor = velox.LLMTaskMonitor(storage)
             tid = monitor.start(velox.APP_SCOPE_ID, "Cache-aware total tokens", task_kind="chat")
             monitor.set_inference_round_metrics(tid, "r1", input_tokens=100, output_tokens=10, cached_input_tokens=40)
@@ -22915,7 +22906,7 @@ class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertEqual(totals["total_tokens"], 165)
 
     def test_agent_records_persist_total_input_and_output_only(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chat = velox.ChatStore(storage).create_chat("Strict total tokens")
@@ -23065,7 +23056,7 @@ class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.Test
         }
         for name, before in baseline_column_sizes.items():
             self.assertLess(current[name], before, name)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chat_id = str(velox.ChatStore(storage).create_chat("Prompt audit")["chat_id"])
@@ -23078,12 +23069,12 @@ class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.Test
         self.assertIn("RESPECT THE PIXELS", velox.DEFAULT_IMAGE_ANALYSIS_SKILL_MARKDOWN)
 
 
-class DashboardRawAndTopToolsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
+class DashboardRawAndToolUsageTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     """Dashboard aggregation and raw task views."""
 
 
-    def test_top_tools_aggregate_all_dashboard_tasks_and_cap_at_ten(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+    def test_tool_counts_aggregate_all_dashboard_tasks(self) -> None:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             first = monitor.start(velox.APP_SCOPE_ID, "First", task_kind="chat")
@@ -23108,12 +23099,7 @@ class DashboardRawAndTopToolsTests(_DataRootsIsolatedTestMixin, unittest.TestCas
                     self.assertTrue(monitor.record_tool_call(task_id, name))
             stats = monitor.statistics()
             self.assertEqual(stats["tool_calls_by_type"], counts)
-            expected = sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold()))[:10]
-            self.assertEqual(
-                [(row["tool_name"], row["count"]) for row in stats["top_tools"]],
-                expected,
-            )
-            self.assertEqual(len(stats["top_tools"]), 10)
+
 
     def test_registry_records_native_tool_calls_against_the_logical_task(self) -> None:
         async def scenario(root: Path) -> None:
@@ -23131,9 +23117,8 @@ class DashboardRawAndTopToolsTests(_DataRootsIsolatedTestMixin, unittest.TestCas
             self.assertTrue(result["ok"])
             stats = monitor.statistics()
             self.assertEqual(stats["tool_calls_by_type"], {"time_now": 1})
-            self.assertEqual(stats["top_tools"], [{"tool_name": "time_now", "count": 1}])
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_cost_card_uses_scrollable_endpoint_bars_and_table_terms(self) -> None:
@@ -23342,7 +23327,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
                 "parameters": {"type": "object", "properties": {}},
             },
         }]
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             client = velox.LLMClient(storage)
@@ -23403,7 +23388,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertIn('"Image analysis context"', editor_source)
         self.assertIn("Both modes use this Task's current endpoint", editor_source)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             _install_legacy_endpoint_fixtures(storage)
@@ -23515,7 +23500,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             self.assertEqual(len(nested), 1)
             self.assertEqual(nested[0]["tool_call_id"], "call-second")
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_chat_live_and_reconstructed_context_receive_image_after_tool_result(self) -> None:
@@ -23617,7 +23602,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             )
             runtime.cancel_all()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_live_and_restart_replay_preserve_current_context_image(self) -> None:
@@ -23715,7 +23700,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             )
             await runtime.shutdown()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
 
@@ -23725,7 +23710,7 @@ class EngineeringWorkflowTests(unittest.TestCase):
     def test_shared_workflow_is_single_concise_capability_aware_block(self) -> None:
         source = inspect.getsource(velox.ContextAssembler.engineering_workflow_guidance)
         self.assertIn("STREAMLINED ENGINEERING WORKFLOW", source)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -23760,7 +23745,7 @@ class EngineeringWorkflowTests(unittest.TestCase):
         self.assertNotIn("immediately use web_search before continuing", without_web)
 
     def test_image_analysis_has_no_workflow_state_or_recovery_packet(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -23822,7 +23807,7 @@ class EngineeringWorkflowTests(unittest.TestCase):
             "many inference rounds", "compaction",
         ):
             self.assertNotIn(forbidden, guidance.lower())
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -23841,7 +23826,7 @@ class EngineeringWorkflowTests(unittest.TestCase):
 
 
     def test_agent_self_selects_expert_mode_without_serial_verifier(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -24150,7 +24135,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
         self.assertTrue(preferred["cl"].endswith(r"14.50.35717\bin\Hostx64\x64\cl.exe"))
 
     def test_cmake_probe_parses_version_generators_and_is_process_cached(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             executable = Path(td) / "cmake.exe"
             executable.write_bytes(b"fake")
             calls: list[tuple[str, str]] = []
@@ -24197,7 +24182,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
         self.assertNotIn("C++23", combined)
 
     def test_assembled_chat_prompt_omits_harness_capacity_coaching(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -24220,7 +24205,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
         self.assertIn('complete affected functions/types', prompt)
 
     def test_agent_prompt_omits_compaction_and_continuation_coaching(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -24247,7 +24232,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
 
 
     def test_expert_mode_continuation_runtime_remains_operational(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -24271,7 +24256,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
 
 
     def test_shell_exec_model_description_states_windows_cmd_contract(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -24425,7 +24410,7 @@ class VerifiedCompletionHistoryAndLayoutTests(_DataRootsIsolatedTestMixin, unitt
         self.assertEqual(velox.embedded_icon_native_size("checklist_export"), 32)
 
     def test_strict_predecessor_rejected_without_migration(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats, _chat, _store = self._fixture(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -24440,7 +24425,7 @@ class VerifiedCompletionHistoryAndLayoutTests(_DataRootsIsolatedTestMixin, unitt
 
 class ChecklistStoreTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         root = Path(self.temp.name)
         self.storage = velox.Storage(velox.AppPaths(root))
         self.storage.ensure_first_run_files()
@@ -24754,7 +24739,7 @@ class NativeToolContractTests(unittest.TestCase):
             )
 
     def test_every_registered_tool_schema_matches_native_signature(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             registry = self._registry(Path(td))
             for name, definition in registry.tools.items():
                 properties = (definition.parameters or {}).get("properties") or {}
@@ -24764,7 +24749,7 @@ class NativeToolContractTests(unittest.TestCase):
                 self.assertTrue(required.issubset(properties), name)
 
     def test_checklist_tools_use_canonical_execution_scope_and_legacy_tools_are_hidden(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             registry = self._registry(Path(td))
             feature_overrides = {
                 "file_tools_enabled": False,
@@ -24828,7 +24813,7 @@ class ChecklistUIAndOrchestrationTests(_DataRootsIsolatedTestMixin, unittest.Tes
         self.assertNotIn("selected_state = selected", source)
 
     def test_append_turn_is_idempotent_and_rejects_conflicting_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -24845,7 +24830,7 @@ class ChecklistUIAndOrchestrationTests(_DataRootsIsolatedTestMixin, unittest.Tes
             self.assertEqual(len(chats.load_turns(velox.APP_SCOPE_ID, chat_id)), 1)
 
     def test_disk_duplicate_identity_collapses_to_newest_record_for_ui(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -24887,15 +24872,15 @@ class ChecklistUIAndOrchestrationTests(_DataRootsIsolatedTestMixin, unittest.Tes
 
 
     def test_default_chat_sidebar_is_one_third_wider(self) -> None:
-        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, 830)
-        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, round(624 * 1.33))
+        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, 1104)
+        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, round(830 * 1.33))
         wide = velox.chat_layout_for_rect(velox.Rect(0, 0, 1920, 900))
-        self.assertEqual(wide.chats.w, 830)
+        self.assertEqual(wide.chats.w, 1104)
         self.assertEqual(wide.main.x, wide.divider.x + wide.divider.w)
 
 
     def test_real_chat_prompt_requires_root_acceptance_then_child_implementation(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -24994,7 +24979,7 @@ class ExecutableVisualLoopTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_checklist_continuation_prioritizes_proof_and_repair(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -25011,7 +24996,7 @@ class ExecutableVisualLoopTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_real_chat_prompt_contains_runtime_and_orientation_rules(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             chats = velox.ChatStore(storage)
@@ -25077,7 +25062,7 @@ class _ReviewerTestLLM:
 
 class ReviewerAgentLoopTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.paths = velox.AppPaths(Path(self.temp.name))
         self.storage = velox.Storage(self.paths)
         self.storage.ensure_first_run_files()
@@ -25545,7 +25530,7 @@ class ChatSidebarReportTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(velox.CHECKLIST_COLLECTION_SCHEMA, velox.data_schema('checklist_collection'))
         self.assertEqual(velox.CHECKLIST_HISTORY_SCHEMA, velox.data_schema('checklist_history_event'))
         self.assertEqual(velox.AGENT_ROLE_SIDECAR_FILENAME, velox.data_schema('agent_role') + ".json")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -25630,7 +25615,7 @@ class ReviewerQualityTests(unittest.TestCase):
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -25648,7 +25633,7 @@ class ChecklistUiReviewCardTests(_DataRootsIsolatedTestMixin, unittest.TestCase)
     """Checklist selection, result cards and row wrapping."""
 
     def test_checklist_dropdown_lists_chat_checklists_oldest_to_newest(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
             cid = chats.create_chat('Historical selection')['chat_id']
             owner = velox.Panels._chat_checklist_owner(cid)
@@ -25754,7 +25739,7 @@ class ChecklistUiReviewCardTests(_DataRootsIsolatedTestMixin, unittest.TestCase)
         self.assertIn('bool(ui.get("table_word_wrap", True))', draw_source)
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -25842,7 +25827,7 @@ class ChatAppearanceTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(velox.Panels._checklist_display_name(state), f"Doom FPS - {expected_stamp}")
 
     def test_checklist_status_exposes_raw_and_display_names(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Display name")
             owner = velox.Panels._chat_checklist_owner(str(chat["chat_id"]))
@@ -25906,7 +25891,7 @@ class InferenceYieldAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             await resumed.release()
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_time_sleep_yields_slot_then_same_task_can_reacquire(self) -> None:
@@ -25966,7 +25951,7 @@ class InferenceYieldAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             await resumed.release()
             await scheduler.close()
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_fresh_start_has_no_initialize_velox_gate(self) -> None:
@@ -25977,7 +25962,7 @@ class InferenceYieldAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertNotIn("bootstrap_mode", init_source + run_source)
         self.assertFalse(hasattr(velox.VeloxApp, "draw_bootstrap_frame"))
         self.assertFalse(hasattr(velox.VeloxApp, "complete_bootstrap"))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             self.assertFalse(storage.paths.app_json_path.exists())
             storage.ensure_first_run_files()
@@ -26009,7 +25994,7 @@ class InferenceYieldAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
     def test_rejects_unsupported_schema_without_migration(self) -> None:
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -26054,7 +26039,7 @@ class WebResearchAndReviewerRegressionTests(_DataRootsIsolatedTestMixin, unittes
         self.assertNotIn("latest news/developments", without_web)
 
     def test_web_tool_descriptions_prompt_current_lookup_and_browser_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             registry = velox.ToolRegistry(storage)
             search_description = registry.tools["web_search"].description
@@ -26186,7 +26171,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("THIS LATE GLOBAL ADDON", str(second_messages[0]["content"]))
             self.assertEqual(second_messages[:len(first_messages)], first_messages)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_date_history_and_context_docs_are_suffix_snapshots_not_system_rewrites(self) -> None:
@@ -26247,7 +26232,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 docs_turns[1]["application_context_fingerprint"],
             )
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_skill_load_stays_chronological_and_does_not_move_into_message_zero(self) -> None:
@@ -26288,7 +26273,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             build_source = inspect.getsource(velox.ChatRuntime._build_messages)
             self.assertNotIn("_loaded_skill_context_block(turns)", build_source)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_week_calendar_updates_append_without_changing_system_prefix(self) -> None:
@@ -26321,7 +26306,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn("Monday: Alpha", str(calendar_turns[0].get("text") or ""))
             self.assertIn("Monday: Beta", str(calendar_turns[1].get("text") or ""))
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_context_assembler_has_no_request_varying_system_prefix_inputs(self) -> None:
@@ -26336,7 +26321,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("byte-stable leading system prompt", stable_source)
 
     def test_native_tool_schema_surface_is_stable_after_chat_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Tools")
             chat_id = str(chat["chat_id"])
@@ -26354,7 +26339,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_strict_data_model_rejects_unsupported_root_without_migration(self) -> None:
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -26382,7 +26367,7 @@ class WindowsCommandAndCompactionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             velox.validate_shell_command_for_platform(command, windows=True)
 
     def test_shell_guidance_names_exact_separator_trap_and_returncode(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             storage.ensure_first_run_files()
             registry = velox.ToolRegistry(storage)
@@ -26425,7 +26410,7 @@ class WindowsCommandAndCompactionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -26452,7 +26437,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         return panel
 
     def test_committed_chat_delete_recovers_selection_even_when_caller_raises_late(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             remaining = chats.create_chat("Remaining")
             doomed = chats.create_chat("Doomed")
@@ -26478,7 +26463,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertFalse(any(str(row.get("level") or "") == "error" for row in panel.state.toasts))
 
     def test_failed_chat_delete_keeps_existing_selection_and_reports_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Still here")
 
@@ -26493,7 +26478,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertTrue(any("deletion failed" in str(row.get("message") or "").lower() for row in panel.state.toasts))
 
     def test_switch_active_chat_validates_destination_before_mutating_state(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
             current = chats.create_chat("Current")
             panel = self._panel(storage, chats)
@@ -26509,7 +26494,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             )
 
     def test_active_selection_does_not_trust_stale_chat_list_cache_after_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             remaining = chats.create_chat("Remaining")
             doomed = chats.create_chat("Doomed")
@@ -26527,7 +26512,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(panel.state.active_chat_id, str(remaining["chat_id"]))
 
     def test_chat_list_skips_record_deleted_between_scan_and_json_read(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, _storage, chats = _make_test_chat_stack(Path(td))
             survivor = chats.create_chat("Survivor")
             doomed = chats.create_chat("Race")
@@ -26552,7 +26537,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn(doomed_id, ids)
 
     def test_agent_list_skips_record_deleted_between_scan_and_json_read(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Owner")
             agents = velox.AgentStore(storage)
@@ -26579,7 +26564,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn(doomed_id, ids)
 
     def test_irreversible_store_deletes_ignore_best_effort_log_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             try:
                 chat = chats.create_chat("Delete log")
@@ -26590,7 +26575,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             finally:
                 _drain_storage_log_writer(storage)
 
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             try:
                 chat = chats.create_chat("Agent owner")
@@ -26605,7 +26590,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 _drain_storage_log_writer(storage)
 
     def test_committed_agent_delete_clears_all_selected_agent_references(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             chat = chats.create_chat("Agent owner")
             agents = velox.AgentStore(storage)
@@ -26665,7 +26650,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -26803,7 +26788,7 @@ class ToolRowIdentityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -26893,7 +26878,7 @@ class ReviewerReliabilitySecurityTests(unittest.IsolatedAsyncioTestCase):
     """Reviewer termination, verdict parsing and secret redaction."""
 
     async def asyncSetUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.paths = velox.AppPaths(Path(self.temp.name))
         self.storage = velox.Storage(self.paths)
         self.storage.ensure_first_run_files()
@@ -27088,7 +27073,7 @@ class ReviewerReliabilitySecurityTests(unittest.IsolatedAsyncioTestCase):
         bearer = "Bearer abcdefghijklmnopqrstuvwxyz0123456789"
         api_key = "sk-abcdefghijklmnopqrstuvwx123456"
         password = "password=correct-horse-battery-staple"
-        auth_url = f"https://triplenom:{pat}@github.com/triplenom/private-repo.git"
+        auth_url = f"https://user:{pat}@git.example.test/team/private-repo.git"
         sha1 = "a02a1bee49482f9509372666f66ef10ee1bf51e4"
         sha256 = "f0ba2fcfe374ac992096a7e070a7f744e8d5eb85ef16db08489144ba5b102dc2"
         secret_text = (
@@ -27155,7 +27140,7 @@ class ReviewerReliabilitySecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -27223,7 +27208,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
         )
 
     async def test_chat_stream_strips_split_terminal_dsml_suffix_before_ui_or_storage(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._chat_client(Path(td))
             artifact = "</｜DSML｜parameter>"
             body = b"".join([
@@ -27240,7 +27225,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertFalse(any("DSML" in chunk.text for chunk in chunks))
 
     async def test_responses_snapshot_recovers_missing_delta_suffix_and_normalizes_replay_item(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._responses_client(Path(td))
             artifact = "</｜DSML｜parameter>"
             final_item = {"id":"msg_1","type":"message","role":"assistant","content":[
@@ -27265,7 +27250,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertIn("Hello", replay)
 
     async def test_responses_done_snapshot_can_finish_text_without_response_completed(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._responses_client(Path(td))
             body = b"".join([
                 self._sse({"type":"response.output_text.delta","delta":"Hel"}),
@@ -27280,7 +27265,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertTrue(chunks[-1].done)
 
     async def test_chat_empty_delta_falls_back_to_same_chunk_message_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._chat_client(Path(td))
             body = self._sse({"choices":[{
                 "delta":{"content":""},
@@ -27294,7 +27279,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertFalse(any(chunk.error for chunk in chunks))
 
     async def test_refusal_is_visible_in_chat_stream_and_nonstream(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             client, stream_request = self._chat_client(root)
             stream_body = self._sse({"choices":[{"delta":{"refusal":"Cannot comply."},"finish_reason":"stop"}]}) + b"data: [DONE]\n\n"
@@ -27317,7 +27302,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertEqual(result["text"], "Policy refusal.")
 
     async def test_sse_multiline_data_event_is_framed_as_one_json_payload(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._chat_client(Path(td))
             body = (
                 b'data: {"choices":[\n'
@@ -27333,7 +27318,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertEqual("".join(chunk.text for chunk in chunks), "OK")
 
     async def test_malformed_sse_after_valid_event_is_protocol_error_not_silent_drop(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._chat_client(Path(td))
             body = self._sse({"choices":[{"delta":{"content":"partial"}}]}) + b'data: {"choices":[\n\n'
             with mock.patch.object(
@@ -27346,7 +27331,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertIn("SSE data event was not valid JSON", str(chunks[-1].error))
 
     async def test_raw_ndjson_rejects_one_malformed_record_instead_of_skipping_it(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._chat_client(Path(td))
             body = (
                 b'{"choices":[{"delta":{"content":"A"}}]}\n'
@@ -27362,7 +27347,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertIn("strict NDJSON", str(chunks[-1].error))
 
     async def test_stream_total_byte_limit_applies_across_many_small_sse_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             _paths, storage, _chats = _make_test_chat_stack(root)
             config = storage.load_config()
@@ -27412,7 +27397,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             ])
 
     def test_responses_output_items_and_replay_collapse_duplicate_call_id(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             client = velox.LLMClient(storage)
             raw = {"status":"completed","output":[
@@ -27429,7 +27414,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertEqual(len(function_items), 1)
 
     async def test_conflicting_chat_tool_snapshot_becomes_protocol_error_not_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._chat_client(Path(td))
             obj = {"choices":[{
                 "delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"time_now","arguments":"{}"}}]},
@@ -27446,7 +27431,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertFalse(chunks[-1].native_tool_calls)
 
     async def test_responses_refusal_delta_done_and_output_item_done_are_visible(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._responses_client(Path(td))
             body = b"".join([
                 self._sse({"type":"response.refusal.delta","delta":"No"}),
@@ -27475,7 +27460,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertEqual("".join(chunk.text for chunk in chunks), "Message snapshot.")
 
     def test_incomplete_responses_status_wins_over_tool_call_finish_reason(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             client = velox.LLMClient(storage)
             parsed = client._responses_parse_output({
@@ -27491,7 +27476,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
             self.assertEqual(velox.llm_termination_category(parsed[5], parsed[6]), "truncated")
 
     async def test_responses_provider_cancel_is_error_and_nonstream_cancel_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             client, request = self._responses_client(root)
             body = self._sse({"type":"response.cancelled","response":{
@@ -27513,7 +27498,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
                     await client.chat_completions_once_full(dataclasses.replace(request, stream=False))
 
     async def test_nonstream_chat_rejects_nonobject_choice_zero(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             client, request = self._chat_client(Path(td))
             raw = json.dumps({"choices":["not-an-object"]}).encode("utf-8")
             with mock.patch.object(
@@ -27527,7 +27512,7 @@ class InferenceProtocolHardeningTests(_DataRootsIsolatedTestMixin, unittest.Isol
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -27570,7 +27555,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             await second.release()
             monitor.complete(first_id); monitor.complete(second_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_rate_limit_budget_wait_happens_before_endpoint_slot_acquire(self) -> None:
@@ -27618,7 +27603,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertEqual(result["usage"]["endpoint_wait_seconds"], 0.25)
             monitor.complete(first_id); monitor.complete(second_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_retry_cooldown_finishes_ready_not_fake_inference(self) -> None:
@@ -27635,7 +27620,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertEqual(metadata["phase"], "ready")
             self.assertEqual(metadata.get("activity"), "inactive")
             self.assertIsNone(metadata.get("cooldown_until_monotonic"))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_pause_lifecycle_keeps_queued_acquire_alive_until_resume(self) -> None:
@@ -27668,7 +27653,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             await lease.release()
             monitor.complete(holder_id); monitor.complete(paused_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_chat_resume_before_safe_boundary_preserves_live_inference_phase(self) -> None:
@@ -27694,7 +27679,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertEqual(monitor.record_metadata(task_id)["phase"], "inference")
             self.assertFalse(monitor.record_metadata(task_id)["pause_requested"])
             self.assertEqual(fake_scheduler.notified, 1)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_direct_agent_pause_and_resume_keep_monitor_scheduler_in_sync(self) -> None:
@@ -27725,7 +27710,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertFalse(metadata["pause_requested"])
             self.assertEqual(metadata["phase"], "inference")
             self.assertEqual(fake_scheduler.notified, 2)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_agent_tool_cancellation_is_owner_scoped(self) -> None:
@@ -27773,11 +27758,11 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertEqual(agents.load_agent(agent_id)["status"], "cancelled")
             self.assertEqual(tools.calls[0][0], agent_id)
             self.assertTrue(tools.calls[0][2])
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_queue_aging_prevents_low_priority_starvation_but_pin_still_wins(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             monitor = velox.LLMTaskMonitor(storage)
             scheduler = velox.EndpointInferenceScheduler(storage, lambda _pid: {}, monitor)
@@ -27825,14 +27810,14 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
             self.assertEqual(scheduler.snapshot()["shared"]["slots_consumed"], 0)
             monitor.complete(task_id)
             await scheduler.close()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
     def test_rejects_unsupported_schema_without_migration(self) -> None:
         self.assertEqual(velox.APP_VERSION, f"velox.v{velox.CURRENT_VERSION}")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, _storage, _chats = _make_test_chat_stack(root)
             manifest = velox.read_json(paths.app_json_path)
@@ -27848,7 +27833,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
 # Owner lifecycle and reviewer failure paths.
 class DurableLifecycleTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
         self.chat = self.chats.create_chat('Owner')
@@ -27971,7 +27956,7 @@ class DurableLifecycleTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 class ChecklistTransitionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
         self.cid = str(self.chats.create_chat('Checklist owner')['chat_id'])
@@ -28485,7 +28470,7 @@ class _ScriptedLLM:
 class _AsyncRuntimeFixture(_WriterDataRootsIsolatedTestMixin, unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
         self.cid = str(self.chats.create_chat("Runtime behavior")["chat_id"])
@@ -30495,7 +30480,7 @@ class FilePickerCacheTests(unittest.TestCase):
             finally: release.set(); cache.discard()
 
     def test_navigation_discards_stale_folder_results(self) -> None:
-        with tempfile.TemporaryDirectory() as old_dir, tempfile.TemporaryDirectory() as new_dir:
+        with _TemporaryDataDirectory() as old_dir, _TemporaryDataDirectory() as new_dir:
             cache=velox.FilePickerDirectoryCache(); entered=threading.Event(); release=threading.Event(); calls=[]
             old_key=str(Path(old_dir)); new_key=str(Path(new_dir))
             def scan(key: str) -> Any:
@@ -30691,6 +30676,7 @@ class ShutdownAndAgentPrefixTests(_AsyncRuntimeFixture):
         app.handle_events=mock.AsyncMock();app.run_background_ticks=mock.AsyncMock();app._update_perf_stats=mock.Mock()
         app.draw_frame=lambda:setattr(app.sdl_host,'running',False)
         app.chats=SimpleNamespace(flush_streaming_snapshots=mock.Mock())
+        app.monitor=SimpleNamespace(flush_history=mock.Mock())
         app.chat=SimpleNamespace(resume_pending_agent_report_deliveries=mock.Mock(),cancel_all=mock.Mock(),wait_for_user_stops=mock.AsyncMock(),running={},_agent_report_workers={})
         app.agent_runtime=SimpleNamespace(report_unreported_agent_events=mock.Mock(),shutdown=mock.AsyncMock())
         app.scheduled_task_scheduler=SimpleNamespace(shutdown=mock.AsyncMock());app.context_doc_service=SimpleNamespace(shutdown=mock.AsyncMock())
@@ -30768,7 +30754,7 @@ class GLMFlashProfileTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase)
 
     def setUp(self) -> None:
         super().setUp()
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.storage = _make_test_storage(Path(self.temp.name))
         self.client = velox.LLMClient(self.storage)
@@ -33400,7 +33386,7 @@ class StreamingReasoningIntegrationTests(_AsyncRuntimeFixture):
 class _ChecklistRuntimeFixture(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
         self.chat_id = str(self.chats.create_chat("Automatic Checklist regressions")["chat_id"])
@@ -33778,7 +33764,7 @@ class CalibrationTests(_AsyncRuntimeFixture):
 
     def test_calibration_does_not_cross_data_roots(self) -> None:
         p=self.profile(); velox.observe_endpoint_prompt_usage(self.storage,p,{'input_tokens':150000})
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             other=velox.Storage(velox.AppPaths(Path(td)));other.ensure_first_run_files()
             self.assertNotIn('_token_estimate_multiplier',velox.endpoint_with_token_calibration(other,p))
 
@@ -35350,7 +35336,7 @@ class EndpointDefaultsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = _TemporaryDataDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.storage = _make_test_storage(Path(self.tmp.name))
         self.client = velox.LLMClient(self.storage)
@@ -35591,7 +35577,7 @@ class PromptContractTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn('delete stale binaries, logs, reports', p)
 
     def test_agent_ownership_guidance_is_only_in_agent_enabled_chat_prompt(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td)); chats = velox.ChatStore(storage)
             chat = chats.create_chat('No worker tools')
             cid = str(chat['chat_id']); chat['features']['agent_tools_enabled'] = False
@@ -35652,7 +35638,7 @@ class PromptContractTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertLess(len(p),4000)
 
     def test_all_seventeen_fresh_skills_seed_and_load_complete(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td)); skills = velox.SkillStore(storage)
             rows = skills.list_skills(include_disabled=False)
             self.assertEqual(len(rows),17)
@@ -35799,7 +35785,7 @@ class QwenHTTPTests(_AsyncRuntimeFixture):
 
 async def _test_chat_recovery_contract(test: unittest.TestCase) -> None:
     """Real ChatRuntime + shared client: recovery does not add model turns."""
-    with tempfile.TemporaryDirectory() as td:
+    with _TemporaryDataDirectory() as td:
         paths, storage, chats = _make_test_chat_stack(Path(td))
         chat_id = str(chats.create_chat("Endpoint Error Recovery regression")["chat_id"])
         eid = chats.get_chat_endpoint_profile_id(chat_id)
@@ -35841,7 +35827,7 @@ async def _test_chat_recovery_contract(test: unittest.TestCase) -> None:
 
 
 async def _test_agent_recovery_contract(test: unittest.TestCase, *, failures: int) -> None:
-    with tempfile.TemporaryDirectory() as td:
+    with _TemporaryDataDirectory() as td:
         paths, storage, chats = _make_test_chat_stack(Path(td))
         cid = str(chats.create_chat("Agent recovery regression")["chat_id"])
         eid = velox.DEFAULT_ENDPOINT_PROFILE_ID
@@ -38010,7 +37996,7 @@ class NestedChecklistPresentationTests(_WriterDataRootsIsolatedTestMixin, unitte
 
     def setUp(self) -> None:
         super().setUp()
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
         self.cid = self.chats.create_chat('Nested presentation')['chat_id']
@@ -38557,36 +38543,38 @@ class ChecklistRenderingTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
             w.table_view('checklist', velox.Rect(0, 0, 830, 240), velox.Panels._expert_mode_table_columns(), self.rows('verified'))
         self.assertTrue(any(call.args[0].endswith('.status') and call.args[2] == 'VERIFIED' for call in tooltip.call_args_list))
 
-    def test_sidebar_can_reach_half_at_all_normal_window_sizes(self) -> None:
+    def test_sidebar_can_reach_responsive_limit_at_all_window_sizes(self) -> None:
         for width in (300, 640, 1024, 1600, 1920, 2560, 3840, 7680):
             with self.subTest(width=width):
                 layout = velox.chat_layout_for_rect(velox.Rect(50, 10, width, 600), chat_list_width=100000)
-                self.assertEqual(layout.chats.w, (width - velox.CHAT_COLUMN_GAP_PX) // 2)
-                self.assertGreaterEqual(layout.main.w, layout.chats.w)
+                available = width - velox.CHAT_COLUMN_GAP_PX
+                expected = min(int(available * .60), available - 420) if available >= 680 else available // 2
+                self.assertEqual(layout.chats.w, expected)
+                self.assertGreaterEqual(layout.main.w, min(420, (available + 1) // 2))
                 self.assertEqual(layout.main.x + layout.main.w, 50 + width)
                 self.assertEqual(layout.divider.x, layout.chats.x + layout.chats.w)
 
-    def test_sidebar_preferences_below_and_above_half_are_clamped_at_layout(self) -> None:
+    def test_sidebar_preferences_are_clamped_to_readable_transcript_limits(self) -> None:
         for width in (301, 700, 1601, 3841):
             for requested in (-20, 80, 400, 900, 2000, 100000):
                 with self.subTest(width=width, requested=requested):
                     layout = velox.chat_layout_for_rect(velox.Rect(0, 0, width, 600), chat_list_width=requested)
                     self.assertGreater(layout.chats.w, 0)
-                    self.assertGreaterEqual(layout.main.w, layout.chats.w)
+                    self.assertGreaterEqual(layout.main.w, min(420, (width - velox.CHAT_COLUMN_GAP_PX + 1) // 2))
                     self.assertEqual(layout.chats.w + layout.main.w + layout.divider.w, width)
 
     def test_sidebar_width_over_old_pixel_ceiling_roundtrips(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td))); storage.ensure_first_run_files()
             state = storage.load_app_state(); state['chat_list_width'] = 1800
             storage.write_app_state_and_geometry(state)
             loaded = storage.load_app_state()
             self.assertEqual(loaded['chat_list_width'], 1800)
             self.assertEqual(velox.chat_layout_for_rect(velox.Rect(0, 0, 3840, 900), chat_list_width=loaded['chat_list_width']).chats.w, 1800)
-            self.assertEqual(velox.chat_layout_for_rect(velox.Rect(0, 0, 1280, 900), chat_list_width=loaded['chat_list_width']).chats.w, (1280 - velox.CHAT_COLUMN_GAP_PX) // 2)
+            self.assertEqual(velox.chat_layout_for_rect(velox.Rect(0, 0, 1280, 900), chat_list_width=loaded['chat_list_width']).chats.w, int((1280 - velox.CHAT_COLUMN_GAP_PX) * .60))
             self.assertEqual(storage.load_app_state()['chat_list_width'], 1800)
 
-    def test_coalesced_sidebar_drag_can_reach_half_and_consumes_release(self) -> None:
+    def test_coalesced_sidebar_drag_reaches_responsive_limit_and_consumes_release(self) -> None:
         p = object.__new__(velox.Panels); p.state = velox.UIState(); p.widgets = SimpleNamespace(renderer=SimpleNamespace(draw_rect=mock.Mock()))
         rect = velox.Rect(40, 10, 3840, 900)
         layout = velox.chat_layout_for_rect(rect, chat_list_width=p.state.chat_list_width)
@@ -38596,7 +38584,7 @@ class ChecklistRenderingTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
         inp.mouse_release_x, inp.mouse_release_y = 9999, 100
         inp.mouse_x, inp.mouse_y = 9999, 100
         self.assertTrue(p.handle_chat_column_divider(rect, layout))
-        self.assertEqual(p.state.chat_list_width, (3840 - velox.CHAT_COLUMN_GAP_PX) // 2)
+        self.assertEqual(p.state.chat_list_width, int((3840 - velox.CHAT_COLUMN_GAP_PX) * .60))
         self.assertTrue(inp.mouse_consumed); self.assertFalse(p.state.chat_column_divider_dragging)
 
     @staticmethod
@@ -38652,7 +38640,7 @@ class ChecklistRenderingTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
 
     def test_current_version_and_schema_reject_previous_roots(self) -> None:
         self.assertEqual(velox.SOURCE_REVISION, str(velox.CURRENT_VERSION)); self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td))); storage.ensure_first_run_files()
             app = velox.read_json(storage.paths.app_json_path)
             for previous in ('v296', 'v298', 'v299', 'v300'):
@@ -38684,7 +38672,7 @@ class EvidenceGuidanceTests(unittest.TestCase):
         self.assertIn('real input-to-visible-outcome path in both directions', velox.REVIEWER_SYSTEM_PROMPT)
 
     def test_tool_signatures_exactly_match_live_registry(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             registry = velox.ToolRegistry(storage)
             self.assertEqual(set(registry.tools), set(velox.TOOL_POSITIONAL_SIGNATURES))
@@ -38697,7 +38685,7 @@ class _NestedChecklistFixture(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
     """Current-model fixtures: use real durable owners, never the retired expert API."""
     def setUp(self) -> None:
         super().setUp()
-        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.temp = _TemporaryDataDirectory(); self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
         self.chat_id = self.chats.create_chat('Checklist contract')['chat_id']
         self.owner = velox._chat_checklist_owner(self.chat_id)
@@ -39428,7 +39416,7 @@ class CachedUsageTests(unittest.TestCase):
 class _StorageFixture(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.temp = _TemporaryDataDirectory(); self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
         self.chat = self.chats.create_chat("Acceptance")
         self.cid = str(self.chat["chat_id"])
@@ -39862,6 +39850,7 @@ class CacheHTTPTests(_AsyncRuntimeFixture):
         self.storage.write_config(cfg)
         monitor = velox.LLMTaskMonitor(self.storage); scheduler = velox.EndpointInferenceScheduler(self.storage, self.llm.resolve_endpoint, monitor)
         self.llm.bind_request_scheduler(scheduler, monitor)
+        previous_tokens = monitor.statistics(include_costs=False)["total_tokens"]
         tid = monitor.start(velox.APP_SCOPE_ID, "Cache HTTP", task_kind="chat")
         try:
             req = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{"role": "user", "content": "Verify accounting"}], stream=stream,
@@ -39875,7 +39864,7 @@ class CacheHTTPTests(_AsyncRuntimeFixture):
             self.assertEqual(row["cached_input_tokens"], hits or 0)
             self.assertEqual(row["cache_reported_rounds"], int(hits is not None))
             self.assertEqual(row["cache_total_rounds"], 1)
-            self.assertEqual(monitor.statistics()["total_tokens"], 104)
+            self.assertEqual(monitor.statistics(include_costs=False)["total_tokens"] - previous_tokens, 104)
             self.assertEqual(velox.cached_input_tokens_from_usage(result), hits)
         finally:
             monitor.complete(tid); await scheduler.close()
@@ -40023,7 +40012,6 @@ class UsageAccountingLifecycleTests(_AsyncRuntimeFixture):
         self.assertTrue(any("Unable to read Skills" in text and "Invalid mode schema" in text for text in seen))
 
 
-
 class DashboardPresentationTests(_StorageFixture):
     """Exercise production ring layouts and full-row pointer/tooltip ownership."""
 
@@ -40066,7 +40054,7 @@ class DashboardPresentationTests(_StorageFixture):
         self.assertEqual(velox.cached_input_label(metrics), "N/A")
         self.assertNotIn("101.0%", velox.cached_input_tooltip(metrics))
 
-    def test_both_donuts_use_equal_full_body_size_and_only_real_token_segments(self) -> None:
+    def test_both_donuts_use_equal_responsive_size_and_only_real_token_segments(self) -> None:
         for width in (500, 800, 1200, 1450, 1920, 2560):
             with self.subTest(width=width):
                 panel = self.panel(); rings = []; bodies = {}; labels = []
@@ -40080,7 +40068,11 @@ class DashboardPresentationTests(_StorageFixture):
                 first, second = rings[:2]
                 self.assertEqual((first[0].w,first[0].h), (second[0].w,second[0].h))
                 body = bodies["Token usage"]
-                self.assertEqual(first[0].w, max(88,min(body.h-8,int(min(body.w,bodies["Task outcomes"].w)*0.43))))
+                shared_width = min(body.w, bodies["Task outcomes"].w)
+                original_size = max(88, min(body.h - 8, int(shared_width * .43)))
+                outcome_labels = [text for _r, text in labels if re.match(r"\d+% (Complete|Failed|Cancelled)", text)]
+                legend_width = max(panel.widgets._text_width(text) for text in outcome_labels)
+                self.assertEqual(first[0].w, min(original_size, max(88, shared_width - 24 - 16 - legend_width)))
                 self.assertEqual(first[0].y-body.y, (body.h-first[0].h)//2)
                 self.assertEqual([v for v,_c in first[1]], [335233,47754])
                 self.assertIn("382,987 total", first[2]["center_tooltip"])
@@ -40670,7 +40662,7 @@ class ContextStormTests(_AsyncRuntimeFixture):
 
 class DebugExportFileTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     def setUp(self) -> None:
-        super().setUp(); self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        super().setUp(); self.temp = _TemporaryDataDirectory(); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name); self.path = self.root / 'report.txt'
 
     def assert_clean(self) -> None:
@@ -41172,7 +41164,7 @@ class VLLMWireTests(_AsyncRuntimeFixture):
 class ChatScrollTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.temp = _TemporaryDataDirectory(); self.addCleanup(self.temp.cleanup)
         _p, _s, self.chats, _cal, self.panel, _svc = CalendarTests._panel_stack(Path(self.temp.name))
         self.a = self.chats.create_chat('Reader A')['chat_id']; self.b = self.chats.create_chat('Reader B')['chat_id']
         self.panel.state.active_scope_id = velox.APP_SCOPE_ID
@@ -41968,7 +41960,7 @@ class RetrievalIntegrityTests(_AsyncRuntimeFixture):
 
 class TestRunnerIntegrityTests(unittest.TestCase):
     def test_printing_ok_is_not_a_successful_test_result(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             marker = Path(root) / 'test-success.json'
             with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker)}), open(os.devnull, 'wb') as target:
                 writer = _RawFDTestStream(target.fileno())
@@ -42337,7 +42329,7 @@ class QueueFailureCoverageTests(_AsyncRuntimeFixture):
 
 class TestResultMarkerTests(unittest.TestCase):
     def test_completed_result_marker_matches_only_its_process_and_count(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             path = Path(root) / 'result.json'
             result = unittest.TestResult(); result.testsRun = 3
             with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER':str(path)}):
@@ -42347,7 +42339,7 @@ class TestResultMarkerTests(unittest.TestCase):
             self.assertFalse(_test_result_matches(path, os.getpid(), 4))
 
     def test_incomplete_or_failed_suite_never_publishes_success(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             path = Path(root) / 'result.json'
             result = unittest.TestResult()
             result.testsRun = 1
@@ -42359,7 +42351,7 @@ class TestResultMarkerTests(unittest.TestCase):
                 self.assertFalse(path.exists())
 
     def test_missing_corrupt_oversized_and_wrong_schema_markers_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             path = Path(root) / 'result.json'
             self.assertFalse(_test_result_matches(path, os.getpid(), 1))
             for raw in (b'OK\n', b'{', b' ' * 5000, b'{"schema":"velox_test_result.v301"}', b'[]'):
@@ -42367,7 +42359,7 @@ class TestResultMarkerTests(unittest.TestCase):
                 self.assertFalse(_test_result_matches(path, os.getpid(), 1))
 
     def test_real_child_marker_cannot_acknowledge_its_parent_process(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             path = Path(root) / 'child-result.json'
             token = uuid.uuid4().hex
             env = dict(os.environ, VELOX_TEST_SUCCESS_MARKER=str(path), VELOX_TEST_RUN_TOKEN=token)
@@ -42552,7 +42544,7 @@ class TestResultMarkerTests(unittest.TestCase):
         self.assertIn("exceeded the 1800-second process timeout", text)
 
     def test_marker_publication_failure_leaves_no_acknowledgement(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             path = Path(root) / 'result.json'
             result = unittest.TestResult()
             result.testsRun = 3
@@ -42584,7 +42576,7 @@ class JsonlAppendHandleTests(unittest.TestCase):
     def test_create_file_failure_raises_winerror_and_closes_nothing(self) -> None:
         closed: list[int] = []
         kernel = self._kernel(None, closed)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "x.jsonl"
             with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
                  mock.patch.object(velox.ctypes, 'get_last_error', return_value=32), \
@@ -42601,7 +42593,7 @@ class JsonlAppendHandleTests(unittest.TestCase):
     def test_descriptor_adoption_failure_closes_raw_handle(self) -> None:
         closed: list[int] = []
         kernel = self._kernel(0x1234, closed)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "x.jsonl"
             with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
                  mock.patch('msvcrt.open_osfhandle', side_effect=OSError("adopt failed")), \
@@ -42616,7 +42608,7 @@ class JsonlAppendHandleTests(unittest.TestCase):
     def test_stream_construction_failure_closes_descriptor_not_raw_handle(self) -> None:
         closed: list[int] = []
         kernel = self._kernel(0x1234, closed)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "x.jsonl"
             with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
                  mock.patch('msvcrt.open_osfhandle', return_value=7), \
@@ -42633,7 +42625,7 @@ class JsonlAppendHandleTests(unittest.TestCase):
         closed: list[int] = []
         kernel = self._kernel(0x1234, closed)
         sentinel = object()
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "x.jsonl"
             with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
                  mock.patch('msvcrt.open_osfhandle', return_value=7), \
@@ -42648,7 +42640,7 @@ class JsonlAppendHandleTests(unittest.TestCase):
     def test_stream_construction_failure_secondary_close_failure_preserves_primary(self) -> None:
         closed: list[int] = []
         kernel = self._kernel(0x1234, closed)
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "x.jsonl"
             with mock.patch.object(velox.ctypes, 'WinDLL', return_value=kernel), \
                  mock.patch('msvcrt.open_osfhandle', return_value=7), \
@@ -42661,7 +42653,7 @@ class JsonlAppendHandleTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows native handle path")
     def test_native_handle_read_write_delete_share_final_close(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             path = Path(td) / "shared.jsonl"
             path.write_bytes(b"seed")
             handle = velox._open_jsonl_append_handle(path)
@@ -42677,7 +42669,7 @@ class JsonlAppendHandleTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows native handle path")
     def test_native_controlled_open_failure_retains_winerror_and_path(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             missing = Path(td) / "does-not-exist.jsonl"
             with self.assertRaises(OSError) as cm:
                 velox._open_jsonl_append_handle(missing)
@@ -42693,7 +42685,7 @@ class StorageLogDrainTests(unittest.TestCase):
         return SimpleNamespace(log_path=lambda: str(log_path))
 
     def test_drain_immediate_success(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             log_path = Path(td) / "log.jsonl"
             storage = self._fake_storage(log_path)
             flush_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
@@ -42712,7 +42704,7 @@ class StorageLogDrainTests(unittest.TestCase):
             clear.assert_called_once()
 
     def test_drain_path_scoped_failure_then_global_success(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             log_path = Path(td) / "log.jsonl"
             storage = self._fake_storage(log_path)
             flush_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
@@ -42732,7 +42724,7 @@ class StorageLogDrainTests(unittest.TestCase):
             clear.assert_called_once()
 
     def test_drain_exhausted_attempts_fails_without_clear(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with _TemporaryDataDirectory() as td:
             log_path = Path(td) / "log.jsonl"
             storage = self._fake_storage(log_path)
 
@@ -42750,7 +42742,7 @@ class StorageLogDrainTests(unittest.TestCase):
 
 class ReleaseSchemaTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     def test_chat_agent_and_turn_models_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             paths, storage, chats = _make_test_chat_stack(Path(root))
             chat = chats.create_chat('Current schema')
             agent = velox.AgentStore(storage).create_agent(chat['chat_id'], 'Current task')
@@ -42771,7 +42763,7 @@ class ReleaseSchemaTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
 
 class ScrollInputOwnershipTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     def test_nontranscript_wheel_does_not_discard_restoration_anchor(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             _p, _s, chats, _cal, panel, _svc = CalendarTests._panel_stack(Path(root))
             cid = chats.create_chat('Saved reading position')['chat_id']
             panel.state.active_scope_id = velox.APP_SCOPE_ID
@@ -42816,7 +42808,7 @@ class DeletedDeliveryTests(_AsyncRuntimeFixture):
 class _AttachmentUiFixture(_WriterDataRootsIsolatedTestMixin):
     def setUp(self) -> None:
         super().setUp()
-        self.tmp = tempfile.TemporaryDirectory(prefix='velox-attachments-')
+        self.tmp = _TemporaryDataDirectory(prefix='velox-attachments-')
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.paths, self.storage, self.chats, self.calendar, self.panel, self.services = CalendarTests._panel_stack(self.root)
@@ -43836,12 +43828,12 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 
 class UnifiedReleaseVersionTests(_StorageFixture):
-    def test_current_version_314_preserves_data_generation_311(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 314)
-        self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 311)
-        self.assertEqual(velox.APP_VERSION, 'velox.v314')
-        self.assertEqual(velox.SOURCE_REVISION, '314')
-        self.assertEqual(velox.DATA_FILE_VERSION, 'v311')
+    def test_current_and_compatibility_versions_are_315(self) -> None:
+        self.assertEqual(velox.CURRENT_VERSION, 315)
+        self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 315)
+        self.assertEqual(velox.APP_VERSION, 'velox.v315')
+        self.assertEqual(velox.SOURCE_REVISION, '315')
+        self.assertEqual(velox.DATA_FILE_VERSION, 'v315')
 
     def test_all_exported_schema_constants_share_data_generation(self) -> None:
         schemas = {name: value for name, value in vars(velox).items()
@@ -43849,8 +43841,8 @@ class UnifiedReleaseVersionTests(_StorageFixture):
         self.assertGreater(len(schemas), 30)
         for name, value in schemas.items():
             with self.subTest(name=name):
-                self.assertTrue(value.endswith('.v311'), value)
-        self.assertEqual(velox.AGENT_ROLE_SIDECAR_FILENAME, 'agent_role.v311.json')
+                self.assertTrue(value.endswith('.v315'), value)
+        self.assertEqual(velox.AGENT_ROLE_SIDECAR_FILENAME, 'agent_role.v315.json')
 
     def test_no_internal_schema_literal_has_its_own_version(self) -> None:
         # Future releases must change the two generation constants, not dozens of tags.
@@ -43860,13 +43852,13 @@ class UnifiedReleaseVersionTests(_StorageFixture):
         self.assertEqual(independent, [])
 
     def test_compatible_application_bump_does_not_change_data_format(self) -> None:
-        with mock.patch.object(velox, 'CURRENT_VERSION', 313):
-            self.assertEqual(velox.data_schema('chat'), 'chat.v311')
-            self.assertEqual(velox.data_schema('web_visible_content'), 'web_visible_content.v311')
+        with mock.patch.object(velox, 'CURRENT_VERSION', 316):
+            self.assertEqual(velox.data_schema('chat'), 'chat.v315')
+            self.assertEqual(velox.data_schema('web_visible_content'), 'web_visible_content.v315')
 
     def test_old_and_future_chat_generations_are_rejected_without_rewriting(self) -> None:
         original = self.chats.load_chat(self.cid)
-        for generation in (301, 303, 304, 309, 310, 312):
+        for generation in (301, 303, 304, 309, 310, 311, 312, 313, 314, 316):
             row = copy.deepcopy(original)
             row['schema'] = f'chat.v{generation}'
             row['data_version'] = f'v{generation}'
@@ -44687,22 +44679,26 @@ class DashboardCostAndChecklistLayoutTests(_StorageFixture):
         source=inspect.getsource(velox.Panels.draw_agents_panel)
         self.assertGreater(source.index('{"key": "cost"'), source.index('{"key": "generation_tps"'))
 
-    def test_cost_card_fits_all_five_rows_at_supported_fonts(self) -> None:
-        for font_h in (16,24,32,48):
+    def test_compact_cost_card_keeps_all_endpoint_rows_reachable(self) -> None:
+        for font_h in (16, 24, 32, 48):
             with self.subTest(font_h=font_h):
-                panel=object.__new__(velox.Panels);panel.widgets=ChecklistRenderingTests.widgets();panel.state=panel.widgets.state
-                panel.services=SimpleNamespace(monitor=self.monitor); panel.widgets.font.line_h=font_h
-                recorded=[]; bodies={}; original=panel._draw_agent_metric_card
-                def card(rect,title):
-                    body=original(rect,title);bodies[title]=body;return body
-                costs={'total_usd':1.,'top_endpoints':[{'label':f'Endpoint {i}','total_usd':.1} for i in range(5)]}
-                with mock.patch.object(panel,'_draw_agent_metric_card',side_effect=card), \
-                     mock.patch.object(panel.widgets,'clipped_text',side_effect=lambda r,t,*a,**k:recorded.append((r,t))):
-                    panel._draw_agent_summary_cards(velox.Rect(0,0,1920,2000), {'costs_24h':costs})
-                body=bodies['Costs']; rows=[(r,t) for r,t in recorded if t.startswith('Endpoint')]
-                self.assertEqual(len(rows),5)
-                for rect,text in rows:
-                    self.assertLessEqual(rect.y+rect.h,body.y+body.h,text)
+                panel = object.__new__(velox.Panels)
+                panel.widgets = ChecklistRenderingTests.widgets()
+                panel.state = panel.widgets.state
+                panel.services = SimpleNamespace(monitor=self.monitor)
+                panel.widgets.font.line_h = font_h
+                costs = {'total_usd': 1., 'endpoints': [
+                    {'label': f'Endpoint {i}', 'total_usd': .1} for i in range(5)]}
+                seen = set()
+                with mock.patch.object(panel.widgets, 'clipped_text', wraps=panel.widgets.clipped_text) as text:
+                    panel._draw_agent_summary_cards(velox.Rect(0, 0, 1920, 2000), {'costs': costs})
+                    seen.update(c.args[1] for c in text.call_args_list if c.args[1].startswith('Endpoint'))
+                    panel.state.scroll['dashboard:cost-bars'] = 100000
+                    text.reset_mock()
+                    panel._draw_agent_summary_cards(velox.Rect(0, 0, 1920, 2000), {'costs': costs})
+                    seen.update(c.args[1] for c in text.call_args_list if c.args[1].startswith('Endpoint'))
+                self.assertEqual(seen, {f'Endpoint {i}' for i in range(5)})
+                self.assertTrue(any(name == 'push_clip' for name, _, _ in panel.r.drawn))
 
 
 class EndpointCostIntegrationTests(_StorageFixture):
@@ -44977,23 +44973,6 @@ class CostDisplayRoundingTests(_StorageFixture):
         self.assertNotIn('theoretical', json.dumps(costs))
         self.assertNotIn('theoretical', velox.token_cost_tooltip(dict(costs[0], theoretical_requests=1)))
 
-    def test_compatible_cost_events_load_without_rewriting_retired_metadata(self) -> None:
-        now = time.time()
-        ledger = velox.TokenCostLedger(self.paths.root_dir)
-        prices = velox.endpoint_cost_pricing_snapshot(velox.endpoint_profile_ref(self.storage.load_config(), velox.DEFAULT_ENDPOINT_PROFILE_ID))
-        prices['theoretical'] = True  # Previously stored v311 metadata is tolerated, not migrated.
-        cost = velox.estimate_token_cost(prices, 10000, 2000, 8000)
-        cost['theoretical_requests'] = 1
-        event = {'schema': 'token_cost.v311', 'event_id': 'saved-v311-request', 'epoch': now - 1, 'pricing': prices, 'cost': cost}
-        path = ledger.directory / (datetime.fromtimestamp(now, timezone.utc).date().isoformat() + '.jsonl')
-        velox.append_jsonl(path, event)
-        before = path.read_bytes()
-        summary = ledger.summary(now=now)
-        self.assertEqual(summary['requests'], 1)
-        self.assertAlmostEqual(summary['total_usd'], cost['total_usd'])
-        self.assertEqual(summary['error'], '')
-        self.assertNotIn('theoretical_requests', summary)
-        self.assertEqual(path.read_bytes(), before)
 
     def test_subcent_requests_are_summed_before_rounding(self) -> None:
         ledger = velox.TokenCostLedger(self.paths.root_dir)
@@ -45548,7 +45527,7 @@ class RunnerFailureDiagnosticsTests(unittest.TestCase):
         return result
 
     def test_failure_details_preserve_assertion_and_do_not_publish_success(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             marker = Path(root) / 'result.ok'
             with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'launch-token'}):
                 result = self.failure_result()
@@ -45560,7 +45539,7 @@ class RunnerFailureDiagnosticsTests(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_failure_diagnostics_reject_other_launches_counts_and_corrupt_files(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             marker = Path(root) / 'result.ok'
             with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'token'}):
                 _publish_test_failure_details(self.failure_result(), 1)
@@ -45572,7 +45551,7 @@ class RunnerFailureDiagnosticsTests(unittest.TestCase):
                 self.assertEqual(_read_test_failure_details(marker, os.getpid(), 'token', 1), '')
 
     def test_success_has_no_failure_sidecar(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             marker = Path(root) / 'result.ok'; result = unittest.TestResult(); result.testsRun = 1
             with mock.patch.dict(os.environ, {'VELOX_TEST_SUCCESS_MARKER': str(marker), 'VELOX_TEST_RUN_TOKEN': 'token'}):
                 _publish_test_result(result, 1); _publish_test_failure_details(result, 1)
@@ -45604,7 +45583,7 @@ class RunnerFailureDiagnosticsTests(unittest.TestCase):
                 self.assertFalse(path.exists())
 
     def test_failure_details_bound_large_tracebacks_and_include_unexpected_success(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
+        with _TemporaryDataDirectory() as root:
             marker = Path(root) / 'result.ok'; result = self.failure_result()
             test, trace = result.failures[0]
             result.failures = [(test, 'x' * 10000 + 'last assertion') for _ in range(20)]
@@ -45739,15 +45718,6 @@ class CostWindowRegressionTests(_StorageFixture):
         for now in (float('nan'),float('inf')):
             with self.assertRaises(ValueError):ledger.summary(now=now)
 
-    def test_old_supported_ledger_schema_and_settings_do_not_need_migration(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION,314);self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION,311)
-        archived=next(iter(set(velox.VAULT_SOURCE_TYPES)-set(velox.VAULT_SOURCE_ORDER)))
-        cfg=self.storage.load_config();cfg['vault'][archived]={'enabled':True,'custom':'keep'}
-        self.storage.write_config(cfg)
-        self.assertEqual(self.storage.load_config()['vault'][archived],{'enabled':True,'custom':'keep'})
-        self.assertEqual(velox.VAULT_SOURCE_ORDER,('google_calendar','google_drive','gmail'))
-        self.assertEqual(set(velox.default_config()['vault'])-{'local_timezone','divider_fraction'},
-                         {'google_calendar','google_drive','gmail'})
 
     def test_dashboard_non_cost_snapshot_never_opens_ledger(self) -> None:
         with mock.patch.object(self.monitor.cost_ledger,'summary',side_effect=AssertionError('UI disk read')):
@@ -45950,6 +45920,347 @@ class ChecklistArrowSpacingTests(unittest.TestCase):
             w.table_view('tree',velox.Rect(0,0,830,250),velox.Panels._expert_mode_table_columns(),rows)
         child=next(c for c in text.call_args_list if c.args[1]=='C1.1')
         self.assertGreaterEqual(child.args[0].w,w._text_width('C1.1'))
+
+
+class DashboardHistoryTests(_StorageFixture):
+    """Exercise saved dashboard rows separately from transient provider traces."""
+
+    def task(self, kind: str = "chat", chat_id: str | None = None) -> str:
+        owner = chat_id or self.cid
+        return self.monitor.start(velox.APP_SCOPE_ID, "Saved dashboard fixture", task_kind=kind,
+            identity_key="chat:" + owner if kind == "chat" else "",
+            metadata={"chat_id": owner, "title": "Saved fixture",
+                      "endpoint_profile_id": velox.DEFAULT_ENDPOINT_PROFILE_ID})
+
+    def charge(self, task_id: str, *, final: bool = True) -> None:
+        profile = velox.endpoint_profile_ref(self.storage.load_config(), velox.DEFAULT_ENDPOINT_PROFILE_ID)
+        request = velox.LLMRequest(velox.APP_SCOPE_ID, profile["id"], [])
+        round_id = self.monitor.begin_inference_round(task_id, request, profile)
+        self.monitor.set_inference_round_metrics(task_id, round_id, input_tokens=100000,
+            output_tokens=10000, cached_input_tokens=80000, prefill_seconds=1.0,
+            generation_seconds=2.0, final=final, estimated=not final)
+
+    def reopen(self) -> velox.LLMTaskMonitor:
+        self.monitor.flush_history()
+        restored = velox.LLMTaskMonitor(self.storage)
+        self.assertEqual(restored.history_errors, [])
+        return restored
+
+    def test_completed_chat_survives_restart_with_identity_and_usage(self) -> None:
+        task = self.task(); self.charge(task); self.monitor.complete(task)
+        before = self.monitor.record_snapshot(task)
+        restored = self.reopen(); after = restored.record_snapshot(task)
+        for key in ("task_id", "display_id", "title", "state", "input_tokens", "output_tokens",
+                    "cached_input_tokens", "cache_total_rounds", "token_cost", "duration_seconds"):
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(restored.statistics(include_costs=False)["total_tasks"], 1)
+        self.assertFalse(restored.has_active_tasks())
+
+    def test_agent_image_and_system_rows_all_survive_restart(self) -> None:
+        tasks = [self.task(kind) for kind in ("agent", "image", "system", "summary", "compaction")]
+        for task in tasks: self.monitor.complete(task)
+        restored = self.reopen()
+        self.assertEqual({r["task_id"] for r in restored.dashboard_records()}, set(tasks))
+
+    def test_terminal_outcomes_are_preserved(self) -> None:
+        ids = [self.task(kind) for kind in ("chat", "agent", "image")]
+        for task, state in zip(ids, ("completed", "failed", "cancelled")):
+            self.monitor.update(task, state=state)
+        restored = self.reopen()
+        self.assertEqual(restored.statistics(include_costs=False)["counts"],
+                         {"completed": 1, "failed": 1, "cancelled": 1})
+
+    def test_interrupted_work_cannot_become_phantom_live_tasks(self) -> None:
+        task = self.task(); self.monitor.set_phase(task, "inference")
+        restored = self.reopen(); row = restored.record_snapshot(task)
+        self.assertEqual(row["state"], "cancelled")
+        self.assertIn("Interrupted", row["metadata"]["recovery_note"])
+        for key in ("cancellable", "pausable", "resumable", "prioritized"):
+            self.assertFalse(row[key], key)
+        panel = object.__new__(velox.Panels); panel._dashboard_task_context_menu_items = lambda row: []
+        self.assertIn("Interrupted", panel._dashboard_live_task_row(row)["_tooltip"])
+        self.assertFalse(restored.has_active_tasks())
+
+    def test_saved_duration_does_not_include_application_downtime(self) -> None:
+        with mock.patch.object(velox.time, "monotonic", return_value=100.0):
+            task = self.task()
+        with mock.patch.object(velox.time, "monotonic", return_value=142.0):
+            self.monitor.update_metadata(task, {"title": "Checkpoint"}, persist=True)
+        self.monitor.history.flush()
+        restored = velox.LLMTaskMonitor(self.storage)
+        with mock.patch.object(velox.time, "monotonic", return_value=1000000.0):
+            self.assertEqual(restored.record_snapshot(task)["duration_seconds"], 42.0)
+
+    def test_paused_time_is_saved_but_no_paused_callback_is_restored(self) -> None:
+        task = self.task(); self.monitor.set_phase(task, "paused")
+        restored = self.reopen()
+        self.assertEqual(restored.record_snapshot(task)["state"], "cancelled")
+        self.assertFalse(restored.resume_task(task))
+
+    def test_new_chat_turn_reopens_the_same_row_and_retains_cumulative_cost(self) -> None:
+        task = self.task(); self.charge(task); self.monitor.complete(task)
+        old = self.monitor.record_snapshot(task)
+        self.monitor = self.reopen()
+        self.assertEqual(self.task(), task)
+        self.charge(task); self.monitor.complete(task)
+        row = self.monitor.record_snapshot(task)
+        self.assertEqual(row["display_id"], old["display_id"])
+        self.assertEqual(row["input_tokens"], 2 * old["input_tokens"])
+        self.assertAlmostEqual(row["token_cost"]["total_usd"], 2 * old["token_cost"]["total_usd"])
+        self.assertEqual(len(self.monitor.dashboard_records()), 1)
+        self.assertNotIn("recovery_note", row["metadata"])
+
+    def test_chat_and_children_roll_up_once_after_restart(self) -> None:
+        parent, child = self.task(), self.task("agent")
+        for task in (parent, child): self.charge(task); self.monitor.complete(task)
+        before = self.monitor.record_snapshot(parent)["chat_cost_breakdown"]
+        restored = self.reopen()
+        self.assertEqual(restored.record_snapshot(parent)["chat_cost_breakdown"], before)
+        self.assertEqual(restored.cost_statistics()["requests"], 2)
+
+    def test_deleted_child_stays_hidden_without_losing_parent_cost(self) -> None:
+        parent, child = self.task(), self.task("image")
+        for task in (parent, child): self.charge(task); self.monitor.complete(task)
+        before = self.monitor.record_snapshot(parent)["chat_cost_breakdown"]
+        self.assertTrue(self.monitor.delete_task(child))
+        restored = self.reopen()
+        self.assertEqual(restored.record_snapshot(child), {})
+        self.assertEqual(restored.record_snapshot(parent)["chat_cost_breakdown"], before)
+        self.assertEqual(restored.cost_statistics()["requests"], 2)
+        # A second reopen must not accumulate the accounting tombstone twice.
+        self.monitor = restored; again = self.reopen()
+        self.assertEqual(again.record_snapshot(parent)["chat_cost_breakdown"], before)
+
+    def test_deleted_parent_then_new_turn_retains_old_chat_cost(self) -> None:
+        task = self.task(); self.charge(task); self.monitor.complete(task)
+        old_cost = self.monitor.record_snapshot(task)["token_cost"]["total_usd"]
+        self.monitor.delete_task(task); self.monitor = self.reopen()
+        new = self.task(); self.assertNotEqual(new, task); self.charge(new)
+        self.assertAlmostEqual(self.monitor.record_snapshot(new)["chat_cost_breakdown"]["chat"]["total_usd"], old_cost * 2)
+
+    def test_unrelated_chat_costs_are_not_merged_on_restart(self) -> None:
+        first, second = self.task(), self.task(chat_id="different")
+        self.charge(second)
+        restored = self.reopen()
+        self.assertEqual(restored.record_snapshot(first)["chat_cost_breakdown"]["total"].get("requests", 0), 0)
+        self.assertEqual(restored.record_snapshot(second)["chat_cost_breakdown"]["total"]["requests"], 1)
+
+    def test_only_summary_fields_are_saved_not_prompts_or_credentials(self) -> None:
+        task = self.task()
+        self.monitor.update_metadata(task, {"api_key": "SECRET", "prompt": "RAW-PROMPT",
+                                           "response": "RAW-RESPONSE", "arbitrary": {"nested": "SECRET"}}, persist=True)
+        self.monitor.flush_history()
+        text = self.monitor.history.path(task).read_text(encoding="utf-8")
+        for secret in ("SECRET", "RAW-PROMPT", "RAW-RESPONSE", "monotonic"):
+            self.assertNotIn(secret, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["schema"], velox.DASHBOARD_TASK_SCHEMA)
+
+    def test_request_inspector_does_not_claim_saved_raw_streams(self) -> None:
+        task = self.task(); self.charge(task); self.monitor.complete(task)
+        self.assertTrue(self.monitor.task_view_snapshot(task)["rounds"])
+        restored = self.reopen()
+        self.assertEqual(restored.task_view_snapshot(task)["rounds"], [])
+        self.assertTrue(restored.task_view_snapshot(task)["task"]["metadata"]["history_restored"])
+
+    def test_stream_metric_updates_are_throttled_but_final_usage_is_saved(self) -> None:
+        task = self.task()
+        with mock.patch.object(self.monitor.history, "save", wraps=self.monitor.history.save) as save:
+            with mock.patch.object(velox.time, "monotonic", return_value=time.monotonic() + 10):
+                for count in range(100):
+                    self.monitor.set_inference_round_metrics(task, "stream", input_tokens=1000, output_tokens=count)
+                self.assertEqual(save.call_count, 1)
+                self.monitor.set_inference_round_metrics(task, "stream", input_tokens=1000, output_tokens=200, final=True)
+                self.assertEqual(save.call_count, 2)
+        self.monitor.history.flush()
+        row = velox.LLMTaskMonitor(self.storage).record_snapshot(task)
+        self.assertEqual(row["output_tokens"], 200)
+
+    def test_old_lifecycle_event_cannot_resurrect_deleted_row(self) -> None:
+        task = self.task(); stale = self.monitor._snapshot_record(self.monitor._records[task])
+        self.monitor.complete(task); self.monitor.delete_task(task); self.monitor._append(stale)
+        self.assertEqual(self.reopen().record_snapshot(task), {})
+
+    def test_corrupt_record_is_reported_without_hiding_other_history(self) -> None:
+        good, bad = self.task(), self.task("agent")
+        self.monitor.complete(good); self.monitor.complete(bad); self.monitor.flush_history()
+        path = self.monitor.history.path(bad); path.write_text("not json", encoding="utf-8")
+        restored = velox.LLMTaskMonitor(self.storage)
+        self.assertTrue(restored.record_snapshot(good)); self.assertEqual(restored.record_snapshot(bad), {})
+        self.assertEqual(len(restored.history_errors), 1)
+        self.assertIn(path.name, restored.history_errors[0])
+        self.assertEqual(path.read_text(), "not json")
+
+    def test_wrong_generation_and_malformed_metadata_are_not_silently_accepted(self) -> None:
+        task = self.task(); self.monitor.complete(task); self.monitor.flush_history()
+        path = self.monitor.history.path(task); original = json.loads(path.read_text())
+        changes = [lambda p: p.update(schema="dashboard_task.v314"),
+                   lambda p: p["record"]["metadata"].update(input_tokens=-1),
+                   lambda p: p["record"]["metadata"].update(tool_calls_by_type=["bad"]),
+                   lambda p: p["record"]["metadata"].update(api_key="unsafe")]
+        for change in changes:
+            row = copy.deepcopy(original); change(row); path.write_text(json.dumps(row), encoding="utf-8")
+            restored = velox.LLMTaskMonitor(self.storage)
+            self.assertEqual(restored.record_snapshot(task), {})
+            self.assertEqual(len(restored.history_errors), 1)
+
+    def test_history_path_rejects_traversal_and_invalid_ids(self) -> None:
+        for task_id in ("../escape", "", "abc", "a/../b"):
+            with self.subTest(task_id=task_id), self.assertRaises(ValueError): self.monitor.history.path(task_id)
+
+    def test_writer_failure_is_reported_by_flush(self) -> None:
+        task = self.task(); self.monitor.history.flush()
+        with mock.patch.object(velox.DASHBOARD_SNAPSHOT_WRITER, "_write_json", side_effect=OSError("disk full")):
+            self.monitor.update_metadata(task, {"title": "Changed"}, persist=True)
+            with self.assertRaisesRegex(OSError, "disk full"): self.monitor.history.flush()
+        self.monitor.flush_history()  # Successful retry clears the error.
+
+    def test_writer_does_not_recreate_a_removed_root(self) -> None:
+        with _TemporaryDataDirectory() as directory:
+            root = Path(directory) / "absent"
+            target = root / "dashboard" / ("task_" + velox.uuid_v4() + ".json")
+            velox._write_owned_dashboard_snapshot(target, {})
+            self.assertFalse(root.exists())
+
+    def test_historical_order_uses_durable_creation_time(self) -> None:
+        first, second = self.task("agent"), self.task("agent")
+        for task in (first, second): self.monitor.complete(task)
+        before = [r["task_id"] for r in self.monitor.dashboard_records()]
+        self.assertEqual([r["task_id"] for r in self.reopen().dashboard_records()], before)
+
+    def test_saved_rows_load_in_a_fresh_python_process(self) -> None:
+        task = self.task(); self.charge(task); self.monitor.complete(task); self.monitor.flush_history()
+        source = str(Path(velox.__file__).resolve())
+        script = "\n".join([
+            "import importlib.util,json,sys,pathlib",
+            "spec=importlib.util.spec_from_file_location('velox',sys.argv[1])",
+            "v=importlib.util.module_from_spec(spec);sys.modules['velox']=v;spec.loader.exec_module(v)",
+            "s=v.Storage(v.AppPaths(pathlib.Path(sys.argv[2])))",
+            "m=v.LLMTaskMonitor(s)",
+            "print(json.dumps({'rows':len(m.dashboard_records()),'tokens':m.statistics(include_costs=False)['input_tokens'],'errors':m.history_errors}))",
+            "v.CoalescingAtomicJSONWriter.shutdown_all();v.BatchedJSONLWriter.shutdown_all()",
+        ])
+        result = subprocess.run([sys.executable, "-c", script, source, str(self.paths.root_dir)],
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1]),
+                         {"rows": 1, "tokens": 100000, "errors": []})
+
+
+class DashboardCompactLayoutTests(_StorageFixture):
+    def panel(self, line_h: int = 18) -> Any:
+        panel = object.__new__(velox.Panels); panel.widgets = ChecklistRenderingTests.widgets()
+        panel.state = panel.widgets.state; panel.services = SimpleNamespace(monitor=self.monitor)
+        panel.widgets.font.line_h = line_h
+        return panel
+
+    def test_card_heights_match_pre_bar_chart_formula_at_all_font_sizes(self) -> None:
+        for height in (14, 18, 22, 28, 34):
+            panel = self.panel(height); cards = []
+            original = panel._draw_agent_metric_card
+            def card(rect, title):
+                cards.append((rect, title)); return original(rect, title)
+            with mock.patch.object(panel, "_draw_agent_metric_card", side_effect=card):
+                panel._draw_agent_summary_cards(velox.Rect(0, 0, 3840, 1600), {})
+            expected = max(232, height + 64 + 5 * max(27, height + 3),
+                           height + 60 + 6 * max(23, height + 1))
+            self.assertEqual([r.h for r, _ in cards], [expected] * 4)
+
+    def test_changing_width_does_not_change_card_height(self) -> None:
+        panel = self.panel(); heights = []
+        original = panel._draw_agent_metric_card
+        def card(rect, title):
+            heights.append(rect.h); return original(rect, title)
+        with mock.patch.object(panel, "_draw_agent_metric_card", side_effect=card):
+            for width in (760, 1450, 2048, 3840):
+                panel._draw_agent_summary_cards(velox.Rect(0, 0, width, 1600), {})
+        self.assertEqual(len(set(heights)), 1)
+
+    def test_ring_legend_has_ten_extra_pixels_of_clearance(self) -> None:
+        panel = self.panel(); rings = []; texts = []
+        with mock.patch.object(panel, "_draw_ring_chart", side_effect=lambda rect, *a, **k: rings.append(rect)), \
+             mock.patch.object(panel.widgets, "clipped_text", side_effect=lambda rect, text, *a, **k: texts.append((rect, text))):
+            panel._draw_agent_summary_cards(velox.Rect(0, 0, 3840, 1000), {})
+        for ring, prefix in zip(rings, ("Input ", "0% Complete")):
+            label = next(r for r, text in texts if text.startswith(prefix))
+            self.assertEqual(label.x - (ring.x + ring.w), 24 + 16)  # clearance, then bullet + label inset
+
+    def test_outcome_counts_remain_readable_at_large_font(self) -> None:
+        panel = self.panel(29)
+        panel.widgets.font.char_w = 12
+        recorded = []
+        with mock.patch.object(panel.widgets, 'clipped_text', side_effect=lambda r, t, *a, **k: recorded.append((r, t))):
+            panel._draw_agent_summary_cards(velox.Rect(0, 0, 2048, 1400), {
+                'counts': {'completed': 6, 'failed': 2},
+                'outcome_percentages': {'completed': 75, 'failed': 25, 'cancelled': 0}})
+        labels = [(r, text) for r, text in recorded if re.match(r"\d+% (Complete|Failed|Cancelled)", text)]
+        self.assertEqual(len(labels), 3)
+        for rect, text in labels:
+            self.assertGreaterEqual(rect.w, panel.widgets._text_width(text), text)
+
+    def test_compact_cost_chart_still_scrolls_all_endpoints(self) -> None:
+        panel = self.panel(); panel.state.scroll["dashboard:cost-bars"] = 10**6
+        with mock.patch.object(panel.widgets, "clipped_text") as text:
+            panel._draw_dashboard_cost_card(velox.Rect(0, 0, 800, 249), DashboardCostBarRenderingTests.costs(50))
+        self.assertIn("Endpoint 49", [call.args[1] for call in text.call_args_list])
+
+    def test_chat_default_grows_by_33_percent_with_responsive_limits(self) -> None:
+        self.assertEqual(velox.CHAT_LIST_WIDTH_DEFAULT, round(830 * 1.33))
+        for desktop_width in (1920, 2048, 2560, 3000):
+            self.assertEqual(velox.chat_layout_for_rect(velox.Rect(0, 0, desktop_width, 900)).chats.w, 1104)
+        for width in (300, 760, 1200, 1920):
+            layout = velox.chat_layout_for_rect(velox.Rect(0, 0, width, 900))
+            self.assertGreaterEqual(layout.main.w, min(420, (width - velox.CHAT_COLUMN_GAP_PX + 1) // 2))
+            self.assertEqual(layout.main.x + layout.main.w, width)
+
+    def test_explicit_chat_width_is_preserved(self) -> None:
+        layout = velox.chat_layout_for_rect(velox.Rect(0, 0, 3000, 900), chat_list_width=640)
+        self.assertEqual(layout.chats.w, 640)
+        self.storage.write_app_state({"chat_list_width": 640})
+        self.assertEqual(self.storage.load_app_state()["chat_list_width"], 640)
+
+
+class Generation315CleanupTests(_StorageFixture):
+    def test_old_manifest_is_rejected_without_any_automatic_conversion(self) -> None:
+        path = self.paths.app_json_path
+        original = path.read_bytes(); payload = json.loads(original)
+        payload["data_version"] = "v311"; payload["schema"] = "velox_app.v311"
+        path.write_text(json.dumps(payload), encoding="utf-8"); before = path.read_bytes()
+        try:
+            storage = velox.Storage(self.paths)
+            with self.assertRaises(velox.UnsupportedDataVersionError): storage.ensure_first_run_files()
+            self.assertEqual(path.read_bytes(), before)
+        finally:
+            path.write_bytes(original)
+
+    def test_removed_account_has_no_ui_prompt_or_credential_api(self) -> None:
+        for cls, names in ((velox.CredentialStore, ("load_github", "save_github")),
+                           (velox.AppPaths, ("github_credentials_file",)),
+                           (velox.Panels, ("_github_settings_card_height",))):
+            for name in names: self.assertFalse(hasattr(cls, name))
+        for function in (velox.Panels._draw_accounts_settings_content,
+                         velox.ContextAssembler.assemble_chat_context, velox.AgentRuntime.build_standard_system_prompt):
+            self.assertNotIn("github", inspect.getsource(function).lower())
+
+    def test_only_active_connector_types_remain_in_current_schema(self) -> None:
+        self.assertEqual(velox.VAULT_SOURCE_TYPES, ("google_calendar", "google_drive", "gmail"))
+        self.assertEqual(velox.VAULT_SOURCE_TYPES, velox.VAULT_SOURCE_ORDER)
+        cfg = self.storage.load_config(); cfg["vault"]["removed_connector"] = {"enabled": True}
+        with self.assertRaises(velox.UnsupportedDataVersionError): self.storage.write_config(cfg)
+
+    def test_new_generation_requires_the_subagent_default_setting(self) -> None:
+        config = self.storage.load_config(); del config["llm"]["default_chat_subagent_profile_id"]
+        with self.assertRaises(velox.UnsupportedDataVersionError): self.storage.write_config(config)
+
+    def test_generic_credential_locking_and_remaining_accounts_still_work(self) -> None:
+        store = velox.CredentialStore(self.paths)
+        store.save_google_oauth_client("id", "secret")
+        store.save_google_drive_oauth_client("drive", "drive-secret")
+        store.save_gmail("reader@example.com", "app-password")
+        reread = velox.CredentialStore(self.paths)
+        self.assertEqual(reread.load_google_calendar()["client_id"], "id")
+        self.assertEqual(reread.load_google_drive()["client_id"], "drive")
+        self.assertEqual(reread.load_gmail()["email_address"], "reader@example.com")
 
 
 def main() -> None:
