@@ -15773,7 +15773,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertEqual(labels, {
             "Qwen 3.8 (vLLM)", "Qwen 3.8 Flash Next (vLLM)",
             "Qwen 3.8 Flash (Novita)", "Kimi K3 (Novita)", "GLM 5.3 Flash (Novita)",
-            "DSV4F Exp (vLLM)", "OpenAI ChatGPT 6 Luna", "OpenAI ChatGPT 6 Sol", "OpenAI ChatGPT 6 Astra",
+            "DSV4F Exp (vLLM)", "OpenAI ChatGPT 6 Luna", "OpenAI ChatGPT 6.1 Sol", "OpenAI ChatGPT 6 Astra",
         })
         for removed in (
             "GPT 5.2 (OpenAI)", "GPT 5.4 (OpenAI)", "Kimi K2.6 (vLLM)",
@@ -43405,7 +43405,7 @@ class CurrentEndpointPresetRegressionTests(_AsyncRuntimeFixture):
     """Real shipped defaults, separate from legacy/custom transport fixtures."""
     GPT6 = (
         (velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_LUNA, 'gpt-6-luna', 'xhigh'),
-        (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_SOL, 'gpt-6-sol', 'high'),
+        (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_SOL, 'gpt-6.1-sol', 'high'),
         (velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_ASTRA, 'gpt-6-astra', 'medium'),
     )
 
@@ -43429,7 +43429,7 @@ class CurrentEndpointPresetRegressionTests(_AsyncRuntimeFixture):
                 self.assertEqual(p['reasoning_effort'], effort)
                 self.assertEqual(p['api_transport'], velox.ENDPOINT_API_TRANSPORT_RESPONSES)
                 self.assertEqual(p['base_url'], 'https://api.openai.com/v1/responses')
-                self.assertEqual(p['label'], 'OpenAI ChatGPT 6 ' + model.rsplit('-', 1)[1].title())
+                self.assertEqual(p['label'], 'OpenAI ChatGPT ' + model.split('-')[1] + ' ' + model.rsplit('-', 1)[1].title())
                 self.assertEqual((p['context_window_tokens'], p['max_output_tokens']), (1050000, 128000))
                 self.assertEqual(velox.normalize_endpoint_profile(p), p)
 
@@ -44298,7 +44298,7 @@ class EndpointTokenPricingTests(_StorageFixture):
     def test_verified_default_usd_rates_for_requested_endpoints(self) -> None:
         for pid, values in (
             (velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID, (.10, .01, .50)),
-            (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, (2., .20, 10.)),
+            (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, (2., .10, 10.)),
             (velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID, (10., 1., 50.)),
             (velox.DEFAULT_KIMI_K3_ENDPOINT_PROFILE_ID, (3., .30, 15.)),
             (velox.DEFAULT_GLM_5_3_FLASH_NOVITA_ENDPOINT_PROFILE_ID, (.15, .03, .50)),
@@ -44335,9 +44335,9 @@ class EndpointTokenPricingTests(_StorageFixture):
         price = velox.endpoint_cost_pricing_snapshot(self.profile())
         cost = velox.estimate_token_cost(price, 100_000, 20_000, 80_000)
         self.assertAlmostEqual(cost['input_usd'], .04)
-        self.assertAlmostEqual(cost['cached_input_usd'], .016)
+        self.assertAlmostEqual(cost['cached_input_usd'], .008)
         self.assertAlmostEqual(cost['output_usd'], .20)
-        self.assertAlmostEqual(cost['total_usd'], .256)
+        self.assertAlmostEqual(cost['total_usd'], .248)
 
     def test_missing_or_invalid_cache_usage_is_conservatively_uncached(self) -> None:
         price = velox.endpoint_cost_pricing_snapshot(self.profile())
@@ -44354,14 +44354,14 @@ class EndpointTokenPricingTests(_StorageFixture):
         short = velox.estimate_token_cost(price, 272000, 1000, 200000)
         long = velox.estimate_token_cost(price, 272001, 1000, 200000)
         self.assertFalse(short['long_context']); self.assertTrue(long['long_context'])
-        self.assertAlmostEqual(long['total_usd'], (72001*4 + 200000*.4 + 1000*15)/1e6)
+        self.assertAlmostEqual(long['total_usd'], (72001*4 + 200000*.2 + 1000*15)/1e6)
 
     def test_explicit_cache_write_premium_and_service_tier(self) -> None:
         row = self.profile(); row['extra_body_json'] = '{"service_tier":"flex"}'
         price = velox.endpoint_cost_pricing_snapshot(row)
         cost = velox.estimate_token_cost(price, 100000, 10000, 20000, cache_write_tokens=60000)
         self.assertAlmostEqual(cost['cache_write_premium_usd'], .015)
-        self.assertAlmostEqual(cost['total_usd'], .08 + .002 + .05 + .015)
+        self.assertAlmostEqual(cost['total_usd'], .08 + .001 + .05 + .015)
         base = dict(price, service_tier='default')
         priority = dict(price, service_tier='priority')
         self.assertAlmostEqual(velox.estimate_token_cost(priority, 100, 20, 0)['total_usd'],
@@ -44427,35 +44427,35 @@ class TokenCostLedgerTests(_StorageFixture):
         self.monitor.set_inference_round_metrics(t, r, input_tokens=900000, output_tokens=50000, estimated=True)
         self.assertEqual(self.monitor.statistics()['costs_24h']['requests'], 1)
         cost = self.publish(t, r)
-        self.assertAlmostEqual(cost['total_usd'], .256)
+        self.assertAlmostEqual(cost['total_usd'], .248)
         self.publish(t, r)
         all_cost = self.monitor.statistics()['costs_24h']
         self.assertEqual(all_cost['requests'], 1)
-        self.assertAlmostEqual(all_cost['total_usd'], .256)
+        self.assertAlmostEqual(all_cost['total_usd'], .248)
         self.assertEqual(all_cost['estimated_requests'], 0)
 
     def test_rates_frozen_at_request_start_but_next_request_uses_new_rates(self) -> None:
         t, r = self.round()
         cfg = self.storage.load_config(); row = velox.endpoint_profile_ref(cfg, velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID)
         row.update(dict.fromkeys(velox.ENDPOINT_PRICE_FIELDS, 100.0)); self.storage.write_config(cfg)
-        self.assertAlmostEqual(self.publish(t, r)['total_usd'], .256)
+        self.assertAlmostEqual(self.publish(t, r)['total_usd'], .248)
         _t, r2 = self.round(tid=t)
-        self.assertAlmostEqual(self.publish(t, r2)['total_usd'], 12.256)
+        self.assertAlmostEqual(self.publish(t, r2)['total_usd'], 12.248)
 
     def test_parent_and_child_use_own_endpoint_without_double_count(self) -> None:
         parent, a = self.round(velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID)
         child, b = self.round(velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID)
         self.publish(parent, a); self.publish(child, b)
-        self.assertAlmostEqual(self.monitor.record_snapshot(parent)['token_cost']['total_usd'], .256)
+        self.assertAlmostEqual(self.monitor.record_snapshot(parent)['token_cost']['total_usd'], .248)
         self.assertAlmostEqual(self.monitor.record_snapshot(child)['token_cost']['total_usd'], .0128)
-        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], .2688)
+        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], .2608)
 
     def test_ledger_survives_task_deletion_and_monitor_restart(self) -> None:
         t, r = self.round(); self.publish(t, r); self.monitor.complete(t)
         self.assertTrue(self.monitor.delete_task(t))
-        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], .256)
+        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], .248)
         restarted = velox.LLMTaskMonitor(self.storage)
-        self.assertAlmostEqual(restarted.statistics()['costs_24h']['total_usd'], .256)
+        self.assertAlmostEqual(restarted.statistics()['costs_24h']['total_usd'], .248)
         self.assertEqual(restarted.statistics()['costs_24h']['requests'], 1)
 
     def test_rolling_window_uses_request_time_not_task_creation(self) -> None:
@@ -44467,8 +44467,8 @@ class TokenCostLedgerTests(_StorageFixture):
             self.publish(t, r2)
         summary = self.monitor.cost_ledger.summary(now=now)
         self.assertEqual(summary['requests'], 1)
-        self.assertAlmostEqual(summary['total_usd'], .256)
-        self.assertAlmostEqual(self.monitor.record_snapshot(t)['token_cost']['total_usd'], .512)
+        self.assertAlmostEqual(summary['total_usd'], .248)
+        self.assertAlmostEqual(self.monitor.record_snapshot(t)['token_cost']['total_usd'], .496)
 
     def test_top_five_group_profiles_by_endpoint_type_and_order_by_cost(self) -> None:
         ledger = self.monitor.cost_ledger; now = time.time()
@@ -44829,14 +44829,14 @@ class EndpointCostIntegrationTests(_StorageFixture):
                         self.assertEqual(result["text"], "A short answer.")
                     cost = self.monitor.record_snapshot(task)["token_cost"]
                     # 20k uncached + 80k cached + 20k output + explicit write premium.
-                    self.assertAlmostEqual(cost["total_usd"], .264)
+                    self.assertAlmostEqual(cost["total_usd"], .256)
                     self.assertAlmostEqual(cost["cache_write_premium_usd"], .008)
                     self.assertEqual(cost["requests"], 1)
                     self.assertEqual(cost["estimated_requests"], 0)
                     self.monitor.complete(task)
                 saved = velox.TokenCostLedger(self.paths.root_dir).summary()
                 self.assertEqual(saved["requests"], 2)
-                self.assertAlmostEqual(saved["total_usd"], .528)
+                self.assertAlmostEqual(saved["total_usd"], .512)
             finally:
                 await scheduler.close()
         asyncio.run(scenario())
@@ -45299,21 +45299,21 @@ class ChatTotalCostTests(_StorageFixture):
         self.charge(chat)
         self.charge(agent, endpoint=velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID)
         costs = self.breakdown(chat)
-        self.assertAlmostEqual(costs['chat']['total_usd'], .256)
+        self.assertAlmostEqual(costs['chat']['total_usd'], .248)
         self.assertAlmostEqual(costs['subagents']['total_usd'], .0128)
-        self.assertAlmostEqual(costs['total']['total_usd'], .2688)
-        self.assertEqual(self.panel_row(chat)['cost']['label'], '$0.27')
+        self.assertAlmostEqual(costs['total']['total_usd'], .2608)
+        self.assertEqual(self.panel_row(chat)['cost']['label'], '$0.26')
         self.assertEqual(self.panel_row(agent)['cost']['label'], '$0.01')
-        self.assertAlmostEqual(self.monitor.record_snapshot(chat)['token_cost']['total_usd'], .256)
+        self.assertAlmostEqual(self.monitor.record_snapshot(chat)['token_cost']['total_usd'], .248)
         self.assertEqual(self.monitor.record_snapshot(chat)['input_tokens'], 100000)
 
     def test_tooltip_has_requested_split_and_no_boilerplate(self) -> None:
         chat, child = self.task(), self.task('agent')
         self.charge(chat); self.charge(child)
         row = self.panel_row(chat)
-        self.assertIn('Chat $0.26 | Subagents $0.26', row['_tooltip'])
-        self.assertIn('Estimated token cost (USD): $0.51', row['_tooltip'])
-        self.assertIn('Input $0.08 | Cache read $0.03 | Output $0.40', row['_tooltip'])
+        self.assertIn('Chat $0.25 | Subagents $0.25', row['_tooltip'])
+        self.assertIn('Estimated token cost (USD): $0.50', row['_tooltip'])
+        self.assertIn('Input $0.08 | Cache read $0.02 | Output $0.40', row['_tooltip'])
         for phrase in ('own requests only', 'excludes child rows', 'Provider usage;',
                        'Frozen per-request', 'Excludes tool fees', 'Reported cache-write premium'):
             self.assertNotIn(phrase, row['_tooltip'])
@@ -45329,9 +45329,9 @@ class ChatTotalCostTests(_StorageFixture):
         for task in tasks: self.charge(task)
         costs = self.breakdown(chat)
         self.assertEqual(costs['subagents']['requests'], 6)
-        self.assertAlmostEqual(costs['total']['total_usd'], 7 * .256)
+        self.assertAlmostEqual(costs['total']['total_usd'], 7 * .248)
         self.assertEqual(self.monitor.statistics()['costs_24h']['requests'], 7)
-        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], 7 * .256)
+        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], 7 * .248)
         self.assertNotIn('chat_cost_breakdown', self.monitor.record_snapshot(tasks[1]))
 
     def test_other_chats_and_unowned_system_jobs_are_excluded(self) -> None:
@@ -45339,8 +45339,8 @@ class ChatTotalCostTests(_StorageFixture):
         child = self.task('agent', chat_id='another-chat')
         system = self.monitor.start(velox.APP_SCOPE_ID, 'Unowned job', task_kind='system')
         for task in (chat, other, child, system): self.charge(task)
-        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], .256)
-        self.assertAlmostEqual(self.breakdown(other)['total']['total_usd'], .512)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], .248)
+        self.assertAlmostEqual(self.breakdown(other)['total']['total_usd'], .496)
         self.assertEqual(self.breakdown(chat)['subagents']['requests'], 0)
 
     def test_costs_reconcile_streaming_final_and_repeated_final_without_duplication(self) -> None:
@@ -45352,7 +45352,7 @@ class ChatTotalCostTests(_StorageFixture):
         cost = self.breakdown(chat)['total']
         self.assertEqual(cost['estimated_requests'], 0)
         self.assertEqual(cost['requests'], 1)
-        self.assertAlmostEqual(cost['total_usd'], .256)
+        self.assertAlmostEqual(cost['total_usd'], .248)
         self.assertEqual(self.monitor.statistics()['costs_24h']['requests'], 1)
 
     def test_completed_failed_cancelled_and_running_children_all_keep_incurred_cost(self) -> None:
@@ -45360,7 +45360,7 @@ class ChatTotalCostTests(_StorageFixture):
         for state in ('completed', 'failed', 'cancelled', 'running'):
             child = self.task('agent'); self.charge(child)
             self.monitor.update(child, state=state)
-        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], 4 * .256)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], 4 * .248)
 
     def test_deleting_child_keeps_chat_cost_without_double_counting_ledger(self) -> None:
         chat, child = self.task(), self.task('agent')
@@ -45368,7 +45368,7 @@ class ChatTotalCostTests(_StorageFixture):
         before = self.breakdown(chat)
         self.assertTrue(self.monitor.delete_task(child)); self.assertFalse(self.monitor.delete_task(child))
         self.assertEqual(self.breakdown(chat), before)
-        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], .512)
+        self.assertAlmostEqual(self.monitor.statistics()['costs_24h']['total_usd'], .496)
         self.assertFalse(self.monitor.set_inference_round_metrics(child, 'late', input_tokens=999))
         self.assertEqual(self.breakdown(chat), before)
 
@@ -45378,8 +45378,8 @@ class ChatTotalCostTests(_StorageFixture):
         self.assertEqual(self.task(), chat)
         self.charge(chat)
         cost = self.breakdown(chat)
-        self.assertAlmostEqual(cost['chat']['total_usd'], .512)
-        self.assertAlmostEqual(cost['subagents']['total_usd'], .256)
+        self.assertAlmostEqual(cost['chat']['total_usd'], .496)
+        self.assertAlmostEqual(cost['subagents']['total_usd'], .248)
 
     def test_recreated_dashboard_chat_row_keeps_deleted_own_and_child_costs(self) -> None:
         chat, child = self.task(), self.task('agent')
@@ -45387,9 +45387,9 @@ class ChatTotalCostTests(_StorageFixture):
         self.monitor.complete(chat); self.monitor.complete(child)
         self.monitor.delete_task(child); self.monitor.delete_task(chat)
         reopened = self.task(); self.assertNotEqual(reopened, chat)
-        self.assertAlmostEqual(self.breakdown(reopened)['total']['total_usd'], .512)
+        self.assertAlmostEqual(self.breakdown(reopened)['total']['total_usd'], .496)
         self.charge(reopened)
-        self.assertAlmostEqual(self.breakdown(reopened)['total']['total_usd'], .768)
+        self.assertAlmostEqual(self.breakdown(reopened)['total']['total_usd'], .744)
 
     def test_unpriced_and_cache_unknown_children_are_not_presented_as_free(self) -> None:
         cfg = self.storage.load_config(); eid = velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID
@@ -45398,7 +45398,7 @@ class ChatTotalCostTests(_StorageFixture):
         chat, child = self.task(), self.task('agent')
         self.charge(chat); self.charge(child, endpoint=eid, cached=None)
         row = self.panel_row(chat)
-        self.assertEqual(row['cost']['label'], '$0.26 + ?')
+        self.assertEqual(row['cost']['label'], '$0.25 + ?')
         self.assertIn('Subagents Unpriced', row['_tooltip'])
         self.assertIn('1 unpriced', row['_tooltip'])
         self.assertIn('1 cache unknown', row['_tooltip'])
@@ -45418,15 +45418,15 @@ class ChatTotalCostTests(_StorageFixture):
         snapshot = self.breakdown(chat)
         snapshot['subagents']['total_usd'] = 9000
         self.monitor.dashboard_records(limit=1); self.monitor.list_records(limit=1)
-        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], 5 * .256)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], 5 * .248)
 
     def test_source_chat_id_fallback_and_unidentified_chat_are_safe(self) -> None:
         chat = self.task()
         child = self.monitor.start(velox.APP_SCOPE_ID, 'Worker', task_kind='agent', metadata={'source_chat_id': self.cid})
         orphan = self.monitor.start(velox.APP_SCOPE_ID, 'No owner', task_kind='chat')
         self.charge(child); self.charge(orphan)
-        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], .256)
-        self.assertAlmostEqual(self.breakdown(orphan)['chat']['total_usd'], .256)
+        self.assertAlmostEqual(self.breakdown(chat)['total']['total_usd'], .248)
+        self.assertAlmostEqual(self.breakdown(orphan)['chat']['total_usd'], .248)
         self.assertEqual(self.breakdown(orphan)['subagents'], {})
 
     def test_grouping_cache_is_reused_and_invalidates_on_child_changes(self) -> None:
@@ -45437,7 +45437,7 @@ class ChatTotalCostTests(_StorageFixture):
         self.assertIs(self.monitor._chat_cost_rollups, cache)
         self.charge(child); self.breakdown(chat)
         self.assertIsNot(self.monitor._chat_cost_rollups, cache)
-        self.assertAlmostEqual(self.breakdown(chat)['subagents']['total_usd'], .512)
+        self.assertAlmostEqual(self.breakdown(chat)['subagents']['total_usd'], .496)
 
     def test_nonzero_cache_write_component_remains_visible_without_notes(self) -> None:
         tip = velox.token_cost_tooltip({'total_usd': 1.25, 'cache_write_premium_usd': .25})

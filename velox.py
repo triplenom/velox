@@ -4298,7 +4298,7 @@ ENDPOINT_MODEL_TYPE_LABELS = {
     ENDPOINT_MODEL_TYPE_GPT_5_6_SOL: "GPT 5.6 Sol",
     ENDPOINT_MODEL_TYPE_GPT_5_6_LUNA: "GPT 5.6 Luna",
     ENDPOINT_MODEL_TYPE_GPT_6_LUNA: "GPT 6 Luna",
-    ENDPOINT_MODEL_TYPE_GPT_6_SOL: "GPT 6 Sol",
+    ENDPOINT_MODEL_TYPE_GPT_6_SOL: "GPT 6.1 Sol",
     ENDPOINT_MODEL_TYPE_GPT_6_ASTRA: "GPT 6 Astra",
     ENDPOINT_MODEL_TYPE_MUSE_GLIMMER: "Muse Glimmer",
 }
@@ -4317,7 +4317,7 @@ DEFAULT_DEEPSEEK_V4_FLASH_0731_NOVITA_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v
 DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID = "endpoint-gpt-5-6-sol-openai"
 DEFAULT_GPT_5_6_LUNA_ENDPOINT_PROFILE_ID = "endpoint-gpt-5-6-luna-openai"
 DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID = "endpoint-gpt-6-luna-openai"
-DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID = "endpoint-gpt-6-sol-openai"
+DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID = "endpoint-gpt-6.1-sol-openai"
 DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID = "endpoint-gpt-6-astra-openai"
 DEFAULT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID
 DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID
@@ -4346,7 +4346,7 @@ TOKEN_COST_SUM_FIELDS = (
 def endpoint_default_token_prices(model_type: str, provider: str) -> dict[str, float | None]:
     rates = {
         (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_LUNA): (0.10, 0.01, 0.50),
-        (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_SOL): (2.0, 0.20, 10.0),
+        (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_SOL): (2.0, 0.10, 10.0),
         (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_ASTRA): (10.0, 1.0, 50.0),
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_KIMI_K3): (3.0, 0.30, 15.0),
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH): (0.15, 0.03, 0.50),
@@ -5151,7 +5151,7 @@ def endpoint_model_type_defaults(model_type: Any) -> dict[str, Any]:
         common.update({
             "model": {
                 ENDPOINT_MODEL_TYPE_GPT_6_LUNA: "gpt-6-luna",
-                ENDPOINT_MODEL_TYPE_GPT_6_SOL: "gpt-6-sol",
+                ENDPOINT_MODEL_TYPE_GPT_6_SOL: "gpt-6.1-sol",
                 ENDPOINT_MODEL_TYPE_GPT_6_ASTRA: "gpt-6-astra",
             }[key],
             "api_transport": ENDPOINT_API_TRANSPORT_RESPONSES,
@@ -5467,7 +5467,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID,
-            "OpenAI ChatGPT 6 Sol",
+            "OpenAI ChatGPT 6.1 Sol",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.openai.com/v1/responses",
             model_type=ENDPOINT_MODEL_TYPE_GPT_6_SOL,
