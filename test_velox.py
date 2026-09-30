@@ -420,7 +420,7 @@ class TestFixtureInitializationTests(_WriterDataRootsIsolatedTestMixin, unittest
         cases = (
             EndpointRecoveryPolicyTests('test_retry_after_seconds_and_case_insensitive_headers'),
             EndpointRecoveryPolicyTests('test_transient_http_statuses'),
-            UnifiedReleaseVersionTests('test_current_and_compatibility_versions_are_316'),
+            UnifiedReleaseVersionTests('test_current_application_and_compatibility_versions'),
             UnifiedReleaseVersionTests('test_compatible_application_bump_does_not_change_data_format'),
         )
         result = unittest.TestResult()
@@ -44191,12 +44191,16 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 
 class UnifiedReleaseVersionTests(unittest.TestCase):
-    def test_current_and_compatibility_versions_are_316(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 316)
+    def test_current_application_and_compatibility_versions(self) -> None:
+        self.assertEqual(velox.CURRENT_VERSION, 317)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 316)
-        self.assertEqual(velox.APP_VERSION, 'velox.v316')
-        self.assertEqual(velox.SOURCE_REVISION, '316')
+        self.assertEqual(velox.APP_VERSION, 'velox.v317')
+        self.assertEqual(velox.SOURCE_REVISION, '317')
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V317]')
+        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/317')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v316')
+        header = Path(velox.__file__).read_text(encoding='utf-8').splitlines()[:3]
+        self.assertIn('# Every commit must bump CURRENT_VERSION (for example, 316 -> 317), no exceptions.', header)
 
     def test_all_exported_schema_constants_share_data_generation(self) -> None:
         schemas = {name: value for name, value in vars(velox).items()
@@ -44215,7 +44219,7 @@ class UnifiedReleaseVersionTests(unittest.TestCase):
         self.assertEqual(independent, [])
 
     def test_compatible_application_bump_does_not_change_data_format(self) -> None:
-        with mock.patch.object(velox, 'CURRENT_VERSION', 317):
+        with mock.patch.object(velox, 'CURRENT_VERSION', velox.CURRENT_VERSION + 1):
             self.assertEqual(velox.data_schema('chat'), 'chat.v316')
             self.assertEqual(velox.data_schema('web_visible_content'), 'web_visible_content.v316')
 

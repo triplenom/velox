@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Every commit must bump CURRENT_VERSION (for example, 316 -> 317), no exceptions.
 """Velox: turn a short prompt into a working project.
 
 Velox gives fast local and hosted models the tools and execution loop to take a
@@ -291,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 316
+CURRENT_VERSION = 317
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
