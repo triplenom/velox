@@ -9297,15 +9297,21 @@ def _plain_atomic_write_bytes(path: Path, data: bytes, *, retries: int = 30) -> 
                 pass
 
 
-def create_default_skills_for_new_install(root_dir: Path) -> None:
+def create_default_skills_for_new_install(
+    root_dir: Path, *, environment: dict[str, Any] | None = None,
+    chrome_path: str | None = None, node_path: str | None = None,
+) -> None:
     """Seed bundled Skills only when creating a new application data root.
 
     Ordinary startup leaves existing Skill files alone. The machine-generated
-    C/C++ Skill is refreshed separately from live toolchain discovery."""
+    C/C++ Skill is refreshed separately from live toolchain discovery. Explicit
+    discovery inputs support isolated fixtures; omitted inputs remain live."""
     skills_dir = Path(root_dir).expanduser().resolve() / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
-    web_programming_markdown = build_web_programming_skill_markdown()
-    cpp_programming_markdown = build_cpp_programming_skill_markdown()
+    web_programming_markdown = build_web_programming_skill_markdown(
+        chrome_path=chrome_path, node_path=node_path,
+    )
+    cpp_programming_markdown = build_cpp_programming_skill_markdown(environment=environment)
     for name, markdown in (
         (DEFAULT_WRITING_SKILL_NAME, DEFAULT_WRITING_SKILL_MARKDOWN),
         (DEFAULT_HIGH_EFFORT_SKILL_NAME, DEFAULT_HIGH_EFFORT_SKILL_MARKDOWN),
@@ -9449,6 +9455,9 @@ class DataRootRegistry:
         root_dir: Path,
         *,
         llm: dict[str, Any] | None = None,
+        environment: dict[str, Any] | None = None,
+        chrome_path: str | None = None,
+        node_path: str | None = None,
     ) -> DataRootContext:
         root = Path(root_dir).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -9464,7 +9473,9 @@ class DataRootRegistry:
                 manifest_path,
                 json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
             )
-            create_default_skills_for_new_install(root)
+            create_default_skills_for_new_install(
+                root, environment=environment, chrome_path=chrome_path, node_path=node_path,
+            )
             with self._registry_lock:
                 self._contexts[root] = ctx
                 self._locks.setdefault(root, threading.RLock())
@@ -13409,8 +13420,11 @@ class Storage:
         self._config_view_sig: tuple[int, int, int, int] | None = None
         self._config_view_checked_at: float = 0.0
 
-    def ensure_first_run_files(self, environment: dict[str, Any] | None = None) -> None:
-        """Create or validate the application data root and its local stores."""
+    def ensure_first_run_files(
+        self, environment: dict[str, Any] | None = None, *,
+        chrome_path: str | None = None, node_path: str | None = None,
+    ) -> None:
+        """Create or validate stores; omitted discovery inputs use the live host."""
         # This method sits beneath several read-only view helpers used by the
         # immediate-mode UI. Once initialization succeeds, avoid repeating
         # path resolution and DATA_ROOTS registry locking on every frame.
@@ -13421,7 +13435,10 @@ class Storage:
         try:
             self.paths.root_dir.mkdir(parents=True, exist_ok=True)
             if not self.paths.app_json_path.exists():
-                DATA_ROOTS.write_manifest(self.paths.root_dir)
+                DATA_ROOTS.write_manifest(
+                    self.paths.root_dir, environment=environment,
+                    chrome_path=chrome_path, node_path=node_path,
+                )
                 self.data_root = DATA_ROOTS.register(self.paths.root_dir)
             else:
                 self.data_root = DATA_ROOTS.register(self.paths.root_dir)
