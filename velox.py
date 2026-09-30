@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 317
+CURRENT_VERSION = 318
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -1502,20 +1502,20 @@ PERSONALIZATION_USER_TEXT_MAX_CHARS = 200_000
 DEFAULT_PERSONALIZATION_USER_TEXT = ""
 DEFAULT_PERSONALIZATION_SKILL_MARKDOWN = r"""Use the optional user.txt profile when it materially helps this request.
 
-Read relevant profile details as context, with the current user message taking precedence. Apply known preferences naturally; keep unrelated or sensitive details out of the response. Treat absent information as unknown. Personalization guides this Chat, not permission to change the profile, contact people, or act on external accounts."""
+Read relevant profile details as context, with the current user message taking precedence. Apply known preferences naturally; keep unrelated or sensitive details out of the response. Treat absent information as unknown. Do not invent personal facts or assume the user's name, role, organization, location, relationships or preferences. Use only details supplied in the profile or current request. Personalization guides this Chat, not permission to change the profile, contact people, or act on external accounts."""
 
 DEFAULT_WRITING_SKILL_MARKDOWN = r"""Write clear, natural prose in the user's voice.
 
 Quality matters more than finishing quickly. You have extensive time and compute available; use them for careful checking and revision while keeping the final result focused on the user's needs.
 
-Lead with the answer, decision, or useful result. Prefer concrete verbs, specific evidence, and ordinary words. Match the requested tone and length. Use complete sentences and purposeful paragraphs; add headings, tables, or lists when they improve navigation. Use commas, parentheses, colons, or separate sentences instead of em dashes. State uncertainty precisely. Replace canned openings, repeated conclusions, inflated praise, and process narration with substance. Preserve meaning and factual limits when editing; quote only text actually supplied or verified."""
+Lead with the answer, decision, or useful result. Prefer concrete verbs, specific evidence, and ordinary words. Match the requested tone and length. Use complete sentences and purposeful paragraphs; add headings, tables, or lists when they improve navigation. Respect punctuation and style preferences explicitly provided for the task. State uncertainty precisely. Replace canned openings, repeated conclusions, inflated praise, and process narration with substance. Preserve meaning and factual limits when editing; quote only text actually supplied or verified."""
 
 DEFAULT_NEWS_SKILL_NAME = "News"
 DEFAULT_NEWS_SKILL_MARKDOWN = r"""Use this skill for current events, breaking news, and news briefings.
 
 When agents_start is available and the user has not prohibited delegation, call agents_start with agent_subtype="reader" to gather and verify the requested news before doing searches or fetching pages in the main Chat. Give it the place, topics, exact time window and source requirements; request a compact brief with source URLs and publication/event dates. A multi-source news briefing is reading-heavy even when each page is fetched separately. Keep synthesis and the final answer in the Chat. If agents_start is absent (including inside a reader), perform the research directly with the supplied tools; never start recursive workers.
 
-Establish the requested place, topic, and time window. Search current reporting; compare publication dates with event dates and use exact dates for ambiguous chronology. Use ordinary natural-language queries with Velox web_search. Prefer Reuters for prompt factual coverage, The Guardian for context, and CBC for Canadian coverage; select other reliable accessible reporting where it adds evidence. Use Bloomberg, CNN, or The New York Times when specifically requested or materially necessary rather than as default sources.
+Establish the requested place, topic, and time window. Search current reporting; compare publication dates with event dates and use exact dates for ambiguous chronology. Use ordinary natural-language queries with Velox web_search. Select trustworthy, accessible reporting relevant to the requested topics and region. Prefer primary statements and original reporting; include local or specialist sources when they add evidence. Follow source preferences explicitly supplied by the user rather than inferring a location or favorite outlet.
 
 Separate verified events, attributed claims, developing reports, and editorial interpretation. Cross-check consequential or contested claims against primary statements and independent reporting. Describe what changed and why it matters, cite sources beside claims, and identify unresolved facts. Keep the brief selective and avoid repeating the same story from multiple outlets."""
 

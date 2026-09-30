@@ -569,6 +569,87 @@ class TestFixtureInitializationTests(_WriterDataRootsIsolatedTestMixin, unittest
             self.assertNotEqual(environments[0], environments[1])
 
 
+class PublicSkillAndDocumentationTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
+    """Public defaults are generic and repository documentation matches executable contracts."""
+
+    def test_all_seeded_skills_are_generic_and_default_profile_is_empty(self) -> None:
+        with _TemporaryDataDirectory() as td:
+            storage = _make_test_storage(Path(td))
+            skills = velox.SkillStore(storage)
+            rows = skills.list_skills(refresh=True)
+            self.assertEqual(len(rows), 17)
+            forbidden = re.compile(r'\bCTO\b|chief\s+technology\s+officer|\bMike\b|\bSikora\b|\bNomcode\b', re.I)
+            for row in rows:
+                with self.subTest(skill=row['name']):
+                    loaded = skills.load_skill(row['name'])
+                    self.assertFalse(loaded['instructions_truncated'])
+                    self.assertIsNone(forbidden.search(loaded['instructions']))
+                    self.assertTrue(loaded['instructions'].strip())
+            profile = storage.paths.skills_dir() / velox.DEFAULT_PERSONALIZATION_SKILL_NAME / velox.PERSONALIZATION_USER_FILE_NAME
+            self.assertEqual(profile.read_text(encoding='utf-8'), '')
+            self.assertEqual(velox.DEFAULT_PERSONALIZATION_USER_TEXT, '')
+            personalization = skills.load_skill('Personalization')['instructions']
+            self.assertIn('Do not invent personal facts', personalization)
+            self.assertIn('current user message taking precedence', personalization)
+            news = skills.load_skill('News')['instructions']
+            for preference in ('Reuters', 'The Guardian', 'CBC', 'Canadian coverage', 'Bloomberg', 'CNN', 'The New York Times'):
+                self.assertNotIn(preference, news)
+            self.assertIn('preferences explicitly supplied by the user', news)
+            self.assertIn('primary statements and original reporting', news)
+            writing = skills.load_skill('Writing')['instructions']
+            self.assertNotIn('instead of em dashes', writing)
+            self.assertIn('preferences explicitly provided for the task', writing)
+
+    def test_existing_user_profile_and_custom_instructions_survive_restart(self) -> None:
+        with _TemporaryDataDirectory() as td:
+            paths, storage, chats = _make_test_chat_stack(Path(td))
+            skills = velox.SkillStore(storage)
+            profile = paths.skills_dir() / 'Personalization' / velox.PERSONALIZATION_USER_FILE_NAME
+            user_text = 'Preferences supplied by this user: concise answers and a chosen source list.\n'
+            profile.write_text(user_text, encoding='utf-8')
+            custom_text = 'Use profile details only when relevant to the current request.\n'
+            skills.save_skill_text('Personalization', custom_text)
+            restarted = _ensure_test_storage(velox.Storage(paths))
+            self.assertEqual(profile.read_text(encoding='utf-8'), user_text)
+            self.assertEqual(velox.SkillStore(restarted).read_skill_text('Personalization'), custom_text)
+            registry = velox.ToolRegistry(restarted)
+            block = registry.build_skill_system_block(velox.APP_SCOPE_ID)
+            self.assertIn(user_text.strip(), block)
+            self.assertIn(custom_text.strip(), block)
+            self.assertTrue(velox.APP_LOG_WRITER.flush(timeout=3.0))
+
+    def test_readme_matches_release_cli_skills_connectors_and_test_runner(self) -> None:
+        readme = _project_documentation('README.md')
+        self.assertIn(velox.APP_VERSION, readme)
+        self.assertIn(f'**{velox.DATA_FILE_VERSION} data files**', readme)
+        self.assertIn('Every commit must bump `CURRENT_VERSION`, no exceptions', readme)
+        self.assertIn('BACKWARD_COMPATIBLE_VERSION', readme)
+        self.assertNotIn('v303', readme)
+        self.assertNotIn('2,063', readme)
+        self.assertNotIn('Slack', readme)
+        for option in ('--init-only', '--no-ui', '--help', '--test', '--test-class'):
+            self.assertIn(option, readme)
+        for _key, label in velox.CHAT_TOOL_CATEGORY_LABELS:
+            self.assertIn(label, readme)
+        for skill in velox.DEFAULT_ALWAYS_SKILL_NAMES:
+            self.assertIn(skill, readme)
+        for connector in ('Google Calendar', 'Google Drive', 'Gmail'):
+            self.assertIn(connector, readme)
+        self.assertIn('read-only', readme)
+        self.assertIn('not background-synced or indexed', readme)
+        self.assertIn('empty profile', readme)
+        self.assertIn('does not overwrite existing custom skill/profile files', readme)
+        self.assertIn('1,800-second timeout', readme)
+        self.assertIn('GITHUB_ACTIONS=true', readme)
+        self.assertIn('python test_velox.py', readme)
+        self.assertIn('ClassName@start:end', readme)
+        self.assertIn('Pillow>=11,<13', readme)
+        workflow = (Path(__file__).parent / '.github' / 'workflows' / 'tests.yml').read_text(encoding='utf-8')
+        for platform in ('windows-latest', 'ubuntu-latest'):
+            self.assertIn(platform, readme)
+            self.assertIn(platform, workflow)
+
+
 class PlainAtomicWriteBytesTests(unittest.TestCase):
     """Regression coverage for the preservative atomic byte-write helper."""
 
@@ -44192,12 +44273,12 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 class UnifiedReleaseVersionTests(unittest.TestCase):
     def test_current_application_and_compatibility_versions(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 317)
+        self.assertEqual(velox.CURRENT_VERSION, 318)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 316)
-        self.assertEqual(velox.APP_VERSION, 'velox.v317')
-        self.assertEqual(velox.SOURCE_REVISION, '317')
-        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V317]')
-        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/317')
+        self.assertEqual(velox.APP_VERSION, 'velox.v318')
+        self.assertEqual(velox.SOURCE_REVISION, '318')
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V318]')
+        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/318')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v316')
         header = Path(velox.__file__).read_text(encoding='utf-8').splitlines()[:3]
         self.assertIn('# Every commit must bump CURRENT_VERSION (for example, 316 -> 317), no exceptions.', header)
