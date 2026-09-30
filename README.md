@@ -1,18 +1,35 @@
 # Velox
 
-**A local desktop application for AI-assisted projects and ongoing work.**
+**A local-first agentic execution harness for long-running AI work.**
 
-Velox combines chat, background agents, persistent checklists, independent review and native tools. Use it for programming, research, writing, local files, or scheduled tasks. The dashboard exposes live work, outcomes, token usage and costs; conversations, requests and tool results remain inspectable.
+Velox is a desktop AI workbench for turning model calls into durable, inspectable workflows. It combines interactive chat, delegated background agents, persistent task contracts, independent verification, native tools and endpoint scheduling behind a single local interface.
+
+It is designed for work that goes beyond a one-shot prompt: programming, research, document workflows, local-file operations, scheduled tasks and other multi-step jobs where an agent needs to plan, use tools, survive long runs, preserve state and prove that the requested work was actually completed.
+
+The runtime is model-agnostic across configured local and hosted endpoints. Conversations can use separate primary and subagent models, while the orchestration layer manages concurrency, context, tool execution, checkpoints, recovery and review. The dashboard exposes active work, agent requests, transcripts, tool results, token usage and cost so the system remains observable rather than opaque.
 
 Current release: **velox.v318**. Compatible data format: **v316**.
 
-## What it does
+## Core capabilities
 
-- **Chat and agents.** Configure local or hosted model endpoints, then delegate bounded work to background agents. Chats have separate main and subagent endpoint choices. Reader, planner, implementer and Reviewer roles have different scopes and tool access.
-- **Checklists and review.** A task has one active checklist with fixed requirements and optional one-level implementation steps. Progress and factual comments persist. Marking work done does not verify it: a separate Reviewer checks the complete contract, and failed requirements remain open for repair. Checklists can be disabled per chat.
-- **Native tools.** File/document operations, Python and shell commands, persistent terminals, web research, Chromium diagnostics/playback and image analysis are available according to the selected tool policy. Optional ComfyUI workflows and Meshy jobs support generated media and 3D assets.
-- **Long-running execution.** Endpoint concurrency, request limits, progress-aware timeouts, transient-error recovery and context fitting/compaction are configurable. Inference slots are released for tool work and other waits. Recorded tool results and durable checkpoints support replay without deliberately repeating completed side effects.
-- **Ongoing context.** Calendar Events and local Items, Context Docs, reusable Skills, scheduled tasks and an optional scheduled Personal Assistant support continuing work.
+- **Agentic orchestration.** Chats can delegate bounded work to background agents with distinct Reader, Planner, Implementer and Reviewer roles. Primary and subagent inference endpoints are configured independently, allowing different models to be used for reasoning, execution and verification.
+- **Durable task contracts and independent review.** Each task can maintain one active checklist with fixed acceptance requirements and optional one-level implementation steps. Progress and factual comments persist across execution. Completion is not self-certified: a separate Reviewer evaluates the full contract, and failed requirements remain open for repair.
+- **Native tool execution.** The tool registry exposes file/document operations, Python, shell commands, persistent terminals, web research, Chromium diagnostics/playback and image analysis under explicit tool policies. Optional ComfyUI workflows and Meshy jobs extend the same execution model to generated media and 3D assets.
+- **Long-running agent runtime.** Endpoint concurrency, request limits, progress-aware timeouts, transient-error recovery and context fitting/compaction are configurable. Inference slots are released while agents are waiting on tools or other external work. Recorded tool results and durable checkpoints support replay without intentionally repeating completed side effects.
+- **Context and skill injection.** Reusable Skills, Context Docs, Calendar Events, local Items and an optional user profile provide persistent context without hard-coding it into the application. Skill loading can be global, on-demand or disabled.
+- **Scheduled and ongoing work.** Local scheduled tasks and the optional Personal Assistant use the same agent/runtime machinery as interactive work, so recurring workflows share the same tools, model configuration, persistence and inspection surfaces.
+- **Observability and operator control.** The dashboard surfaces live runs, checklist state, agent requests, transcripts, tool output, token consumption and cost. Pause and Stop are first-class runtime controls rather than UI-only state.
+
+## Design principles
+
+Velox is intentionally closer to an **agentic harness and orchestration runtime** than a chat wrapper.
+
+- **Models are replaceable; execution state is durable.** The application treats configured inference endpoints as interchangeable components while preserving task state, tool results and acceptance criteria locally.
+- **Agents operate against explicit contracts.** Checklists define what success means before execution is declared complete, and independent review separates implementation from verification.
+- **Tool use is a runtime concern.** Files, processes, browsers, connectors and generated-media systems are dispatched through a common registry with ownership and policy checks.
+- **Long-running work must be recoverable.** Context management, checkpoints, transient-error recovery, cancellation semantics and resumable state are built into the execution path.
+- **Operator visibility matters.** Requests, outputs, tool activity, token usage and cost remain inspectable so autonomous work can be supervised and audited.
+- **Local-first does not mean local-only.** Application state is local, while inference and connected data sources can be local or remote depending on configuration.
 
 ## Run it
 
@@ -60,7 +77,7 @@ Create a chat, choose its main/subagent endpoints, and **enable the tools** it n
 
 > Build a local tool for exploring CSV files. Let me import a file, inspect its columns, filter rows and export the result. Pick a suitable stack, add tests and run them. Work only in the workspace I specify.
 
-Follow progress on the dashboard and open a task to inspect its checklist, requests, transcript or tool output. **Pause** holds execution at safe boundaries and preserves unfinished work. **Stop** cancels the active chat run, its active checklist and chat-owned child work; cancelled checklist work requires an explicit user-authorized resume. Ordinary application shutdown preserves resumable work rather than treating it as a user Stop.
+Follow progress on the dashboard and open a task to inspect its checklist, agent requests, transcript or tool output. **Pause** holds execution at safe boundaries and preserves unfinished work. **Stop** cancels the active chat run, its active checklist and chat-owned child work; cancelled checklist work requires an explicit user-authorized resume. Ordinary application shutdown preserves resumable work rather than treating it as a user Stop.
 
 Tools run with your account's permissions, **not in an operating-system sandbox**. Prompted scopes and ownership checks do not restrict general filesystem access. Read [SECURITY.md](SECURITY.md) before using important files or private accounts. Endpoint configuration, account credential files and debug exports deserve protection.
 
@@ -68,7 +85,7 @@ Tools run with your account's permissions, **not in an operating-system sandbox*
 
 A new data root seeds **17 skills** in `skills/<Skill name>/skill.md`. Manage them in Settings or edit their files:
 
-- **Always:** loaded into new Chat/Agent contexts.
+- **Always:** injected into new Chat/Agent contexts.
 - **Optional:** catalogued for on-demand `skills_load`.
 - **Disable:** neither catalogued nor loadable.
 
@@ -80,7 +97,9 @@ Ordinary startup does not overwrite existing custom skill/profile files. The mac
 
 Skill modes and instruction changes apply to new contexts. Established chats retain their frozen prompt snapshots; optional skill loads remain chronological additions.
 
-## Calendar, Vault and scheduled work
+## Connected context, Vault and scheduled work
+
+Velox can bring external context into the same agentic runtime while keeping connector behavior explicit:
 
 - **Google Calendar:** optional read-only OAuth connection with calendar selection and incremental sync. Events appear in Calendar; local Items can be scheduled or linked without modifying the external event.
 - **Gmail:** optional read-only IMAP connection configured with an email address/app password. Cached mail is available through Vault and search.
@@ -92,21 +111,32 @@ Google OAuth setup and account controls are in Settings. Google connection flows
 
 Read-only connector access **does not guarantee local-only data**: selected account context, attachments and tool output can be sent to your configured model endpoint. A self-hosted endpoint may also be on another machine.
 
-## How it works
+## Runtime architecture
 
 ```mermaid
 flowchart LR
     UI[Dashboard and chat] --> R[Chat and agent runtimes]
-    R --> C[Checklist and independent review]
-    R --> S[Endpoint scheduler]
-    S --> M[Local or hosted model]
+    R --> C[Task contracts and independent review]
+    R --> S[Inference scheduler]
+    S --> M[Local or hosted model endpoints]
     M --> R
     R --> T[Tool registry]
     T --> W[Files, processes, web and connectors]
-    R --> D[Local conversation and task data]
+    R --> D[Durable local conversation and task state]
 ```
 
-The application is in [velox.py](velox.py), with the regression suite and isolated-process runner in [test_velox.py](test_velox.py). `ChatRuntime` and `AgentRuntime` own execution; `LLMClient` handles transports/context policy; `EndpointInferenceScheduler` controls provider admission; `ToolRegistry` validates and dispatches native tools. `ChecklistStore` and `_tool_verify_checklist` implement durable acceptance/review. `Panels`, `Widgets` and `Renderer` provide the interface.
+The application is in [velox.py](velox.py), with the regression suite and isolated-process runner in [test_velox.py](test_velox.py).
+
+The runtime is intentionally separated into a small set of explicit control surfaces:
+
+- `ChatRuntime` and `AgentRuntime` own interactive and delegated execution.
+- `LLMClient` abstracts transport, endpoint behavior and context policy.
+- `EndpointInferenceScheduler` provides admission control and concurrency management across model requests.
+- `ToolRegistry` validates and dispatches native tools.
+- `ChecklistStore` and `_tool_verify_checklist` implement persistent acceptance criteria and independent verification.
+- `Panels`, `Widgets` and `Renderer` provide the desktop interface.
+
+This split keeps model inference, orchestration, tool execution, durable state and UI concerns independently testable rather than collapsing them into a single chat loop.
 
 ## Tests
 
