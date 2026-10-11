@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 318
+CURRENT_VERSION = 319
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -30540,6 +30540,7 @@ TOOL_POSITIONAL_SIGNATURES: dict[str, tuple[ToolArgumentSpec, ...]] = {
     "agents_list": (),
     "agents_get_result": (ToolArgumentSpec("agent_id", "text"), ToolArgumentSpec("offset", "number"), ToolArgumentSpec("max_chars", "number")),
     "agents_get_output": (ToolArgumentSpec("agent_id", "text"), ToolArgumentSpec("include_thinking", "boolean"), ToolArgumentSpec("include_tool_calls", "boolean"), ToolArgumentSpec("offset", "number"), ToolArgumentSpec("max_chars", "number")),
+    "agents_steer": (ToolArgumentSpec("agent_id", "text"), ToolArgumentSpec("message", "text")),
     "agents_pause": (ToolArgumentSpec("agent_id", "text"),),
     "agents_resume": (ToolArgumentSpec("agent_id", "text"),),
     "agents_stop": (ToolArgumentSpec("agent_id", "text"),),
@@ -40242,6 +40243,9 @@ class ToolRegistry:
                           "include_thinking": {"type": "boolean", "default": False},
                           "include_tool_calls": {"type": "boolean", "default": False}}, ["agent_id"]), self.tool_agents_get_output)
         agent_control = self._schema({"agent_id": {"type": "string", "minLength": 1}}, ["agent_id"])
+        self.register("agents_steer", "Inject guidance into an active agent by Dashboard numeric ID or UUID. Delivered before its next tool call, or with the running tool result. Does not cancel or restart it.",
+                      self._schema({"agent_id": {"type": "string", "minLength": 1},
+                                    "message": {"type": "string", "minLength": 1}}, ["agent_id", "message"]), self.tool_agents_steer)
         self.register("agents_pause", "Pause one current-chat agent", agent_control, self.tool_agents_pause)
         self.register("agents_resume", "Resume one current-chat agent", agent_control, self.tool_agents_resume)
         self.register("agents_stop", "Stop one current-chat agent", agent_control, self.tool_agents_stop)
@@ -42083,6 +42087,7 @@ class ToolRegistry:
                 progress_label += f" - {progress}"
             row = {
                 "agent_id": agent_id,
+                "dashboard_id": agent["task_run_id"],
                 "title": title,
                 "status": status,
                 "progress": progress_label,
@@ -42090,7 +42095,7 @@ class ToolRegistry:
                 "updated_at": str(agent.get("updated_at") or ""),
             }
             rows.append(row)
-            lines.append(f"{agent_id} | {status} | {progress_label} | {title}")
+            lines.append(f"{agent['task_run_id']} | {agent_id} | {status} | {progress_label} | {title}")
         return {
             "schema": data_schema('agents_for_chat'),
             "chat_id": chat_id,
@@ -42176,6 +42181,23 @@ class ToolRegistry:
 
     async def tool_agents_get_output(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(self._agent_read_page, ctx, args, transcript=True)
+
+    async def tool_agents_steer(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        if self.agent_runtime is None:
+            raise RuntimeError("background agent service is not initialized")
+        if not ctx.chat_id:
+            raise PermissionError("Agent steering requires an owning Chat or Agent context")
+        target = self.agent_runtime.resolve_steering_agent(args.get("agent_id"))
+        if target["source_chat_id"] != str(ctx.chat_id):
+            raise PermissionError("The requested Agent belongs to another Chat")
+        if ctx.agent_id:
+            caller = self.agent_runtime.agents.load_agent(ctx.agent_id)
+            if (_is_reviewer_agent(caller) or caller["source_chat_id"] != str(ctx.chat_id)
+                    or caller["status"] in AGENT_TERMINAL_STATUSES
+                    or (ctx.agent_task_run_id is not None and ctx.agent_task_run_id != caller["task_run_id"])):
+                raise PermissionError("This Agent run may not steer other agents")
+        return self.agent_runtime.steer(target["agent_id"], args.get("message"),
+                                        source_agent_id=str(ctx.agent_id or ""))
 
     async def tool_agents_pause(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
         runtime, agent = self._require_chat_agent_control(ctx, args)
@@ -43113,6 +43135,22 @@ class AgentLLMTimeoutPauseError(RuntimeError):
         super().__init__(str(message or "LLM requests timed out repeatedly"))
 
 
+def steering_message_content(text: str) -> str:
+    return ("NEW USER STEERING MESSAGE — adjust to the new guidance before taking further action.\n"
+            "Previously proposed, unstarted tool calls are stale; reconsider them.\n\n" + text)
+
+
+def steering_skipped_tool_result(name: str) -> dict[str, Any]:
+    return {"ok": True, "tool_name": name, "status": "steered", "executed": False,
+            "result": {"message": "Not executed: new steering guidance invalidated this proposed call. Reconsider before calling tools."}}
+
+
+def attach_steering_to_tool_result(result: dict[str, Any], guidance: list[dict[str, Any]]) -> None:
+    if guidance:
+        result["steering_messages"] = copy.deepcopy(guidance)
+        result["steering_instructions"] = "New user steering message: adjust to this guidance before any further action."
+
+
 class AgentRuntime:
     """Execute durable, timeout-bounded Agent Tasks alongside Chat inference."""
 
@@ -43551,7 +43589,7 @@ class AgentRuntime:
                 normalized["tool_call_id"] = tool_call_id
                 if str(message.get("name") or "").strip():
                     normalized["name"] = str(message.get("name") or "").strip()
-            for marker in ("_velox_synthetic_context", "_velox_substantive_user", "_velox_image_budget_compaction", "_velox_vision_source_ids", "_velox_agent_report_id"):
+            for marker in ("_velox_synthetic_context", "_velox_substantive_user", "_velox_image_budget_compaction", "_velox_vision_source_ids", "_velox_agent_report_id", "_velox_steering_ids"):
                 if marker in message:
                     normalized[marker] = message[marker]
             safe_tail.append(normalized)
@@ -43672,6 +43710,65 @@ class AgentRuntime:
     def is_running(self, agent_id: str | None) -> bool:
         task = self.running.get(str(agent_id or ""))
         return bool(task and not task.done())
+
+    def resolve_steering_agent(self, identity: Any) -> dict[str, Any]:
+        value = str(identity or "").strip()
+        if value.isascii() and value.isdecimal() and int(value) > 0:
+            matches = [row for row in self.agents.list_agents() if row.get("task_run_id") == int(value)]
+            if len(matches) != 1:
+                raise ValueError("Dashboard ID does not identify an Agent")
+            return matches[0]
+        if not is_uuid_v4(value):
+            raise ValueError("agent_id must be a Dashboard numeric ID or Agent UUID")
+        return self.agents.load_agent(value)
+
+    def steer(self, identity: Any, message: Any, *, source_agent_id: str = "") -> dict[str, Any]:
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("steering message must be non-empty text")
+        agent = self.resolve_steering_agent(identity)
+        agent_id = agent["agent_id"]
+        with DATA_ROOTS.lock_for_path(self.storage.paths.agent_dir(agent_id)):
+            agent = self.agents.load_agent(agent_id)
+            if agent["status"] in AGENT_TERMINAL_STATUSES:
+                raise ValueError("Cannot steer an agent that has finished")
+            if _is_reviewer_agent(agent):
+                raise PermissionError("Independent Reviewers cannot be steered")
+            steering_id = uuid_v4()
+            self.agents.append_event(agent_id, "steering", {
+                "steering_id": steering_id, "task_run_id": agent["task_run_id"],
+                "message": message.strip(), "source_agent_id": source_agent_id,
+            })
+        self.__dict__.setdefault("_child_report_events", {}).setdefault(agent_id, asyncio.Event()).set()
+        return {"agent_id": agent_id, "task_run_id": agent["task_run_id"],
+                "steering_id": steering_id, "status": agent["status"], "queued": True}
+
+    def _take_agent_steering(self, agent_id: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        events = self.agents.load_transcript(agent_id)
+        consumed = {identity for event in events if event.get("kind") == "conversation_message"
+                    for identity in (event.get("data") or {}).get("_velox_steering_ids", [])}
+        consumed.update(identity for row in messages for identity in row.get("_velox_steering_ids", []))
+        run_id = self.agents.load_agent(agent_id)["task_run_id"]
+        return [{"id": data["steering_id"], "content": steering_message_content(data["message"])}
+                for event in events if event.get("kind") == "steering"
+                for data in [event.get("data") or {}]
+                if data.get("task_run_id") == run_id and data.get("steering_id") not in consumed]
+
+    def _checkpoint_steering_tool_result(self, agent_id: str, pending: dict[str, Any], result: dict[str, Any]) -> None:
+        result.setdefault("tool_call_id", str(pending.get("execution_id") or uuid_v4()))
+        if not result.get("steering_messages") and result.get("status") != "steered":
+            return
+        record = copy.deepcopy(self.agents.load_agent(agent_id).get("pending_tool_call") or {})
+        slots = record.get("calls", []) if record.get("parallel_image_batch") else [record]
+        slot = next((row for row in slots if row.get("execution_id") == pending.get("execution_id")), None)
+        if slot is None:
+            raise RuntimeError("Agent pending steering call changed before result commit")
+        slot["execution_result"] = self._json_safe(result)
+        self.agents.update_agent(agent_id, {"pending_tool_call": record})
+
+    def _append_agent_steering(self, agent_id: str, messages: list[dict[str, Any]], guidance: list[dict[str, Any]]) -> None:
+        for row in guidance:
+            self._append_native_conversation_message(agent_id, messages,
+                {"role": "user", "content": row["content"], "_velox_steering_ids": [row["id"]]})
 
     def cancel(self, agent_id: str) -> bool:
         agent_id = str(agent_id or "").strip()
@@ -44956,7 +45053,7 @@ class AgentRuntime:
                             restored["tool_call_id"] = str(item.get("tool_call_id") or "")
                             if str(item.get("name") or "").strip():
                                 restored["name"] = str(item.get("name") or "").strip()
-                        for marker in ("_velox_synthetic_context", "_velox_substantive_user", "_velox_image_budget_compaction", "_velox_vision_source_ids", "_velox_agent_report_id"):
+                        for marker in ("_velox_synthetic_context", "_velox_substantive_user", "_velox_image_budget_compaction", "_velox_vision_source_ids", "_velox_agent_report_id", "_velox_steering_ids"):
                             if marker in item:
                                 restored[marker] = copy.deepcopy(item[marker])
                         messages.append(restored)
@@ -45048,6 +45145,10 @@ class AgentRuntime:
         try:
             while True:
                 wake.clear()  # Clear before the snapshot so concurrent delivery cannot be lost.
+                guidance = self._take_agent_steering(agent_id, messages)
+                if guidance:
+                    self._append_agent_steering(agent_id, messages, guidance)
+                    return True
                 children = await asyncio.to_thread(self.agents.list_agents, parent["source_chat_id"])
                 active = [c for c in children if c.get("parent_agent_id") == agent_id
                           and c.get("parent_task_run_id") == parent["task_run_id"]
@@ -45366,11 +45467,18 @@ class AgentRuntime:
         agent = self.agents.load_agent(agent_id)
         native_tools = self._native_tools_for_agent(agent)
         await self._maybe_compact_agent_context(agent_id, messages, native_tools=native_tools)
+        guidance = self._take_agent_steering(agent_id, messages)
+        interrupted = self.__dict__.setdefault("_steering_interrupted_batches", set())
+        if guidance:
+            interrupted.add(agent_id)
         monitor_task_id = self._monitor_task_ids.get(agent_id)
         if self.monitor and monitor_task_id:
             self.monitor.set_phase(monitor_task_id, "tool")
 
         async def execute_one(pending: dict[str, Any]) -> dict[str, Any]:
+            if (agent_id in interrupted and not pending.get("execution_started")
+                    and not isinstance(pending.get("execution_result"), dict)):
+                return steering_skipped_tool_result(str(pending.get("normalized_name") or ""))
             normalization_error = str(pending.get("normalization_error") or "")
             if normalization_error:
                 timestamp = now_iso()
@@ -45418,6 +45526,10 @@ class AgentRuntime:
             if self.monitor and monitor_task_id:
                 self.monitor.set_phase(monitor_task_id, "ready")
 
+        guidance.extend(self._take_agent_steering(agent_id, messages) if not guidance else [])
+        if guidance:
+            interrupted.add(agent_id)
+            attach_steering_to_tool_result(results[0], guidance)
         current = self.agents.load_agent(agent_id)
         failure_count = int(current.get("tool_failure_count") or 0)
         malformed_streak = int(current.get("malformed_tool_call_streak") or 0)
@@ -45433,9 +45545,10 @@ class AgentRuntime:
             if failed:
                 failure_count += 1
             malformed_streak = malformed_streak + 1 if normalization_error else 0
-            tool_call_count += 1
+            tool_call_count += int(result.get("executed") is not False)
             result["tool_failure_count"] = failure_count
             result["malformed_tool_call_streak"] = malformed_streak
+            self._checkpoint_steering_tool_result(agent_id, pending, result)
             _record_agent_tool_result(self, agent_id, {
                 "iteration": int(pending.get("iteration") or 0),
                 "tool_name": result.get("tool_name") or normalized_name,
@@ -45445,11 +45558,9 @@ class AgentRuntime:
             self._append_native_conversation_message(
                 agent_id,
                 messages,
-                openai_tool_result_message(
-                    native_tool_call,
-                    self._tool_result_message(result),
-                    name=normalized_name,
-                ),
+                {**openai_tool_result_message(
+                    native_tool_call, self._tool_result_message(result), name=normalized_name),
+                 "_velox_steering_ids": [row["id"] for row in result.get("steering_messages", [])]},
             )
             # Keep the complete durable batch (including each execution_result)
             # until its ordered results and image handoff have both committed.
@@ -45520,12 +45631,19 @@ class AgentRuntime:
             agent_id, messages, native_tools=native_tools,
         )
         agent = self.agents.load_agent(agent_id)
+        guidance = self._take_agent_steering(agent_id, messages)
+        interrupted = self.__dict__.setdefault("_steering_interrupted_batches", set())
+        if guidance:
+            interrupted.add(agent_id)
         normalization_error = str(pending.get("normalization_error") or "")
         native_tool_call = pending.get("provider_tool_call") if isinstance(pending.get("provider_tool_call"), dict) else {}
         normalized_name = str(pending.get("normalized_name") or "malformed_tool_call")
         tool_call = pending.get("tool_call") if isinstance(pending.get("tool_call"), dict) else {}
         iteration = int(pending.get("iteration") or 0)
-        if normalization_error:
+        if agent_id in interrupted and not pending.get("execution_started") and not isinstance(pending.get("execution_result"), dict):
+            normalization_error = ""
+            result = steering_skipped_tool_result(normalized_name)
+        elif normalization_error:
             timestamp = now_iso()
             result = {
                 "ok": False,
@@ -45575,6 +45693,10 @@ class AgentRuntime:
             finally:
                 if self.monitor and monitor_task_id:
                     self.monitor.set_phase(monitor_task_id, "ready")
+        guidance.extend(self._take_agent_steering(agent_id, messages) if not guidance else [])
+        if guidance:
+            interrupted.add(agent_id)
+        attach_steering_to_tool_result(result, guidance)
         result["raw_tool_call"] = str(pending.get("raw_tool_call") or result.get("raw_tool_call") or "")
         result["provider_tool_call_id"] = str(pending.get("provider_tool_call_id") or native_tool_call.get("id") or "")
         result["provider_tool_call"] = copy.deepcopy(native_tool_call)
@@ -45587,6 +45709,7 @@ class AgentRuntime:
         )
         result["tool_failure_count"] = failure_count
         result["malformed_tool_call_streak"] = malformed_streak
+        self._checkpoint_steering_tool_result(agent_id, pending, result)
         _record_agent_tool_result(self, agent_id, {
             "iteration": iteration,
             "tool_name": result.get("tool_name") or normalized_name,
@@ -45594,10 +45717,9 @@ class AgentRuntime:
         })
         self._append_native_conversation_message(
             agent_id, messages,
-            openai_tool_result_message(
-                native_tool_call, self._tool_result_message(result),
-                name=normalized_name,
-            ),
+            {**openai_tool_result_message(
+                native_tool_call, self._tool_result_message(result), name=normalized_name),
+             "_velox_steering_ids": [row["id"] for row in result.get("steering_messages", [])]},
         )
         image_handoffs = current_context_vision_handoffs_from_tool_results([result])
         if image_handoffs:
@@ -45618,7 +45740,7 @@ class AgentRuntime:
                 },
             )
         self.agents.update_agent(agent_id, {
-            "tool_call_count": int(current.get("tool_call_count") or 0) + 1,
+            "tool_call_count": int(current.get("tool_call_count") or 0) + (result.get("executed") is not False),
             # Keep the last agent-authored percent/message visible. The complete
             # recent tool call remains in the transcript and statistics instead
             # of displacing the more useful completion estimate.
@@ -45771,6 +45893,8 @@ class AgentRuntime:
                 # Check before every inference, not only before a recognized tool
                 # executes. Native-format mistakes and long prose-only turns must
                 # not bypass context compaction indefinitely.
+                self._append_agent_steering(agent_id, messages, self._take_agent_steering(agent_id, messages))
+                self.__dict__.setdefault("_steering_interrupted_batches", set()).discard(agent_id)
                 await self._maybe_compact_agent_context(agent_id, messages)
                 self._enforce_original_agent_prefix(agent_id, messages)
                 response = await self._request_agent_completion(
@@ -45893,6 +46017,14 @@ class AgentRuntime:
                         text, response_output_items=response_output_items, reasoning_fields=response.get("reasoning_fields"),
                     ))
 
+                if not tool_calls:
+                    guidance = self._take_agent_steering(agent_id, messages)
+                    if guidance:
+                        self._append_agent_steering(agent_id, messages, guidance)
+                        iteration += 1
+                        agent = self.agents.load_agent(agent_id)
+                        continue
+
                 visible_output = strip_agent_control_markup(
                     tool_visible if tool_calls else text, self.tools,
                 )
@@ -45984,6 +46116,12 @@ class AgentRuntime:
                             self.monitor.fail(request_id, diagnostic)
                         return
 
+                    guidance = self._take_agent_steering(agent_id, messages)
+                    if guidance:
+                        self._append_agent_steering(agent_id, messages, guidance)
+                        iteration += 1
+                        agent = self.agents.load_agent(agent_id)
+                        continue
                     terminal_message = str(terminal.get("message") or "").strip()
                     candidate_output = str(visible_output or "").strip()
                     if terminal.get("kind") == "succeeded":
@@ -46078,7 +46216,7 @@ class AgentRuntime:
 
                     current = self.agents.load_agent(agent_id)
                     used = int(current.get("tool_call_count") or 0)
-                    if skipped_for_budget or used >= agent_tool_call_limit:
+                    if (skipped_for_budget and agent_id not in self.__dict__.setdefault("_steering_interrupted_batches", set())) or used >= agent_tool_call_limit:
                         self._append_conversation_message(
                             agent_id,
                             messages,
@@ -48598,6 +48736,7 @@ class ChatRuntime:
         # regeneration, compaction, and Checklist continuation reuses that exact profile.
         key = chat_id
         if key in self.running and not self.running[key].done():
+            self.steer_from_ui(scope_id, chat_id, text, attachments=attachments)
             return
         self._check_user_stop_commit(chat_id)
         endpoint_profile_id = self._chat_endpoint_profile_id(chat_id, endpoint_profile_id)
@@ -48635,6 +48774,47 @@ class ChatRuntime:
         )
         self.running[key] = task
         task.add_done_callback(lambda done, cid=key: self._chat_task_done(cid, done))
+
+    def steer_from_ui(self, scope_id: str, chat_id: str, text: str, *, attachments: Optional[list[dict[str, Any]]] = None) -> None:
+        if not self.is_running(chat_id):
+            raise ValueError("Chat is no longer running; send a normal message instead")
+        self._check_user_stop_commit(chat_id)
+        cancel_event = self._chat_cancel_event(chat_id, create=False)
+        if cancel_event is not None and cancel_event.is_set():
+            raise ValueError("Chat is stopping; wait before sending another message")
+        if not str(text or "").strip() and not attachments:
+            raise ValueError("Steering requires a message or attachment")
+        endpoint_id = self._chat_endpoint_profile_id(chat_id)
+        turn = make_turn(chat_id, "user", text, attachments=attachments or [],
+                         endpoint_profile_id=endpoint_id, endpoint_label=self._endpoint_label(endpoint_id))
+        turn["steering"] = True
+        self.chats.append_turn(scope_id, chat_id, turn)
+        self.__dict__.setdefault("_chat_child_report_events", {}).setdefault(chat_id, asyncio.Event()).set()
+
+    def _chat_steering_pending(self, chat_id: str) -> bool:
+        return any(turn.get("steering") and not turn.get("steering_delivered_at")
+                   for turn in self.chats.load_turns(APP_SCOPE_ID, chat_id))
+
+    def _take_chat_steering(self, scope_id: str, chat_id: str, endpoint_id: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        consumed = {identity for row in messages for identity in row.get("_velox_steering_ids", [])}
+        guidance = []
+        for turn in self.chats.load_turns(scope_id, chat_id):
+            if not turn.get("steering") or turn.get("steering_delivered_at") or turn["turn_id"] in consumed:
+                continue
+            content = self._build_user_content(scope_id, turn, endpoint_id)
+            if isinstance(content, str):
+                content = steering_message_content(content)
+            else:
+                content = [{"type": "text", "text": steering_message_content("")}, *content]
+            guidance.append({"id": turn["turn_id"], "content": content})
+            self.chats.update_turn(scope_id, chat_id, turn["turn_id"], {
+                "steering_delivered_at": now_iso(), "steering_model_content": copy.deepcopy(content),
+            }, mark_stale=False)
+        return guidance
+
+    @staticmethod
+    def _chat_steering_messages(guidance: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{"role": "user", "content": row["content"], "_velox_steering_ids": [row["id"]]} for row in guidance]
 
     def _ensure_chat_cancel_state(self) -> None:
         """Initialize transient cancellation state for normal and minimal test runtimes."""
@@ -49018,6 +49198,9 @@ class ChatRuntime:
     def _chat_task_done(self, chat_id: str, task: asyncio.Task, *, user_stop: bool = False) -> None:
         """Release only the task owner and terminalize any orphaned stream card."""
         self._ensure_chat_cancel_state()
+        cancel_event = self._cancel_events.get(str(chat_id))
+        cancelled_run = bool((cancel_event is not None and cancel_event.is_set())
+                             or getattr(task, "_velox_chat_cancelled_run", False))
         replacement = self.running.get(str(chat_id))
         superseded = replacement is not None and replacement is not task
         if replacement is task:
@@ -49032,6 +49215,21 @@ class ChatRuntime:
                     "chat_id": str(chat_id), "error": str(task.exception())})
         else:
             self._consume_running_task_exception(str(chat_id), task, terminalize=not superseded)
+        # A message may arrive during the final disk commit, after the last
+        # inference boundary. Preserve that accepted input as a follow-up rather
+        # than requiring the user to send it again. Stop/errors never auto-resume.
+        owned = getattr(task, "_velox_chat_stream_turn_ids", {}).get(str(chat_id), set())
+        if (not superseded and not user_stop and not cancelled_run and owned and not task.cancelled()
+                and task.exception() is None and self._chat_steering_pending(str(chat_id))):
+            turns = self.chats.load_turns(APP_SCOPE_ID, str(chat_id))
+            last_owned = next((turn for turn in reversed(turns) if turn.get("turn_id") in owned), {})
+            if last_owned.get("status") == "complete":
+                endpoint_id = self._chat_endpoint_profile_id(str(chat_id))
+                self._begin_chat_cancel_scope(str(chat_id))
+                followup = asyncio.create_task(self._run_assistant_from_existing_user(
+                    APP_SCOPE_ID, str(chat_id), endpoint_id))
+                self.running[str(chat_id)] = followup
+                followup.add_done_callback(lambda done, cid=str(chat_id): self._chat_task_done(cid, done))
 
     def _terminalize_orphaned_chat_stream(
         self, chat_id: str, *, status: str, diagnostic: str,
@@ -49370,7 +49568,7 @@ class ChatRuntime:
                 await self._wait_if_chat_paused(chat_id, "waiting for subagents")
                 if chat_id in getattr(self, "_agent_report_stopped_chats", set()):
                     raise asyncio.CancelledError()
-                if self._agent_reports_ready(chat_id):
+                if self._agent_reports_ready(chat_id) or self._chat_steering_pending(chat_id):
                     return True
                 children = await asyncio.to_thread(self._child_agents_for_chat, chat_id)
                 if not any(row.get("status") not in AGENT_TERMINAL_STATUSES for row in children):
@@ -49442,8 +49640,9 @@ class ChatRuntime:
             self._agent_report_workers.pop(chat_id, None)
         owned_chat = self.running.get(chat_id) is task
         if owned_chat:
-            self.running.pop(chat_id, None)
-        self._consume_running_task_exception(str(chat_id), task, terminalize=owned_chat)
+            self._chat_task_done(chat_id, task)
+        else:
+            self._consume_running_task_exception(str(chat_id), task, terminalize=False)
 
     async def _drain_agent_report_queue(self, chat_id: str) -> None:
         current_task = asyncio.current_task()
@@ -49719,7 +49918,7 @@ class ChatRuntime:
             turns = await asyncio.to_thread(self.chats.load_turns, scope_id, chat_id)
             latest = next((
                 t for t in reversed(turns)
-                if str(t.get("role") or "").lower() == "user" and not is_chat_application_injected_prompt_turn(t)
+                if str(t.get("role") or "").lower() == "user" and not t.get("steering") and not is_chat_application_injected_prompt_turn(t)
             ), None)
             same_request = bool(latest and str(latest.get("text") or "") == str(text or "") and list(latest.get("attachments") or []) == list(attachments or []))
         except Exception:
@@ -50088,6 +50287,38 @@ class ChatRuntime:
             context_overflow_output_override: int | None = None
             # Tool calls and endpoint inference rounds are separate user-facing budgets.
             max_model_rounds = tool_setting_int(runtime_config, "chat_max_model_rounds")
+            async def continue_with_steering(current_visible: str) -> bool:
+                nonlocal current_assistant_id, accumulated, current_tool_results, terminal_replay
+                nonlocal started, first_token, last_write, raw_stream_output_chars, section_timing, usage, turn_model_round
+                guidance = self._take_chat_steering(scope_id, chat_id, endpoint_profile_id, messages)
+                if guidance:
+                    replay = [self._assistant_message_for_model_text(current_visible,
+                        response_output_items=round_response_output_items, reasoning_fields=round_reasoning_fields),
+                        *self._chat_steering_messages(guidance)]
+                    messages.extend(replay)
+                    await self._update_turn_io(scope_id, chat_id, current_assistant_id, {
+                        "text": current_visible, "status": "complete", "model_replay_messages": replay,
+                        "streaming_tool_preview": "", "stats": self._make_stats(started, first_token, current_visible, current_tool_results, usage),
+                    }, mark_stale=True, expected_statuses={"streaming"})
+                    next_turn = make_turn(chat_id, "assistant", "", endpoint_profile_id=endpoint_profile_id,
+                                          endpoint_label=endpoint_label, status="streaming")
+                    await self._append_turn_io(scope_id, chat_id, next_turn, mark_stale=False)
+                    current_assistant_id = str(next_turn["turn_id"])
+                    accumulated = ""
+                    current_tool_results = []
+                    terminal_replay = None
+                    started = time.time()
+                    first_token = None
+                    last_write = 0.0
+                    raw_stream_output_chars = 0
+                    section_timing = []
+                    usage = {"_estimated_prompt_tokens": self._estimate_messages_tokens(messages),
+                             "_estimated_added_prompt_tokens": estimated_prompt_added, "_stream_output_chars": 0,
+                             "_section_timing": section_timing}
+                    turn_model_round = 0
+                    return True
+                return False
+
             while model_round < max_model_rounds:
                 await self._wait_if_chat_paused(chat_id, "before model inference")
                 if await self._consume_ready_agent_reports(
@@ -50095,6 +50326,8 @@ class ChatRuntime:
                     messages, current_assistant_id, _ = await self._maybe_compact_chat_context(
                         scope_id, chat_id, endpoint_profile_id, messages, current_assistant_id,
                         native_tools=native_tool_schemas, monitor_task_id=request_id)
+                pre_inference_steering = self._take_chat_steering(scope_id, chat_id, endpoint_profile_id, messages)
+                messages.extend(self._chat_steering_messages(pre_inference_steering))
                 model_round += 1
                 turn_model_round += 1
                 round_prefix = ""
@@ -50667,6 +50900,8 @@ class ChatRuntime:
                     )
                     await asyncio.sleep(0)
 
+                    steering_interrupted = False
+                    batch_steering: list[dict[str, Any]] = []
                     prepared_iterator = iter(visible_prepared_calls)
                     execution_groups = self._consecutive_image_tool_groups(selected_calls)
                     for call_group in execution_groups:
@@ -50702,7 +50937,13 @@ class ChatRuntime:
                             len(prepared_calls) > 1
                             and all(str(call.get("name") or "") in PARALLEL_IMAGE_ANALYSIS_TOOL_NAMES for call, _pending, _callback in prepared_calls)
                         )
-                        if parallel_image_group:
+                        guidance = self._take_chat_steering(scope_id, chat_id, endpoint_profile_id, messages)
+                        if guidance:
+                            steering_interrupted = True
+                        if steering_interrupted:
+                            group_results = [steering_skipped_tool_result(str(call.get("name") or ""))
+                                             for call, _pending, _callback in prepared_calls]
+                        elif parallel_image_group:
                             if self.monitor and request_id:
                                 self.monitor.set_phase(request_id, "tool")
                             try:
@@ -50738,6 +50979,17 @@ class ChatRuntime:
                                 if self.monitor and request_id:
                                     self.monitor.set_phase(request_id, "ready")
 
+                        if not guidance:
+                            guidance = self._take_chat_steering(scope_id, chat_id, endpoint_profile_id, messages)
+                        if guidance:
+                            steering_interrupted = True
+                            batch_steering.extend(guidance)
+                            # Native tool content is text. Visual attachments are handed off
+                            # as user multipart content only after all native results are paired.
+                            attach_steering_to_tool_result(group_results[0], [
+                                {"id": row["id"], "content": row["content"] if isinstance(row["content"], str)
+                                 else "See the steering attachment handoff after this tool batch."} for row in guidance])
+
                         for (call, pending_tool, _progress_callback), result in zip(prepared_calls, group_results):
                             pending_tool.clear()
                             pending_tool.update(result)
@@ -50755,6 +51007,7 @@ class ChatRuntime:
                                 self._tool_result_payload_text(result),
                                 name=str(call.get("name") or ""),
                             )
+                            protocol_result["_velox_steering_ids"] = [row["id"] for row in guidance] if result is prepared_calls[0][1] else []
                             batch_protocol_results.append(protocol_result)
                             result_message_tokens += self._estimate_messages_tokens([protocol_result])
                             provisional_assistant = assistant_message_for_openai_tool_calls(
@@ -50779,7 +51032,8 @@ class ChatRuntime:
                             usage["_capacity_checks_after_tool_results"] = (
                                 int(usage.get("_capacity_checks_after_tool_results") or 0) + 1
                             )
-                            tool_calls_used += 1
+                            if result.get("executed") is not False:
+                                tool_calls_used += 1
                             cancelled = bool(result.get("cancelled")) or str(result.get("status") or "") == "cancelled"
                             failed = not bool(result.get("ok")) and not cancelled
                             if failed:
@@ -50822,6 +51076,7 @@ class ChatRuntime:
                             response_output_items=context_response_output_items, reasoning_fields=round_reasoning_fields,
                         ))
                         messages.extend(batch_protocol_results)
+                        messages.extend(self._chat_steering_messages([row for row in batch_steering if not isinstance(row["content"], str)]))
                         image_handoffs = current_context_vision_handoffs_from_tool_results(batch_results)
                         if image_handoffs:
                             vision_message, vision_summary = build_current_context_vision_message(
@@ -50873,7 +51128,7 @@ class ChatRuntime:
                             accumulated, f"[error] {final_terminal_error}",
                         )
                         break
-                    if budget_skipped or tool_calls_used >= tool_call_limit:
+                    if (budget_skipped and not steering_interrupted) or tool_calls_used >= tool_call_limit:
                         final_terminal_error = (
                             f"The configured tool-call limit of {tool_call_limit} was reached."
                         )
@@ -50929,6 +51184,8 @@ class ChatRuntime:
                     continue
 
                 current_visible = display_candidate
+                if await continue_with_steering(current_visible):
+                    continue
                 if (
                     not batch_calls
                     and normalize_llm_termination_reason(round_finish_reason) == "tool_calls"
@@ -51130,6 +51387,8 @@ class ChatRuntime:
 
                 if not self._agent_reports_ready(chat_id):
                     await self._await_chat_child_reports(chat_id, request_id)
+                if await continue_with_steering(current_visible):
+                    continue
                 if expert_active or self._agent_reports_ready(chat_id):
                     if model_round >= max_model_rounds:
                         final_terminal_error = (
@@ -51326,6 +51585,10 @@ class ChatRuntime:
             )
         finally:
             self._monitor_task_ids.pop(chat_id, None)
+            if request_cancel_event is not None and request_cancel_event.is_set():
+                owner_task = asyncio.current_task()
+                if owner_task is not None:
+                    setattr(owner_task, "_velox_chat_cancelled_run", True)
             if self._cancel_events.get(chat_id) is request_cancel_event:
                 self._cancel_events.pop(chat_id, None)
             self.storage.append_app_log(
@@ -53199,7 +53462,18 @@ class ChatRuntime:
         remaining_image_inputs = max(
             0, prompt_image_limit - message_image_input_count(messages),
         )
+        replayed_steering = {identity for turn in turns for row in (turn.get("model_replay_messages") or [])
+                            if isinstance(row, dict) for identity in row.get("_velox_steering_ids", [])}
         for t in turns[turn_start:]:
+            if t.get("steering"):
+                if t["turn_id"] in replayed_steering:
+                    continue
+                if not t.get("steering_delivered_at") and self.is_running(chat_id):
+                    continue
+                messages.append({"role": "user", "content": copy.deepcopy(t.get("steering_model_content")
+                                 or steering_message_content(str(t.get("text") or ""))),
+                                 "_velox_steering_ids": [t["turn_id"]]})
+                continue
             role = str(t.get("role") or "")
             if role == "compaction":
                 continue
@@ -68765,6 +69039,7 @@ class Panels:
                 "separator_before": True,
                 "payload": payload,
             },
+            {"action": "steer", "label": "Steer agent…", "enabled": active and not _is_reviewer_agent(agent), "payload": payload},
             {"action": "cancel", "label": "Cancel agent", "enabled": active, "danger": True, "payload": payload},
             {"action": "delete", "label": "Delete agent", "enabled": deletable, "danger": True, "payload": payload},
         ]
@@ -68792,6 +69067,8 @@ class Panels:
                 self._open_agent_statistics_dialog(resolved)
             elif action == "export_debug":
                 self._request_agent_debug_export(resolved)
+            elif action == "steer":
+                self._open_agent_steering(resolved)
             elif action == "pause":
                 self.services.agent_runtime.pause(resolved)
             elif action == "resume":
@@ -68804,6 +69081,46 @@ class Panels:
                 self._open_agent_source_chat(resolved)
         except Exception as exc:
             self.state.add_toast("Agent action failed", f"{type(exc).__name__}: {exc}", "error")
+
+    def _open_agent_steering(self, agent_id: str) -> None:
+        agent = self.services.agent_runtime.resolve_steering_agent(agent_id)
+        if agent["status"] in AGENT_TERMINAL_STATUSES or _is_reviewer_agent(agent):
+            raise ValueError("This agent cannot receive steering")
+        self.state.modal = {"kind": "agent_steering", "agent_id": agent["agent_id"],
+                            "display_id": agent["task_run_id"], "message": "", "error": ""}
+        self.state.active_widget = "modal.steering.message"
+
+    def _draw_agent_steering_modal(self, rect: Rect, modal: dict[str, Any]) -> None:
+        self.r.draw_rect(rect, Palette.modal_backdrop)
+        mw, mh = min(760, rect.w - 48), min(430, rect.h - 48)
+        box = Rect(rect.x + (rect.w - mw) // 2, rect.y + (rect.h - mh) // 2, mw, mh)
+        self.r.draw_card(box, radius=24, fill=Palette.panel)
+        inner = box.inset(24)
+        title_h = self.f.line_h + 8
+        self._draw_card_title_text("modal.steering.title", Rect(inner.x, inner.y, inner.w, title_h),
+                                   f"STEER AGENT {modal['display_id']}")
+        self.widgets.clipped_text(Rect(inner.x, inner.y + title_h + 8, inner.w, self.f.line_h + 8),
+            "Guidance is delivered at the next safe tool/inference boundary.", Palette.muted2)
+        editor_y = inner.y + title_h + self.f.line_h + 32
+        editor = Rect(inner.x, editor_y, inner.w, max(70, box.y + box.h - 110 - editor_y))
+        modal["message"] = self.widgets.multiline_text_input("modal.steering.message", editor,
+            str(modal.get("message") or ""), "For example: Wrap up and return partial results with remaining gaps.")
+        if modal.get("error"):
+            self.widgets.clipped_text(Rect(inner.x, box.y + box.h - 100, inner.w, 32),
+                str(modal["error"]), Palette.danger, tooltip=str(modal["error"]))
+        by = box.y + box.h - 58
+        if self.widgets.button("modal.steering.cancel", Rect(box.x + box.w - 226, by, 94, 36), "Cancel") or self.state.input.key_escape:
+            self.state.modal = None
+            return
+        clicked = self.widgets.button("modal.steering.send", Rect(box.x + box.w - 120, by, 98, 36),
+                                      "Steer", primary=True, enabled=bool(str(modal.get("message") or "").strip()))
+        shortcut = self.state.input.key_enter and self.state.input.primary_modifier and self.state.active_widget == "modal.steering.message"
+        if clicked or shortcut:
+            try:
+                self.services.agent_runtime.steer(modal["agent_id"], modal.get("message"))
+                self.state.modal = None
+            except Exception as exc:
+                modal["error"] = f"{type(exc).__name__}: {exc}"
 
     def _open_terminal_dialog(self, owner_type: str, owner_id: str, title: str = "") -> None:
         owner_type = str(owner_type or "").strip().lower()
@@ -70234,6 +70551,9 @@ class Panels:
             if not modal:
                 return
             kind = modal.get("kind")
+            if kind == "agent_steering":
+                self._draw_agent_steering_modal(rect, modal)
+                return
             if kind == "chat_attachments":
                 self._draw_attachment_manager(rect, modal)
                 return
@@ -72493,6 +72813,8 @@ class Panels:
 
     def _tool_summary_text(self, result: dict[str, Any]) -> str:
         name = str(result.get("tool_name") or "tool")
+        if result.get("executed") is False and result.get("status") == "steered":
+            return f"Not executed — steered: {name}"
         if result.get("status") == "running" or result.get("ok") is None:
             status = "running"
         elif result.get("cancelled") or str(result.get("status") or "") == "cancelled":
@@ -72598,6 +72920,8 @@ class Panels:
         name = str(tool_call.get("tool_name") or "tool")
         params = self._tool_arg_summary(tool_call.get("input") or {})
         suffix = " — verify file" if tool_call.get("warning") else ""
+        if tool_call.get("executed") is False and tool_call.get("status") == "steered":
+            return f"Not executed — steered: {name} {params}".strip()
         return f"{name} {params}{suffix}".strip()
 
     def _tool_row_height(self) -> int:
@@ -72606,6 +72930,8 @@ class Panels:
     def _tool_row_state(self, tool_call: dict[str, Any]) -> tuple[str, Color, Color]:
         ok = tool_call.get("ok")
         status = str(tool_call.get("status") or "")
+        if status == "steered" and tool_call.get("executed") is False:
+            return "steered", theme_alpha(Palette.panel2, 220), Palette.muted2
         if status == "constructing":
             return "constructing", theme_alpha(Palette.selected, 210), Palette.accent
         if status == "cancelled" or tool_call.get("cancelled"):
@@ -75758,10 +76084,10 @@ class Panels:
         can_send = bool(
             self.state.active_scope_id
             and (self.state.active_chat_id or callable(ensure_active_chat))
-            and not running
         )
         send_clicked = self.widgets.button(
-            "composer.send", send_rect, "Send", primary=True, enabled=can_send,
+            "composer.send", send_rect, "Steer" if running else "Send", primary=True, enabled=can_send,
+            tooltip="Inject guidance before the next tool call, or with the running tool result." if running else "Send message",
         )
         if send_clicked or (
             self.state.input.key_enter
@@ -75845,8 +76171,6 @@ class Panels:
         if (not text and not self.state.queued_attachments) or not self.state.active_scope_id:
             return
         if not self._ensure_live_chat_for_action(ensure_active_chat):
-            return
-        if self.services.chat.is_running(self.state.active_chat_id):
             return
         if not text:
             text = "Please review the attached file(s)."
@@ -79774,9 +80098,17 @@ class Panels:
         prioritized = bool(record.get("prioritized"))
         live = str(record.get("state") or "running").lower() == "running"
         can_prioritize = live and task_type in {"Chat", "Agent", "Image"}
+        can_steer = live and task_type == "Agent" and bool(_agent_id)
+        if can_steer:
+            try:
+                can_steer = not _is_reviewer_agent(self.services.agents.load_agent(_agent_id))
+            except Exception:
+                can_steer = False
         return [
             {"label": "View Raw…", "action": "view_raw"},
             {"label": "Copy raw", "action": "copy_raw"},
+            *([{"label": "Steer agent…", "action": "steer", "enabled": can_steer}]
+              if task_type == "Agent" else []),
             {
                 "label": "Open Workspace…", "action": "open_workspace",
                 "enabled": bool(workspace_chat_id), "separator_before": True,
@@ -80144,6 +80476,16 @@ class Panels:
         action = str(action_name or "").strip().lower()
         record = self._dashboard_task_record(task_id)
         title = str(record.get("title") or record.get("description") or "Task")
+        if action == "steer":
+            task_type, _chat_id, agent_id, _workspace_chat_id = self._dashboard_task_context_ids(record)
+            if task_type != "Agent" or not agent_id:
+                return False
+            try:
+                self._open_agent_steering(agent_id)
+                return True
+            except Exception as exc:
+                self.state.add_toast("Steering unavailable", str(exc), "error")
+                return False
         if action == "view_raw":
             self.state.modal = {
                 "kind": "task_raw", "task_id": str(task_id),
@@ -81475,7 +81817,7 @@ EXPERT_MODE_REVIEW_TOOL_NAME = "expert_review_submit"
 EXPERT_MODE_REVIEWER_READ_ONLY_TOOL_DENYLIST = frozenset({
     "fs_write", "fs_edit", "fs_delete", "fs_move", "fs_copy", "fs_mkdir", "fs_import", "fs_rename",
     "doc_write", "doc_create", "doc_edit", "doc_replace", "doc_delete", "doc_import",
-    "agents_start", "agents_stop", "agents_pause", "agents_resume",
+    "agents_start", "agents_stop", "agents_pause", "agents_resume", "agents_steer",
     "chat_send", "chat_create", "chat_delete",
     "terminal_send", "terminal_write", "web_download_file", "image_generate",
 })
@@ -82414,7 +82756,7 @@ EXPERT_MODE_REVIEWER_READ_ONLY_TOOL_DENYLIST = frozenset({
     "week_chat_get", "drive_download", "web_download_file", "web_fetch_to_pdf",
     "create_context_doc", "update_context_doc", "delete_context_doc",
     "scheduled_task_create_once", "scheduled_task_create_recurring", "scheduled_task_delete",
-    "agents_start", "agents_pause", "agents_resume", "agents_stop",
+    "agents_start", "agents_pause", "agents_resume", "agents_stop", "agents_steer",
     "comfy_text_to_image", "comfy_image_to_image",
     "meshy_text_to_3d", "meshy_image_to_3d", "meshy_ai_texturing", "meshy_rig", "meshy_animate",
 })

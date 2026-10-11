@@ -8,8 +8,6 @@ It is designed for work that goes beyond a one-shot prompt: programming, researc
 
 The runtime is model-agnostic across configured local and hosted endpoints. Conversations can use separate primary and subagent models, while the orchestration layer manages concurrency, context, tool execution, checkpoints, recovery and review. The dashboard exposes active work, agent requests, transcripts, tool results, token usage and cost so the system remains observable rather than opaque.
 
-Current release: **velox.v318**. Compatible data format: **v316**.
-
 ## Core capabilities
 
 - **Agentic orchestration.** Chats can delegate bounded work to background agents with distinct Reader, Planner, Implementer and Reviewer roles. Primary and subagent inference endpoints are configured independently, allowing different models to be used for reasoning, execution and verification.
@@ -18,7 +16,7 @@ Current release: **velox.v318**. Compatible data format: **v316**.
 - **Long-running agent runtime.** Endpoint concurrency, request limits, progress-aware timeouts, transient-error recovery and context fitting/compaction are configurable. Inference slots are released while agents are waiting on tools or other external work. Recorded tool results and durable checkpoints support replay without intentionally repeating completed side effects.
 - **Context and skill injection.** Reusable Skills, Context Docs, Calendar Events, local Items and an optional user profile provide persistent context without hard-coding it into the application. Skill loading can be global, on-demand or disabled.
 - **Scheduled and ongoing work.** Local scheduled tasks and the optional Personal Assistant use the same agent/runtime machinery as interactive work, so recurring workflows share the same tools, model configuration, persistence and inspection surfaces.
-- **Observability and operator control.** The dashboard surfaces live runs, checklist state, agent requests, transcripts, tool output, token consumption and cost. Pause and Stop are first-class runtime controls rather than UI-only state.
+- **Observability and operator control.** The dashboard surfaces live runs, checklist state, agent requests, transcripts, tool output, token consumption and cost. Steering, Pause and Stop are first-class runtime controls rather than UI-only state.
 
 ## Design principles
 
@@ -63,7 +61,7 @@ The interface uses the pinned [PySDL3](https://pysdl3.readthedocs.io/en/latest/i
 
 ### Release and data compatibility
 
-`CURRENT_VERSION` identifies the application release. `BACKWARD_COMPATIBLE_VERSION` identifies the supported persisted-data generation. This release uses **v316 data files**: existing valid v316 roots remain compatible, while other generations are rejected without automatic migration. Use a fresh directory for incompatible data; do not expect a version bump to convert an old root.
+`CURRENT_VERSION` identifies the application release. `BACKWARD_COMPATIBLE_VERSION` identifies the supported persisted-data generation. Valid roots from the supported data generation remain compatible, while other generations are rejected without automatic migration. See these constants in `velox.py` for the supported release and data generation. Use a fresh directory for incompatible data; do not expect a version bump to convert an old root.
 
 **Every commit must bump `CURRENT_VERSION`, no exceptions.** Compatible changes increment the application version only. Change `BACKWARD_COMPATIBLE_VERSION` as well only when the data format actually breaks compatibility, and update the relevant tests/documentation.
 
@@ -78,6 +76,16 @@ Create a chat, choose its main/subagent endpoints, and **enable the tools** it n
 > Build a local tool for exploring CSV files. Let me import a file, inspect its columns, filter rows and export the result. Pick a suitable stack, add tests and run them. Work only in the workspace I specify.
 
 Follow progress on the dashboard and open a task to inspect its checklist, agent requests, transcript or tool output. **Pause** holds execution at safe boundaries and preserves unfinished work. **Stop** cancels the active chat run, its active checklist and chat-owned child work; cancelled checklist work requires an explicit user-authorized resume. Ordinary application shutdown preserves resumable work rather than treating it as a user Stop.
+
+### Steering active work
+
+Send another message while a chat is running (the composer button becomes **Steer**, with the same Ctrl/Cmd+Enter shortcut). It stays in the transcript and is delivered before the next unstarted tool call. If a tool is already running, it finishes normally and its result carries the new guidance. Remaining calls from the old batch are not executed; the model reconsiders its next action. Multiple messages retain their order, and attachments use the normal chat attachment path.
+
+To steer a background agent, right-click its Dashboard row and choose **Steer agent…**, or use the same action in the chat's agent list. You can also ask the chat to steer an agent by its numeric **ID** column, for example:
+
+> Get agent 23 to wrap up and return partial results with the remaining gaps instead of continuing.
+
+Chats and ordinary agents can call `agents_steer(agent_id, message)` with a Dashboard numeric ID (as text) or Agent UUID. Tool access remains subject to the Agent policy, and a model may steer only agents in its source chat. Independent Reviewers cannot steer or receive steering. Steering is guidance, not cancellation or automatic acceptance: partial results must be labelled honestly, and active Checklist requirements are not silently marked complete. A paused task retains guidance until resumed. Finished agents reject steering; use Pause or Stop when you need execution held or cancelled.
 
 Tools run with your account's permissions, **not in an operating-system sandbox**. Prompted scopes and ownership checks do not restrict general filesystem access. Read [SECURITY.md](SECURITY.md) before using important files or private accounts. Endpoint configuration, account credential files and debug exports deserve protection.
 

@@ -620,8 +620,10 @@ class PublicSkillAndDocumentationTests(_WriterDataRootsIsolatedTestMixin, unitte
 
     def test_readme_matches_release_cli_skills_connectors_and_test_runner(self) -> None:
         readme = _project_documentation('README.md')
-        self.assertIn(velox.APP_VERSION, readme)
-        self.assertIn(f'**{velox.DATA_FILE_VERSION} data files**', readme)
+        self.assertNotIn(velox.APP_VERSION, readme)
+        self.assertIn('`CURRENT_VERSION` identifies the application release', readme)
+        self.assertIn('`BACKWARD_COMPATIBLE_VERSION` identifies the supported persisted-data generation', readme)
+        self.assertIsNone(re.search(r'(?i)\b(?:velox\.)?v\d{3}\b', readme))
         self.assertIn('Every commit must bump `CURRENT_VERSION`, no exceptions', readme)
         self.assertIn('BACKWARD_COMPATIBLE_VERSION', readme)
         self.assertNotIn('v303', readme)
@@ -1018,7 +1020,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertIn(component.__name__, velox.__doc__ or "")
         self.assertIn("python velox.py", velox.__doc__ or "")
         readme = _project_documentation("README.md")
-        for section in ("## What it does", "## Run it", "## How it works", "## Tests"):
+        for section in ("## Core capabilities", "## Run it", "## Runtime architecture", "## Tests"):
             self.assertIn(section, readme)
         self.assertIn("python test_velox.py", readme)
         self.assertIn("XOR obfuscation, not encryption", _project_documentation("SECURITY.md"))
@@ -19030,17 +19032,20 @@ class TaskInspectorTests(unittest.TestCase):
             "task_type": "Agent", "state": "running", "metadata": {"agent_id": "agent-1"},
             "pausable": False, "resumable": True, "cancellable": True,
         })
-        self.assertTrue(agent_items[2]["enabled"])
-        self.assertTrue(agent_items[3]["enabled"])
-        self.assertTrue(agent_items[4]["enabled"])
-        self.assertTrue(agent_items[5]["enabled"])
-        self.assertEqual(agent_items[6]["label"], "Resume")
-        self.assertEqual(agent_items[6]["action"], "resume")
+        self.assertEqual([item["action"] for item in agent_items],
+                         ["view_raw", "copy_raw", "steer", "open_workspace", "expert_mode",
+                          "expert_mode_history", "prioritize", "resume", "cancel"])
+        agent_actions = {item["action"]: item for item in agent_items}
+        for action in ("steer", "open_workspace", "expert_mode", "expert_mode_history", "prioritize"):
+            self.assertTrue(agent_actions[action]["enabled"])
+        self.assertEqual(agent_actions["resume"]["label"], "Resume")
+        self.assertNotIn("steer", [item["action"] for item in items])
 
         system_items = panel._dashboard_task_context_menu_items({
             "task_type": "System", "state": "running", "metadata": {},
             "pausable": False, "resumable": False, "cancellable": False,
         })
+        self.assertNotIn("steer", [item["action"] for item in system_items])
         self.assertFalse(system_items[2]["enabled"])
         self.assertFalse(system_items[3]["enabled"])
         self.assertFalse(system_items[4]["enabled"])
@@ -28870,6 +28875,420 @@ class _AsyncRuntimeFixture(_WriterDataRootsIsolatedTestMixin, unittest.IsolatedA
         self.chats.append_turn(velox.APP_SCOPE_ID, self.cid, assistant, mark_stale=False)
         await self.runtime._run_assistant_loop(velox.APP_SCOPE_ID, self.cid, str(assistant["turn_id"]), self.eid, user["text"], "Runtime replay")
         return fake
+
+
+class SteeringRuntimeTests(_AsyncRuntimeFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.tools.bind_agent_runtime(self.aruntime)
+
+    def native_calls(self, count: int = 2) -> list[dict[str, Any]]:
+        return [_make_test_provider_call(f'steer-call-{i}', 'time_now', {}) for i in range(count)]
+
+    def queue_chat(self, text: str) -> None:
+        # Call the actual busy-send entry point; it must not start another worker.
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, text, self.eid)
+
+    async def chat_scenario(self, *, during_tool: bool = False, no_tools: bool = False, count: int = 2) -> tuple[Any, list[str]]:
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = self.native_calls(count)
+        case = self
+        class Endpoint(_ScriptedLLM):
+            async def chat_completions_stream(inner, request):
+                inner.requests.append(copy.deepcopy(request))
+                if len(inner.requests) == 1:
+                    if not during_tool:
+                        entered.set(); await release.wait()
+                    yield velox.LLMChunk(text='Earlier answer.' if no_tools else '', native_tool_calls=[] if no_tools else calls,
+                                   done=True, finish_reason='stop' if no_tools else 'tool_calls')
+                else:
+                    yield velox.LLMChunk(text='Partial results, with remaining gaps.', done=True, finish_reason='stop')
+        endpoint = Endpoint(self.storage, [])
+        self.runtime.llm = endpoint
+        executed = []
+        original = self.tools.tools['time_now'].handler
+        async def handler(ctx, args):
+            executed.append(str(ctx.chat_id))
+            if during_tool:
+                entered.set(); await release.wait()
+            return await original(ctx, args)
+        with mock.patch.object(self.tools.tools['time_now'], 'handler', side_effect=handler):
+            self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, 'Start work.', self.eid)
+            task = self.runtime.running[self.cid]
+            await asyncio.wait_for(entered.wait(), 5)
+            self.queue_chat('STEER_FIRST: return partial results now')
+            self.queue_chat('STEER_SECOND: include remaining gaps')
+            self.assertIs(self.runtime.running[self.cid], task)
+            release.set()
+            await asyncio.wait_for(task, 10)
+        self.assertEqual(len(endpoint.requests), 2, str(self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)))
+        incoming = endpoint.requests[-1].messages
+        body = json.dumps(incoming)
+        self.assertIn('STEER_FIRST', body); self.assertIn('STEER_SECOND', body)
+        self.assertLess(body.index('STEER_FIRST'), body.index('STEER_SECOND'))
+        results = [row for row in incoming if row['role'] == 'tool']
+        self.assertEqual(len(results), 0 if no_tools else count)
+        if results:
+            payload = json.loads(results[0]['content'])
+            self.assertTrue(payload['ok'])
+            self.assertIn('steering_messages', payload)
+            self.assertEqual(payload.get('executed', True), during_tool)
+            self.assertTrue(all(json.loads(row['content']).get('executed') is False for row in results[1:]))
+        self.assertEqual(len(executed), int(during_tool))
+        self.assertEqual(self.chats.load_chat(self.cid)['tool_failure_count'], 0)
+        self.assertEqual(sum(1 for row in results if json.loads(row['content']).get('executed') is not False), int(during_tool))
+        # Production replay is the same complete native exchange, with no lost/duplicated guidance.
+        replay = self.messages()
+        for token in ('STEER_FIRST', 'STEER_SECOND'):
+            self.assertEqual(json.dumps(replay).count(token), 1)
+        # Provider transports both strip internal metadata and keep valid call/result pairing.
+        req = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, replay)
+        for payload_builder in (self.llm._chat_payload_and_headers, self.llm._responses_payload_and_headers):
+            payload_builder(req, stream=False)
+        return endpoint, executed
+
+    async def test_chat_steering_before_tool_skips_whole_stale_batch(self):
+        await self.chat_scenario()
+
+    async def test_chat_steering_during_tool_keeps_result_and_skips_next_call(self):
+        await self.chat_scenario(during_tool=True)
+
+    async def test_chat_steering_during_final_inference_creates_followup(self):
+        await self.chat_scenario(no_tools=True)
+
+    async def test_chat_pause_retains_guidance_until_resume(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        class Endpoint(_ScriptedLLM):
+            async def chat_completions_stream(inner, request):
+                inner.requests.append(copy.deepcopy(request))
+                if len(inner.requests) == 1:
+                    entered.set(); await release.wait()
+                    yield velox.LLMChunk(native_tool_calls=self.native_calls(1), done=True, finish_reason='tool_calls')
+                else: yield velox.LLMChunk(text='Done', done=True, finish_reason='stop')
+        self.runtime.llm = endpoint = Endpoint(self.storage, [])
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, 'Start', self.eid)
+        task = self.runtime.running[self.cid]
+        await asyncio.wait_for(entered.wait(), 5)
+        self.runtime.pause(self.cid); self.queue_chat('PAUSED_GUIDANCE')
+        release.set(); await asyncio.sleep(.1)
+        self.assertFalse(task.done()); self.assertEqual(len(endpoint.requests), 1)
+        self.runtime.resume(self.cid)
+        await asyncio.wait_for(task, 10)
+        self.assertIn('PAUSED_GUIDANCE', json.dumps(endpoint.requests[-1].messages))
+
+    async def test_chat_stop_rejects_late_steering_without_erasing_draft(self):
+        task = asyncio.create_task(asyncio.sleep(30)); self.runtime.running[self.cid] = task
+        self.runtime._begin_chat_cancel_scope(self.cid).set()
+        with self.assertRaisesRegex(ValueError, 'stopping'): self.queue_chat('Late message')
+        self.assertFalse(self.chats.load_turns(velox.APP_SCOPE_ID, self.cid))
+        task.cancel(); await asyncio.gather(task, return_exceptions=True)
+
+    async def test_chat_pending_steering_survives_runtime_recreation(self):
+        task = asyncio.create_task(asyncio.sleep(30)); self.runtime.running[self.cid] = task
+        self.queue_chat('DURABLE_PENDING')
+        fresh = velox.ChatRuntime(self.storage, velox.ChatStore(self.storage), velox.ContextAssembler(self.paths), self.llm, self.tools)
+        guidance = fresh._take_chat_steering(velox.APP_SCOPE_ID, self.cid, self.eid, [])
+        self.assertEqual(len(guidance), 1); self.assertIn('DURABLE_PENDING', str(guidance))
+        self.assertIn('DURABLE_PENDING', json.dumps(fresh._build_messages(velox.APP_SCOPE_ID, self.cid)))
+        task.cancel(); await asyncio.gather(task, return_exceptions=True)
+
+    async def test_chat_steering_attachments_use_normal_preparation_and_replay(self):
+        task = asyncio.create_task(asyncio.sleep(30)); self.runtime.running[self.cid] = task
+        file = self.paths.chat_workspace_dir(self.cid) / 'steering.txt'; file.write_text('ATTACHMENT_EVIDENCE')
+        attachment = velox.AttachmentStore(self.storage).attach_file(velox.APP_SCOPE_ID, file, 'chat', self.cid)
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, 'Use attached evidence', self.eid, attachments=[attachment])
+        rows = self.runtime._take_chat_steering(velox.APP_SCOPE_ID, self.cid, self.eid, [])
+        self.assertIn('ATTACHMENT_EVIDENCE', json.dumps(rows))
+        self.assertEqual(len(self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)[0]['attachments']), 1)
+        task.cancel(); await asyncio.gather(task, return_exceptions=True)
+
+    async def agent_scenario(self, *, during_tool: bool = False, no_tools: bool = False, parallel: bool = False):
+        agent = self.agent(); aid = agent['agent_id']
+        self.agents.update_agent(aid, {'status': 'running'})
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = self.native_calls(2)
+        if parallel:
+            calls = [_make_test_provider_call(f'image-{i}', 'image_analyze', {'path':f'img-{i}.png','prompt':'inspect'}) for i in range(2)]
+        requests, executed = [], []
+        async def completion(agent_id, endpoint_id, messages, **kwargs):
+            requests.append(copy.deepcopy(messages))
+            if len(requests) == 1:
+                if not during_tool: entered.set(); await release.wait()
+                return {'text':'Earlier final\n$$AGENT_PROGRESS: {"message":"Done","percent":100}' if no_tools else '',
+                        'tool_calls':[] if no_tools else calls,'finish_reason':'stop' if no_tools else 'tool_calls'}
+            return {'text':'PARTIAL_EVIDENCE: remaining gaps noted\n$$AGENT_PROGRESS: {"message":"Partial results returned","percent":100}', 'finish_reason':'stop'}
+        async def execute(scope_id, call, **kwargs):
+            executed.append(call['name'])
+            if during_tool: entered.set(); await release.wait()
+            return {'ok':True,'tool_name':call['name'],'result':{'evidence':'REAL_COMPLETED_RESULT'}}
+        with mock.patch.object(self.aruntime, '_request_agent_completion', side_effect=completion), \
+             mock.patch.object(self.tools, 'execute_tool_call', side_effect=execute), \
+             mock.patch.object(self.aruntime, '_schedule_chat_report'):
+            task = asyncio.create_task(self.aruntime._run_agent(aid))
+            await asyncio.wait_for(entered.wait(), 5)
+            first = self.aruntime.steer(str(agent['task_run_id']), 'AGENT_STEER_FIRST: wrap up with partial results')
+            self.aruntime.steer(aid, 'AGENT_STEER_SECOND: disclose remaining gaps')
+            self.assertEqual(first['task_run_id'], agent['task_run_id'])
+            release.set(); await asyncio.wait_for(task, 10)
+        self.assertEqual(len(requests), 2)
+        body = json.dumps(requests[-1])
+        self.assertIn('AGENT_STEER_FIRST', body); self.assertIn('AGENT_STEER_SECOND', body)
+        self.assertLess(body.index('AGENT_STEER_FIRST'), body.index('AGENT_STEER_SECOND'))
+        self.assertEqual(len(executed), 0 if not during_tool else 2 if parallel else 1)
+        if during_tool: self.assertIn('REAL_COMPLETED_RESULT', body)
+        current = self.agents.load_agent(aid)
+        self.assertEqual(current['status'], 'succeeded'); self.assertIn('PARTIAL_EVIDENCE', current['final_output'])
+        self.assertEqual(current['tool_failure_count'], 0)
+        self.assertEqual(current['tool_call_count'], len(executed))
+        fresh = velox.AgentRuntime(self.storage, velox.AgentStore(self.storage), self.chats, velox.ContextAssembler(self.paths), self.llm, self.tools)
+        restored, _ = fresh._conversation_from_transcript(current)
+        for token in ('AGENT_STEER_FIRST','AGENT_STEER_SECOND'): self.assertEqual(json.dumps(restored).count(token), 1)
+        self.assertEqual(fresh._take_agent_steering(aid, restored), [])
+
+    async def test_agent_steering_before_tool_skips_stale_batch(self):
+        await self.agent_scenario()
+
+    async def test_agent_steering_during_tool_retains_result_and_skips_next(self):
+        await self.agent_scenario(during_tool=True)
+
+    async def test_agent_final_inference_is_reconsidered_after_steering(self):
+        await self.agent_scenario(no_tools=True)
+
+    async def test_agent_parallel_image_batch_is_skipped_before_start(self):
+        await self.agent_scenario(parallel=True)
+
+    async def test_agent_parallel_image_batch_finishes_then_injects_guidance(self):
+        await self.agent_scenario(parallel=True, during_tool=True)
+
+    async def test_agent_steering_tool_is_registered_and_available_to_ordinary_agents(self):
+        target, caller = self.agent(), self.agent()
+        ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, agent_id=caller['agent_id'], agent_task_run_id=caller['task_run_id'])
+        result = await self.tools.tool_agents_steer(ctx, {'agent_id':str(target['task_run_id']), 'message':'Wrap up'})
+        self.assertEqual(result['agent_id'], target['agent_id'])
+        schemas = self.aruntime._native_tools_for_agent(caller)
+        self.assertIn('agents_steer', [row['function']['name'] for row in schemas])
+        listed = await self.tools.tool_agents_get_all(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid), {})
+        self.assertIn(target['task_run_id'], [row['dashboard_id'] for row in listed['agents']])
+
+    async def test_agent_steering_rejects_cross_chat_and_stale_caller_run(self):
+        target, caller = self.agent(), self.agent()
+        wrong = self.chats.create_chat('Other chat')['chat_id']
+        with self.assertRaises(PermissionError):
+            await self.tools.tool_agents_steer(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=wrong), {'agent_id':str(target['task_run_id']),'message':'No'})
+        with self.assertRaises(PermissionError):
+            await self.tools.tool_agents_steer(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, agent_id=caller['agent_id'], agent_task_run_id=caller['task_run_id']+1), {'agent_id':target['agent_id'],'message':'No'})
+
+    def test_agent_steering_validates_identity_message_terminal_and_reviewer(self):
+        agent = self.agent(); aid = agent['agent_id']
+        for invalid in ('', '0', '-1', 'missing', '9999999999999999999999999'):
+            with self.subTest(invalid=invalid), self.assertRaises((ValueError,FileNotFoundError)): self.aruntime.steer(invalid, 'Message')
+        for invalid in ('', '  ', None, 42):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError): self.aruntime.steer(aid, invalid)
+        self.agents.update_agent(aid, {'status':'succeeded'})
+        with self.assertRaisesRegex(ValueError, 'finished'): self.aruntime.steer(aid, 'Message')
+        review = self.agents.create_agent(self.cid, 'Review', context=velox.EXPERT_MODE_REVIEW_AGENT_CONTEXT_MARKER+'\n{}')
+        with self.assertRaises(PermissionError): self.aruntime.steer(review['agent_id'], 'Change verdict')
+        self.assertIn('agents_steer', velox.EXPERT_MODE_REVIEWER_READ_ONLY_TOOL_DENYLIST)
+
+    def test_agent_pending_steering_survives_restart_and_paused_state(self):
+        agent = self.agent(); aid = agent['agent_id']; self.agents.update_agent(aid, {'status':'paused'})
+        self.aruntime.steer(aid, 'PERSISTED_GUIDANCE')
+        fresh = velox.AgentRuntime(self.storage, velox.AgentStore(self.storage), self.chats, velox.ContextAssembler(self.paths), self.llm, self.tools)
+        pending = fresh._take_agent_steering(aid, [])
+        self.assertIn('PERSISTED_GUIDANCE', json.dumps(pending))
+        self.assertEqual(self.agents.load_agent(aid)['status'], 'paused')
+
+    def test_readme_has_no_application_point_release(self):
+        text = Path(velox.__file__).with_name('README.md').read_text(encoding='utf-8')
+        self.assertIsNone(re.search(r'(?i)\b(?:velox\.)?v\d{3}\b', text))
+
+    async def test_chat_waiting_for_child_accepts_steering_without_waiting_for_completion(self):
+        self.aruntime.chat_runtime = self.runtime
+        child = self.agents.create_agent(self.cid, 'Bounded read', endpoint_profile_id=self.eid)
+        entered = asyncio.Event()
+        calls = [_make_test_provider_call('steer-worker', 'agents_steer',
+                 {'agent_id':str(child['task_run_id']), 'message':'Wrap up with partial results'})]
+        class Endpoint(_ScriptedLLM):
+            async def chat_completions_stream(inner, request):
+                inner.requests.append(copy.deepcopy(request))
+                if len(inner.requests) == 1:
+                    entered.set()
+                    yield velox.LLMChunk(text='Waiting for the worker.', done=True, finish_reason='stop')
+                elif len(inner.requests) == 2:
+                    yield velox.LLMChunk(native_tool_calls=calls, done=True, finish_reason='tool_calls')
+                else:
+                    yield velox.LLMChunk(text='Here are partial results.', done=True, finish_reason='stop')
+        self.runtime.llm = endpoint = Endpoint(self.storage, [])
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, 'Begin', self.eid)
+        task = self.runtime.running[self.cid]
+        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.sleep(.05)
+        self.queue_chat('Get the worker to wrap up now')
+        for _ in range(200):
+            if self.aruntime._take_agent_steering(child['agent_id'], []): break
+            await asyncio.sleep(.01)
+        self.assertTrue(self.aruntime._take_agent_steering(child['agent_id'], []))
+        self.assertEqual(self.agents.load_agent(child['agent_id'])['status'], 'queued')
+        self.agents.update_agent(child['agent_id'], {'status':'succeeded'})
+        await asyncio.wait_for(task, 5)
+        self.assertEqual(len(endpoint.requests), 3)
+
+    async def test_agent_committed_tool_result_survives_steering_recovery(self):
+        agent = self.agent(); aid = agent['agent_id']
+        call = self.tools.convert_openai_tool_call(self.native_calls(1)[0])
+        pending, _, _ = self.aruntime._agent_pending_tool_record(call, 1)
+        original = {'ok':True,'tool_name':'time_now','tool_call_id':pending['execution_id'],'result':{'evidence':'COMMITTED_SIDE_EFFECT'}}
+        pending.update(execution_started=True, execution_result=original)
+        self.agents.update_agent(aid, {'status':'running','pending_tool_call':pending})
+        self.aruntime.steer(aid, 'RECOVERY_GUIDANCE')
+        messages, _ = self.aruntime._conversation_from_transcript(agent)
+        messages.append(velox.assistant_message_for_openai_tool_calls('', [call['provider_tool_call']]))
+        with mock.patch.object(self.tools, 'execute_tool_call', side_effect=AssertionError('Side effect repeated')):
+            ok, _ = await self.aruntime._execute_pending_tool(aid, self.agents.load_agent(aid), messages)
+        self.assertTrue(ok); self.assertIn('COMMITTED_SIDE_EFFECT', json.dumps(messages)); self.assertIn('RECOVERY_GUIDANCE', json.dumps(messages))
+
+    def test_agent_steering_ui_binds_numeric_identity_and_rejects_finished_target(self):
+        agent = self.agent()
+        panel = object.__new__(velox.Panels)
+        panel.services = SimpleNamespace(agents=self.agents, agent_runtime=self.aruntime)
+        panel.state = velox.UIState()
+        panel._open_agent_steering(str(agent['task_run_id']))
+        self.assertEqual(panel.state.modal['display_id'], agent['task_run_id'])
+        self.assertEqual(panel.state.modal['agent_id'], agent['agent_id'])
+        actions = panel._agent_row_context_items(agent)
+        self.assertTrue(next(row for row in actions if row['action']=='steer')['enabled'])
+        self.agents.update_agent(agent['agent_id'], {'status':'failed'})
+        with self.assertRaises(ValueError): panel._open_agent_steering(agent['agent_id'])
+
+    def test_steering_modal_cancel_and_send_use_bound_agent_and_keep_errors_visible(self):
+        agent = self.agent()
+        panel = object.__new__(velox.Panels)
+        panel.services = SimpleNamespace(agents=self.agents, agent_runtime=self.aruntime)
+        panel.state = velox.UIState()
+        panel.widgets = mock.Mock()
+        panel.widgets.font = SimpleNamespace(line_h=20)
+        panel.widgets.renderer = mock.Mock()
+        panel._draw_card_title_text = mock.Mock()
+        panel.widgets.multiline_text_input.return_value = 'Return partial results'
+        panel.widgets.button.side_effect = lambda wid,*a,**k: wid=='modal.steering.send'
+        panel._open_agent_steering(agent['agent_id'])
+        panel._draw_agent_steering_modal(velox.Rect(0,0,1280,720), panel.state.modal)
+        self.assertIsNone(panel.state.modal)
+        self.assertEqual(len(self.aruntime._take_agent_steering(agent['agent_id'], [])),1)
+        panel._open_agent_steering(agent['agent_id'])
+        self.agents.update_agent(agent['agent_id'], {'status':'succeeded'})
+        panel._draw_agent_steering_modal(velox.Rect(0,0,1280,720), panel.state.modal)
+        self.assertIn('finished',panel.state.modal['error'])
+        panel.widgets.button.side_effect = lambda wid,*a,**k: wid=='modal.steering.cancel'
+        panel._draw_agent_steering_modal(velox.Rect(0,0,1280,720), panel.state.modal)
+        self.assertIsNone(panel.state.modal)
+
+    async def test_chat_skipped_batch_does_not_exhaust_tool_budget(self):
+        config=self.storage.load_config(); config['tools']['chat_max_tool_iterations']=2; self.storage.write_config(config)
+        await self.chat_scenario(count=2)
+
+    async def test_agent_skipped_batch_does_not_exhaust_tool_budget(self):
+        config=self.storage.load_config(); config['tools']['agent_max_iterations']=2; self.storage.write_config(config)
+        await self.agent_scenario()
+
+    async def test_agent_steering_result_replays_exactly_after_delivery_before_pending_clear(self):
+        agent=self.agent(); aid=agent['agent_id']
+        call=self.tools.convert_openai_tool_call(self.native_calls(1)[0])
+        pending,_,_=self.aruntime._agent_pending_tool_record(call,1)
+        self.agents.update_agent(aid,{'status':'running','pending_tool_call':pending})
+        self.aruntime.steer(aid,'EXACT_CRASH_GUIDANCE')
+        self.agents.append_event(aid,'llm_output',{'text':'','iteration':1,'native_tool_calls':[call['provider_tool_call']]})
+        messages,_=self.aruntime._conversation_from_transcript(self.agents.load_agent(aid))
+        original=self.agents.update_agent
+        def interrupted_update(agent_id,patch):
+            if patch.get('pending_tool_call','not clearing') is None: raise OSError('Crash before pending clear')
+            return original(agent_id,patch)
+        with mock.patch.object(self.agents,'update_agent',side_effect=interrupted_update), \
+             mock.patch.object(self.tools,'execute_tool_call',side_effect=AssertionError('Skipped side effect')):
+            with self.assertRaisesRegex(OSError,'Crash before'):
+                await self.aruntime._execute_pending_tool(aid,self.agents.load_agent(aid),messages)
+        fresh=velox.AgentRuntime(self.storage,velox.AgentStore(self.storage),self.chats,velox.ContextAssembler(self.paths),self.llm,self.tools)
+        recovered,_=fresh._conversation_from_transcript(fresh.agents.load_agent(aid))
+        with mock.patch.object(self.tools,'execute_tool_call',side_effect=AssertionError('Replay side effect')):
+            ok,_=await fresh._execute_pending_tool(aid,fresh.agents.load_agent(aid),recovered)
+        self.assertTrue(ok);self.assertEqual(recovered,messages)
+        self.assertEqual(json.dumps(recovered).count('EXACT_CRASH_GUIDANCE'),1)
+        self.assertEqual(fresh._take_agent_steering(aid,recovered),[])
+
+    async def test_chat_steering_arriving_during_final_commit_is_not_stranded(self):
+        endpoint=_ScriptedLLM(self.storage,[[velox.LLMChunk(text='First completed response.',done=True,finish_reason='stop')],
+                                             [velox.LLMChunk(text='Adjusted final response.',done=True,finish_reason='stop')]])
+        self.runtime.llm=endpoint
+        original=self.runtime._update_turn_io;queued=False
+        async def update(scope_id,chat_id,turn_id,patch,**kwargs):
+            nonlocal queued
+            if patch.get('status')=='complete' and not queued:
+                queued=True;self.queue_chat('LATE_COMMIT_GUIDANCE')
+            return await original(scope_id,chat_id,turn_id,patch,**kwargs)
+        with mock.patch.object(self.runtime,'_update_turn_io',side_effect=update):
+            self.runtime.send_from_ui(velox.APP_SCOPE_ID,self.cid,'Original request',self.eid)
+            await asyncio.wait_for(self.runtime.running[self.cid],5)
+            for _ in range(200):
+                await asyncio.sleep(.01)
+                if not self.runtime.is_running(self.cid):break
+            if self.runtime.is_running(self.cid):await asyncio.wait_for(self.runtime.running[self.cid],5)
+        self.assertEqual(len(endpoint.requests),2)
+        self.assertIn('LATE_COMMIT_GUIDANCE',json.dumps(endpoint.requests[-1].messages))
+        turns=self.chats.load_turns(velox.APP_SCOPE_ID,self.cid)
+        self.assertEqual(sum(t['text']=='Original request' for t in turns),1)
+        self.assertFalse(self.runtime._chat_steering_pending(self.cid))
+
+    def test_skipped_tool_row_cannot_look_like_successful_execution(self):
+        panel=object.__new__(velox.Panels)
+        result=velox.steering_skipped_tool_result('time_now')
+        self.assertEqual(panel._tool_row_state(result)[0],'steered')
+        self.assertIn('Not executed — steered',panel._tool_row_summary(result))
+        self.assertEqual(panel._tool_summary_text(result),'Not executed — steered: time_now')
+        self.assertNotEqual(panel._tool_row_state(result)[1],panel._tool_row_state({'ok':True,'status':'complete'})[1])
+
+    async def test_chat_stop_signal_fences_late_commit_followup(self):
+        endpoint=_ScriptedLLM(self.storage,[[velox.LLMChunk(text='First completed response.',done=True,finish_reason='stop')],
+                                             [velox.LLMChunk(text='MUST_NOT_RUN',done=True,finish_reason='stop')]])
+        self.runtime.llm=endpoint
+        original=self.runtime._update_turn_io;queued=False
+        async def update(scope_id,chat_id,turn_id,patch,**kwargs):
+            nonlocal queued
+            result=await original(scope_id,chat_id,turn_id,patch,**kwargs)
+            if patch.get('status')=='complete' and not queued:
+                queued=True;self.queue_chat('Stopped late guidance')
+                self.runtime._signal_chat_request_cancel(self.cid)
+            return result
+        with mock.patch.object(self.runtime,'_update_turn_io',side_effect=update):
+            self.runtime.send_from_ui(velox.APP_SCOPE_ID,self.cid,'Original request',self.eid)
+            await asyncio.wait_for(self.runtime.running[self.cid],5)
+            await asyncio.sleep(.1)
+            if self.runtime.is_running(self.cid):await asyncio.wait_for(self.runtime.running[self.cid],5)
+        self.assertEqual(len(endpoint.requests),1)
+
+    async def test_chat_agent_report_final_commit_steering_is_not_stranded(self):
+        self.user('Read the agent evidence.')
+        agent=self.agent()
+        completed=self.agents.update_agent(agent['agent_id'],{'status':'succeeded','final_output':'Agent evidence','final_message':'Done'})
+        endpoint=_ScriptedLLM(self.storage,[[velox.LLMChunk(text='Agent report summary.',done=True,finish_reason='stop')],
+                                             [velox.LLMChunk(text='Adjusted report guidance.',done=True,finish_reason='stop')]])
+        self.runtime.llm=endpoint
+        original=self.runtime._update_turn_io;queued=False
+        async def update(scope_id,chat_id,turn_id,patch,**kwargs):
+            nonlocal queued
+            result=await original(scope_id,chat_id,turn_id,patch,**kwargs)
+            if patch.get('status')=='complete' and not queued:
+                queued=True;self.queue_chat('LATE_AGENT_REPORT_GUIDANCE')
+            return result
+        with mock.patch.object(self.runtime,'_update_turn_io',side_effect=update):
+            task=self.runtime.enqueue_agent_report(completed)
+            await asyncio.wait_for(task,5)
+            for _ in range(200):
+                await asyncio.sleep(.01)
+                if not self.runtime.is_running(self.cid):break
+            if self.runtime.is_running(self.cid):await asyncio.wait_for(self.runtime.running[self.cid],5)
+        self.assertEqual(len(endpoint.requests),2)
+        self.assertIn('LATE_AGENT_REPORT_GUIDANCE',json.dumps(endpoint.requests[-1].messages))
+        self.assertFalse(self.runtime._chat_steering_pending(self.cid))
 
 
 class PromptStabilityTests(_AsyncRuntimeFixture):
@@ -44273,12 +44692,12 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 class UnifiedReleaseVersionTests(unittest.TestCase):
     def test_current_application_and_compatibility_versions(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 318)
+        self.assertEqual(velox.CURRENT_VERSION, 319)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 316)
-        self.assertEqual(velox.APP_VERSION, 'velox.v318')
-        self.assertEqual(velox.SOURCE_REVISION, '318')
-        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V318]')
-        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/318')
+        self.assertEqual(velox.APP_VERSION, 'velox.v319')
+        self.assertEqual(velox.SOURCE_REVISION, '319')
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V319]')
+        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/319')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v316')
         header = Path(velox.__file__).read_text(encoding='utf-8').splitlines()[:3]
         self.assertIn('# Every commit must bump CURRENT_VERSION (for example, 316 -> 317), no exceptions.', header)
