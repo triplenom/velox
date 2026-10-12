@@ -87,6 +87,12 @@ To steer a background agent, right-click its Dashboard row and choose **Steer ag
 
 Chats and ordinary agents can call `agents_steer(agent_id, message)` with a Dashboard numeric ID (as text) or Agent UUID. Tool access remains subject to the Agent policy, and a model may steer only agents in its source chat. Independent Reviewers cannot steer or receive steering. Steering is guidance, not cancellation or automatic acceptance: partial results must be labelled honestly, and active Checklist requirements are not silently marked complete. A paused task retains guidance until resumed. Finished agents reject steering; use Pause or Stop when you need execution held or cancelled.
 
+Each steering message permits up to **100,000 characters**, with up to **64 undelivered messages per task**. Oversized messages and full queues are rejected without clearing the draft or attachments. These limits are separate from the tool-evidence output cap: accepted guidance is not shortened when tool evidence is truncated, and the latest steering stays exact through context compaction.
+
+Steering records distinguish direct user instructions, chat-assistant relays and agent-originated guidance. A relay does not override user constraints, tool permissions or independent verification. **Stop** retires undelivered guidance for the stopped chat request while retaining it, and any attachments, in chronological history; it cannot become a fresh correction to a later request. Pause and ordinary shutdown retain resumable guidance.
+
+Recovery closes every outstanding call in an invalidated native proposal before requesting more inference. Saved tool results and image handoffs are reused, not rewritten or repeated. An interrupted external action whose outcome was not saved remains explicitly unknown; it is not silently executed again or presented as an unexecuted skip.
+
 Tools run with your account's permissions, **not in an operating-system sandbox**. Prompted scopes and ownership checks do not restrict general filesystem access. Read [SECURITY.md](SECURITY.md) before using important files or private accounts. Endpoint configuration, account credential files and debug exports deserve protection.
 
 ## Skills and personalization

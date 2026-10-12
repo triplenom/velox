@@ -29291,6 +29291,776 @@ class SteeringRuntimeTests(_AsyncRuntimeFixture):
         self.assertFalse(self.runtime._chat_steering_pending(self.cid))
 
 
+class SteeringHardeningTests(_AsyncRuntimeFixture):
+    """Behavioral regressions for steering delivery, recovery and limits."""
+
+    def setUp(self):
+        super().setUp()
+        self.tools.bind_agent_runtime(self.aruntime)
+
+    def _send(self, text):
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, text, self.eid)
+
+    def _provider(self, rounds, hook=None):
+        class Endpoint(_ScriptedLLM):
+            async def response(inner, request):
+                inner.requests.append(copy.deepcopy(request))
+                if hook is not None:
+                    value = hook(len(inner.requests))
+                    if inspect.isawaitable(value):
+                        await value
+                if not inner.rounds:
+                    raise AssertionError("Unexpected additional inference")
+                return inner.rounds.pop(0)
+
+            async def chat_completions_stream(inner, request):
+                row = await inner.response(request)
+                yield velox.LLMChunk(text=row.get("text", ""),
+                    native_tool_calls=row.get("tool_calls", []), done=True,
+                    finish_reason=row.get("finish_reason", "stop"))
+
+            async def chat_completions_once_full(inner, request):
+                return await inner.response(request)
+
+        return Endpoint(self.storage, copy.deepcopy(rounds))
+
+    @staticmethod
+    def _calls(count=1, image=False):
+        return [_make_test_provider_call(f"v320-call-{i}",
+            "image_analyze" if image else "time_now",
+            {"path": f"image-{i}.png", "prompt": "Inspect"} if image else {})
+            for i in range(count)]
+
+    async def _settle(self):
+        for _ in range(12):
+            task = self.runtime.running.get(self.cid)
+            if task is None:
+                return
+            await asyncio.wait_for(asyncio.shield(task), 10)
+            await asyncio.sleep(0)
+        self.fail("Chat did not settle")
+
+    def _assert_protocol(self, messages):
+        # Check each batch, not global provider IDs: IDs may repeat in later rounds.
+        pending = set()
+        for row in messages:
+            if row.get("role") == "tool":
+                identity = row["tool_call_id"]
+                self.assertIn(identity, pending, "Duplicate or orphan tool result")
+                pending.remove(identity)
+            else:
+                self.assertFalse(pending, "A native batch was left unanswered")
+                calls = row.get("tool_calls", [])
+                pending = {call["id"] for call in calls}
+                self.assertEqual(len(pending), len(calls))
+        self.assertFalse(pending, "Incomplete final native batch")
+        request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, messages)
+        for build in (self.llm._chat_payload_and_headers,
+                      self.llm._responses_payload_and_headers):
+            wire = build(request, stream=False)[2]
+            self.assertNotIn("_velox_steering_ids", wire.decode("utf-8"))
+
+    async def _long_guidance(self, agent_mode):
+        config = self.storage.load_config()
+        config["tools"]["tool_result_max_chars"] = 1024
+        self.storage.write_config(config)
+        token = "V320_DO_NOT_DELETE_THE_PROJECT"
+        guidance = "x" * 4000 + token + "y" * 4000
+        target = self.agent() if agent_mode else None
+        def steer(index):
+            if index == 1:
+                if agent_mode:
+                    self.aruntime.steer(target["agent_id"], guidance)
+                else:
+                    self._send(guidance)
+        terminal = {"text": 'Partial results\n$$AGENT_PROGRESS: {"message":"Done","percent":100}'}
+        endpoint = self._provider([
+            {"tool_calls": self._calls(), "finish_reason": "tool_calls"}, terminal], steer)
+        with mock.patch.object(self.tools, "execute_tool_call",
+                               side_effect=AssertionError("Stale tool executed")):
+            if agent_mode:
+                self.aruntime.llm = endpoint
+                await asyncio.wait_for(self.aruntime.start_agent(target["agent_id"]), 10)
+            else:
+                self.runtime.llm = endpoint
+                self._send("Start work")
+                await self._settle()
+        self.assertEqual(len(endpoint.requests), 2)
+        incoming = endpoint.requests[-1].messages
+        self.assertEqual(json.dumps(incoming).count(token), 1)
+        self._assert_protocol(incoming)
+        replay = (self.aruntime._conversation_from_transcript(
+            self.agents.load_agent(target["agent_id"]))[0] if agent_mode else self.messages())
+        self.assertEqual(json.dumps(replay).count(token), 1)
+        self._assert_protocol(replay)
+
+    async def test_chat_guidance_survives_tool_output_cap_and_replay(self):
+        await self._long_guidance(False)
+
+    async def test_agent_guidance_survives_tool_output_cap_and_replay(self):
+        await self._long_guidance(True)
+
+    def test_guidance_bypasses_evidence_cap_without_disabling_evidence_truncation(self):
+        config = self.storage.load_config()
+        config["tools"]["tool_result_max_chars"] = 1024
+        self.storage.write_config(config)
+        result = {"ok": True, "tool_name": "time_now",
+                  "result": {"stdout": "z" * 20000}}
+        # Exercise a previously rendered but not yet committed result, too.
+        velox._tool_result_payload(self.storage, result)
+        guidance = [{"id": "s1", "content": "x" * 4000 + "KEEP_MIDDLE" + "y" * 4000}]
+        velox.attach_steering_to_tool_result(result, guidance)
+        text = velox._tool_result_payload(self.storage, result)
+        payload = json.loads(text)
+        self.assertEqual(payload["steering_messages"], guidance)
+        self.assertTrue(payload["truncation"]["truncated"])
+        self.assertLess(len(payload["result"]["stdout"]), 20000)
+        self.assertEqual(velox._tool_result_payload(self.storage, result), text)
+
+    async def _recover(self, count=1, executed=False, newer=False, image=False):
+        calls = self._calls(count, image)
+        slots = [self.aruntime._agent_pending_tool_record(
+            self.tools.convert_openai_tool_call(call), 1)[0] for call in calls]
+        if executed:
+            slots[0].update(execution_started=True, execution_result={
+                "ok": True, "tool_name": "image_analyze" if image else "time_now",
+                "tool_call_id": slots[0]["execution_id"],
+                "result": {"saved": "V320_COMMITTED_EVIDENCE"}})
+        record = {"parallel_image_batch": True, "calls": slots} if image else slots[0]
+        aid = self.agent()["agent_id"]
+        self.agents.update_agent(aid, {"status": "running", "pending_tool_call": record})
+        self.agents.append_event(aid, "llm_output", {
+            "text": "", "iteration": 1, "native_tool_calls": calls})
+        messages, _ = self.aruntime._conversation_from_transcript(self.agents.load_agent(aid))
+        self.aruntime.steer(aid, "V320_GUIDANCE_A")
+        original = self.agents.update_agent
+        def crash(agent_id, patch):
+            if patch.get("pending_tool_call", "not-clearing") is None:
+                raise OSError("V320 crash before pending clear")
+            return original(agent_id, patch)
+        with mock.patch.object(self.tools, "execute_tool_call",
+                               side_effect=AssertionError("Unexpected side effect")):
+            with mock.patch.object(self.agents, "update_agent", side_effect=crash):
+                with self.assertRaisesRegex(OSError, "V320 crash"):
+                    await self.aruntime._execute_pending_tool(
+                        aid, self.agents.load_agent(aid), messages)
+            committed = copy.deepcopy([row for row in messages if row["role"] == "tool"])
+            self.assertTrue(committed)
+            fresh = velox.AgentRuntime(self.storage, velox.AgentStore(self.storage),
+                self.chats, velox.ContextAssembler(self.paths), self.llm, self.tools)
+            if newer:
+                fresh.steer(aid, "V320_GUIDANCE_B")
+            recovered, _ = fresh._conversation_from_transcript(fresh.agents.load_agent(aid))
+            ok, diagnostic = await fresh._execute_pending_tool(
+                aid, fresh.agents.load_agent(aid), recovered)
+        self.assertTrue(ok, diagnostic)
+        results = [row for row in recovered if row["role"] == "tool"]
+        self.assertEqual(results[:len(committed)], committed, "Committed rows were rewritten")
+        self.assertEqual(len(results), count)
+        self._assert_protocol(recovered)
+        payloads = [json.loads(row["content"]) for row in results]
+        self.assertEqual(sum(row.get("executed") is not False for row in payloads), int(executed))
+        current = fresh.agents.load_agent(aid)
+        self.assertIsNone(current["pending_tool_call"])
+        self.assertEqual(current["tool_call_count"], int(executed))
+        self.assertEqual(current["tool_failure_count"], 0)
+        if executed:
+            self.assertIn("V320_COMMITTED_EVIDENCE", json.dumps(recovered))
+        self.assertEqual(fresh._take_agent_steering(aid, recovered), [])
+        replay, _ = fresh._conversation_from_transcript(current)
+        self.assertEqual(replay, recovered)
+        for token in (["V320_GUIDANCE_A", "V320_GUIDANCE_B"] if newer else ["V320_GUIDANCE_A"]):
+            self.assertEqual(json.dumps(replay).count(token), 1)
+        self._assert_protocol(replay)
+
+    async def test_single_skipped_call_is_not_dispatched_after_crash(self):
+        await self._recover()
+
+    async def test_two_call_skipped_batch_is_complete_after_crash(self):
+        await self._recover(count=2)
+
+    async def test_new_guidance_does_not_rewrite_committed_result_after_crash(self):
+        await self._recover(executed=True, newer=True)
+
+    async def test_recovered_committed_first_call_closes_stale_second_call(self):
+        await self._recover(count=2, executed=True, newer=True)
+
+    async def test_parallel_image_recovery_preserves_completed_and_skipped_results(self):
+        await self._recover(count=2, executed=True, newer=True, image=True)
+
+    async def _stop_order(self, restart):
+        entered = asyncio.Event()
+        async def hold(index):
+            entered.set()
+            await asyncio.Event().wait()
+        self.runtime.llm = self._provider([{"text": "Unreachable"}], hold)
+        self._send("Original task")
+        owner = self.runtime.running[self.cid]
+        await asyncio.wait_for(entered.wait(), 5)
+        self._send("V320_OLD_LONG_REPORT")
+        self.runtime.cancel(self.cid)
+        await self.runtime.wait_for_user_stops()
+        await asyncio.gather(owner, return_exceptions=True)
+        await asyncio.sleep(0)
+        if restart:
+            self.runtime = velox.ChatRuntime(self.storage, velox.ChatStore(self.storage),
+                velox.ContextAssembler(self.paths), self.llm, self.tools)
+        endpoint = self._provider([{"text": "One sentence."}])
+        self.runtime.llm = endpoint
+        self._send("V320_NEW_ONE_SENTENCE")
+        await self._settle()
+        body = json.dumps(endpoint.requests[0].messages)
+        self.assertEqual(body.count("V320_OLD_LONG_REPORT"), 1)
+        self.assertLess(body.index("V320_OLD_LONG_REPORT"), body.index("V320_NEW_ONE_SENTENCE"))
+        self.assertFalse(self.runtime._chat_steering_pending(self.cid))
+
+    async def test_stop_does_not_redeliver_old_guidance_after_new_request(self):
+        await self._stop_order(False)
+
+    async def test_stop_then_restart_preserves_guidance_chronology(self):
+        await self._stop_order(True)
+
+    def test_latest_steering_and_complete_native_batch_survive_every_compaction_pass(self):
+        messages = [{"role": "system", "content": "System"}, {"role": "user", "content": "Original"},
+            velox.assistant_message_for_openai_tool_calls("", self._calls(2)),
+            {"role": "tool", "tool_call_id": "v320-call-0", "content": "CURRENT_STEERING", "_velox_steering_ids": ["s1"]},
+            {"role": "tool", "tool_call_id": "v320-call-1", "content": "Other result"}]
+        messages.extend({"role": "assistant", "content": f"Old prose {i}"} for i in range(12))
+        messages.extend([velox.assistant_message_for_openai_tool_calls("", [
+            _make_test_provider_call("later", "time_now", {})]),
+            {"role": "tool", "tool_call_id": "later", "content": "Later evidence"}])
+        original = copy.deepcopy(messages)
+        for preserve in (self.runtime._chat_compaction_preserved_indices,
+                         self.aruntime._compaction_preserved_indices):
+            for number in (1, 2, 3):
+                with self.subTest(owner=preserve.__qualname__, pass_number=number):
+                    kept = preserve(messages, pass_number=number)
+                    self.assertTrue({2, 3, 4}.issubset(kept), kept)
+        self.assertEqual(messages, original)
+
+    def test_agent_message_and_pending_limits_are_atomic_and_release_capacity(self):
+        aid = self.agent()["agent_id"]
+        before = self.agents.load_transcript(aid)
+        for invalid in (None, 123, "", "   ", "x" * 100001):
+            with self.subTest(value_type=type(invalid).__name__):
+                with self.assertRaises(ValueError):
+                    self.aruntime.steer(aid, invalid)
+                self.assertEqual(self.agents.load_transcript(aid), before)
+        self.aruntime.steer(aid, "x" * 100000)
+        for i in range(63):
+            self.aruntime.steer(aid, f"queued {i}")
+        full = self.agents.load_transcript(aid)
+        with self.assertRaises(ValueError):
+            self.aruntime.steer(aid, "Queue overflow")
+        self.assertEqual(self.agents.load_transcript(aid), full)
+        messages, _ = self.aruntime._conversation_from_transcript(self.agents.load_agent(aid))
+        guidance = self.aruntime._take_agent_steering(aid, messages)
+        self.assertEqual(len(guidance), 64)
+        self.aruntime._append_agent_steering(aid, messages, guidance)
+        self.assertTrue(self.aruntime.steer(aid, "Capacity released")["queued"])
+
+    async def test_busy_chat_message_and_pending_limits_do_not_persist_rejected_input(self):
+        entered = asyncio.Event()
+        async def hold(index):
+            entered.set()
+            await asyncio.Event().wait()
+        self.runtime.llm = self._provider([{"text": "Unreachable"}], hold)
+        self._send("Start")
+        owner = self.runtime.running[self.cid]
+        await asyncio.wait_for(entered.wait(), 5)
+        try:
+            before = self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)
+            with self.assertRaises(ValueError):
+                self._send("x" * 100001)
+            self.assertEqual(self.chats.load_turns(velox.APP_SCOPE_ID, self.cid), before)
+            self._send("x" * 100000)
+            for i in range(63):
+                self._send(f"queued {i}")
+            full = self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)
+            with self.assertRaises(ValueError):
+                self._send("Queue overflow")
+            self.assertEqual(self.chats.load_turns(velox.APP_SCOPE_ID, self.cid), full)
+            self.assertIs(self.runtime.running[self.cid], owner)
+        finally:
+            self.runtime.cancel(self.cid)
+            await self.runtime.wait_for_user_stops()
+            await asyncio.gather(owner, return_exceptions=True)
+
+    async def test_guidance_preserves_user_chat_and_agent_origins(self):
+        caller, target = self.agent(), self.agent()
+        aid = target["agent_id"]
+        self.aruntime.steer(aid, "Direct user guidance")
+        await self.tools.tool_agents_steer(
+            velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid),
+            {"agent_id": aid, "message": "Chat assistant guidance"})
+        await self.tools.tool_agents_steer(velox.ToolContext(velox.APP_SCOPE_ID,
+            chat_id=self.cid, agent_id=caller["agent_id"], agent_task_run_id=caller["task_run_id"]),
+            {"agent_id": aid, "message": "Sibling agent guidance"})
+        guidance = self.aruntime._take_agent_steering(aid, [])
+        self.assertEqual(len(guidance), 3)
+        self.assertIn("NEW USER STEERING MESSAGE", guidance[0]["content"])
+        self.assertIn("CHAT ASSISTANT STEERING MESSAGE", guidance[1]["content"])
+        self.assertIn("AGENT STEERING MESSAGE", guidance[2]["content"])
+        self.assertIn(caller["agent_id"], guidance[2]["content"])
+        self.assertNotIn("NEW USER STEERING MESSAGE", guidance[1]["content"])
+        self.assertNotIn("NEW USER STEERING MESSAGE", guidance[2]["content"])
+
+    async def test_cancelled_parent_is_rejected_by_actual_tool_dispatch(self):
+        parent = self.agent()
+        child = self.agents.create_agent(self.cid, "Child", parent_agent_id=parent["agent_id"],
+                                        parent_task_run_id=parent["task_run_id"])
+        self.agents.update_agent(parent["agent_id"], {"status": "cancelled"})
+        call = self.tools.convert_openai_tool_call(_make_test_provider_call("terminal-parent", "agents_steer",
+            {"agent_id": child["agent_id"], "message": "V320_FORBIDDEN_MUTATION"}))
+        before = self.agents.load_transcript(child["agent_id"])
+        result = await self.tools.execute_tool_call(velox.APP_SCOPE_ID, call,
+            chat_id=self.cid, agent_id=parent["agent_id"], endpoint_profile_id=self.eid, task_kind="agent")
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(self.agents.load_transcript(child["agent_id"]), before)
+
+
+    def _seed_recovery_batch(self, *, completed=False, unknown=False, image=False):
+        agent = self.agent()
+        aid = agent["agent_id"]
+        calls = self._calls(2, image)
+        slots = [self.aruntime._agent_pending_tool_record(self.tools.convert_openai_tool_call(call), 1)[0]
+                 for call in calls]
+        if completed:
+            slots[0].update(execution_started=True, execution_result={
+                "ok": True, "tool_name": "image_analyze" if image else "time_now",
+                "tool_call_id": slots[0]["execution_id"], "result": {"evidence": "SAVED_EXTERNAL_EFFECT"}})
+        elif unknown:
+            slots[0].update(execution_started=True, execution_started_at=velox.now_iso())
+        record = {"parallel_image_batch": True, "calls": slots} if image else slots[0]
+        self.agents.update_agent(aid, {"status": "running", "pending_tool_call": record})
+        self.agents.append_event(aid, "llm_output", {"iteration": 1, "text": "", "native_tool_calls": calls})
+        self.aruntime.steer(aid, "BOUNDARY_GUIDANCE")
+        messages, _ = self.aruntime._conversation_from_transcript(self.agents.load_agent(aid))
+        return aid, calls, slots, messages
+
+    def _fresh_agent_runtime(self):
+        fresh = velox.AgentRuntime(self.storage, velox.AgentStore(self.storage), self.chats,
+                                  velox.ContextAssembler(self.paths), self.llm, self.tools)
+        self.addAsyncCleanup(fresh.shutdown)
+        return fresh
+
+    async def test_agent_crash_after_batch_invalidation_before_first_result(self):
+        aid, _calls, _slots, messages = self._seed_recovery_batch()
+        append = self.agents.append_event
+        def fail_first_result(agent_id, kind, data=None):
+            if kind == "tool_result":
+                raise OSError("crash before first result")
+            return append(agent_id, kind, data)
+        with mock.patch.object(self.tools, "execute_tool_call", side_effect=AssertionError("Stale dispatch")):
+            with mock.patch.object(self.agents, "append_event", side_effect=fail_first_result):
+                with self.assertRaisesRegex(OSError, "before first result"):
+                    await self.aruntime._execute_pending_tool(aid, self.agents.load_agent(aid), messages)
+            events = self.agents.load_transcript(aid)
+            self.assertEqual(sum(e["kind"] == "steering_batch_invalidated" for e in events), 1)
+            self.assertFalse(any(e["kind"] == "tool_result" for e in events))
+            fresh = self._fresh_agent_runtime()
+            replay, _ = fresh._conversation_from_transcript(fresh.agents.load_agent(aid))
+            self.assertTrue((await fresh._execute_pending_tool(aid, fresh.agents.load_agent(aid), replay))[0])
+        self._assert_protocol(replay)
+        results = [json.loads(row["content"]) for row in replay if row["role"] == "tool"]
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(row["executed"] is False for row in results))
+        self.assertEqual(json.dumps(replay).count("BOUNDARY_GUIDANCE"), 1)
+        self.assertIsNone(self.agents.load_agent(aid)["pending_tool_call"])
+        self.assertEqual(self.agents.load_agent(aid)["tool_call_count"], 0)
+
+    async def test_agent_crash_after_pending_clear_before_next_inference(self):
+        # Legacy V319 boundary: only the first skipped row committed, then the
+        # single pending slot cleared. No write-ahead invalidation exists yet.
+        aid, calls, slots, messages = self._seed_recovery_batch()
+        guidance = self.aruntime._take_agent_steering(aid, messages)
+        result = velox.steering_skipped_tool_result("time_now")
+        result.update(tool_call_id=slots[0]["execution_id"], provider_tool_call_id=calls[0]["id"],
+                      provider_tool_call=calls[0])
+        velox.attach_steering_to_tool_result(result, guidance)
+        velox._record_agent_tool_result(self.aruntime, aid, {"iteration": 1, "result": result})
+        row = {**velox.openai_tool_result_message(calls[0], self.aruntime._tool_result_message(result), name="time_now"),
+               "_velox_steering_ids": [item["id"] for item in guidance]}
+        self.aruntime._append_native_conversation_message(aid, messages, row)
+        self.agents.update_agent(aid, {"pending_tool_call": None})
+        fresh = self._fresh_agent_runtime()
+        endpoint = self._provider([
+            {"tool_calls": [calls[0]], "finish_reason": "tool_calls"},
+            {"text": 'Recovered\n$$AGENT_PROGRESS: {"message":"Done","percent":100}'}])
+        fresh.llm = endpoint
+        executed = []
+        original = self.tools.tools["time_now"].handler
+        async def handler(ctx, args):
+            executed.append(ctx.agent_id)
+            return await original(ctx, args)
+        with mock.patch.object(self.tools.tools["time_now"], "handler", side_effect=handler):
+            await asyncio.wait_for(fresh._run_agent(aid), 10)
+        self.assertEqual(self.agents.load_agent(aid)["status"], "succeeded")
+        self.assertEqual(executed, [aid], "The reused ID denotes NEW work, not an old skip")
+        self.assertEqual(self.agents.load_agent(aid)["tool_call_count"], 1)
+        self.assertEqual(len(endpoint.requests), 2)
+        for request in endpoint.requests:
+            self._assert_protocol(request.messages)
+            self.assertEqual(json.dumps(request.messages).count("BOUNDARY_GUIDANCE"), 1)
+        first_results = [json.loads(row["content"]) for row in endpoint.requests[0].messages if row["role"] == "tool"]
+        self.assertEqual(len(first_results), 2)
+        self.assertTrue(all(row["executed"] is False for row in first_results))
+        replay, _ = fresh._conversation_from_transcript(self.agents.load_agent(aid))
+        self._assert_protocol(replay)
+        self.assertEqual(sum(row["role"] == "tool" for row in replay), 3)
+
+    async def test_recovery_fault_matrix_preserves_results_and_counts_exactly_once(self):
+        phases = ("before_invalidation", "after_invalidation", "after_evidence", "before_conversation",
+                  "after_first_conversation", "after_last_conversation", "before_clear", "after_clear")
+        for phase in phases:
+            with self.subTest(phase=phase):
+                aid, _calls, _slots, messages = self._seed_recovery_batch(completed=True)
+                append, update = self.agents.append_event, self.agents.update_agent
+                committed_count = 0
+                fired = False
+                def crash():
+                    nonlocal fired
+                    fired = True
+                    raise OSError("fault matrix crash")
+                def intercept_event(agent_id, kind, data=None):
+                    nonlocal committed_count
+                    if kind == "steering_batch_invalidated" and phase == "before_invalidation":
+                        crash()
+                    if kind == "conversation_message" and (data or {}).get("role") == "tool" and phase == "before_conversation":
+                        crash()
+                    event = append(agent_id, kind, data)
+                    if kind == "steering_batch_invalidated" and phase == "after_invalidation":
+                        crash()
+                    if kind == "tool_result" and phase == "after_evidence":
+                        crash()
+                    if kind == "conversation_message" and (data or {}).get("role") == "tool":
+                        committed_count += 1
+                        if phase == "after_first_conversation" or phase == "after_last_conversation" and committed_count == 2:
+                            crash()
+                    return event
+                def intercept_update(agent_id, patch):
+                    clear = patch.get("pending_tool_call", "not-clearing") is None
+                    if clear and phase == "before_clear":
+                        crash()
+                    row = update(agent_id, patch)
+                    if clear and phase == "after_clear":
+                        crash()
+                    return row
+                with mock.patch.object(self.tools, "execute_tool_call", side_effect=AssertionError("Side effect replayed")):
+                    with mock.patch.object(self.agents, "append_event", side_effect=intercept_event), \
+                         mock.patch.object(self.agents, "update_agent", side_effect=intercept_update):
+                        with self.assertRaisesRegex(OSError, "matrix crash"):
+                            await self.aruntime._execute_pending_tool(aid, self.agents.load_agent(aid), messages)
+                    self.assertTrue(fired)
+                    saved_rows = [copy.deepcopy(e["data"]) for e in self.agents.load_transcript(aid)
+                                  if e["kind"] == "conversation_message" and e["data"].get("role") == "tool"]
+                    # Changing the evidence cap cannot rewrite committed rows.
+                    config = self.storage.load_config()
+                    config["tools"]["tool_result_max_chars"] = 1024
+                    self.storage.write_config(config)
+                    fresh = self._fresh_agent_runtime()
+                    replay, _ = fresh._conversation_from_transcript(fresh.agents.load_agent(aid))
+                    self.assertTrue((await fresh._execute_pending_tool(aid, fresh.agents.load_agent(aid), replay))[0])
+                    stable = copy.deepcopy(replay)
+                    self.assertTrue((await fresh._execute_pending_tool(aid, fresh.agents.load_agent(aid), replay))[0])
+                self.assertEqual(replay, stable)
+                self._assert_protocol(replay)
+                tool_rows = [r for r in replay if r["role"] == "tool"]
+                self.assertEqual(tool_rows[:len(saved_rows)], saved_rows)
+                self.assertEqual(len(tool_rows), 2)
+                self.assertEqual(json.dumps(replay).count("BOUNDARY_GUIDANCE"), 1)
+                self.assertIn("SAVED_EXTERNAL_EFFECT", json.dumps(replay))
+                record = self.agents.load_agent(aid)
+                self.assertEqual(record["tool_call_count"], 1)
+                self.assertEqual(record["tool_failure_count"], 0)
+                self.assertIsNone(record["pending_tool_call"])
+                events = self.agents.load_transcript(aid)
+                self.assertEqual(sum(e["kind"] == "tool_result" for e in events), 2)
+                self.assertEqual(sum(e["kind"] == "steering_batch_invalidated" for e in events), 1)
+                self.assertEqual(fresh._conversation_from_transcript(record)[0], replay)
+
+    async def test_unknown_outcome_is_reused_not_reexecuted_or_falsely_skipped(self):
+        aid, _calls, _slots, messages = self._seed_recovery_batch(unknown=True, image=True)
+        append = self.agents.append_event
+        def crash_after_evidence(agent_id, kind, data=None):
+            event = append(agent_id, kind, data)
+            if kind == "tool_result":
+                raise OSError("unknown evidence committed")
+            return event
+        with mock.patch.object(self.tools, "execute_tool_call", side_effect=AssertionError("Unknown effect repeated")):
+            with mock.patch.object(self.agents, "append_event", side_effect=crash_after_evidence):
+                with self.assertRaisesRegex(OSError, "unknown evidence"):
+                    await self.aruntime._execute_pending_tool(aid, self.agents.load_agent(aid), messages)
+            evidence = next(e["data"]["result"] for e in self.agents.load_transcript(aid) if e["kind"] == "tool_result")
+            fresh = self._fresh_agent_runtime()
+            replay, _ = fresh._conversation_from_transcript(fresh.agents.load_agent(aid))
+            self.assertTrue((await fresh._execute_pending_tool(aid, fresh.agents.load_agent(aid), replay))[0])
+        self._assert_protocol(replay)
+        results = [json.loads(r["content"]) for r in replay if r["role"] == "tool"]
+        self.assertTrue(results[0]["outcome_unknown"])
+        self.assertNotEqual(results[0].get("executed"), False)
+        self.assertEqual(results[0]["ended_at"], evidence["ended_at"])
+        self.assertIs(results[1]["executed"], False)
+        self.assertEqual(self.agents.load_agent(aid)["tool_call_count"], 1)
+        self.assertEqual(self.agents.load_agent(aid)["tool_failure_count"], 1)
+        self.assertEqual(json.dumps(replay).count("BOUNDARY_GUIDANCE"), 1)
+
+    async def test_recovery_rejects_pending_slot_from_another_proposal(self):
+        aid, _calls, slots, messages = self._seed_recovery_batch(completed=True)
+        slots[0]["llm_output_event_id"] = velox.uuid_v4()
+        self.agents.update_agent(aid, {"pending_tool_call": slots[0]})
+        before = self.agents.load_transcript(aid)
+        with mock.patch.object(self.tools, "execute_tool_call", side_effect=AssertionError("Stale dispatch")):
+            with self.assertRaisesRegex(RuntimeError, "current native proposal"):
+                await self.aruntime._execute_pending_tool(aid, self.agents.load_agent(aid), messages)
+        self.assertEqual(self.agents.load_transcript(aid), before)
+
+    async def test_pending_limits_survive_runtime_recreation_and_release_after_delivery(self):
+        aid = self.agent()["agent_id"]
+        self.user("Original request")
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        self.runtime.running[self.cid] = blocker
+        try:
+            for i in range(64):
+                self._send(f"chat pending {i}")
+                self.aruntime.steer(aid, f"agent pending {i}")
+            fresh_agent = self._fresh_agent_runtime()
+            fresh_chat = velox.ChatRuntime(self.storage, velox.ChatStore(self.storage),
+                velox.ContextAssembler(self.paths), self.llm, self.tools)
+            fresh_chat.running[self.cid] = blocker
+            with self.assertRaises(ValueError):
+                fresh_agent.steer(aid, "Overflow after recreation")
+            with self.assertRaises(ValueError):
+                fresh_chat.steer_from_ui(velox.APP_SCOPE_ID, self.cid, "Overflow after recreation")
+            chat_guidance = fresh_chat._take_chat_steering(velox.APP_SCOPE_ID, self.cid, self.eid, [])
+            self.assertEqual(len(chat_guidance), 64)
+            fresh_chat.steer_from_ui(velox.APP_SCOPE_ID, self.cid, "Capacity released")
+            replay, _ = fresh_agent._conversation_from_transcript(self.agents.load_agent(aid))
+            guidance = fresh_agent._take_agent_steering(aid, replay)
+            self.assertEqual(len(guidance), 64)
+            fresh_agent._append_agent_steering(aid, replay, guidance)
+            self.assertTrue(fresh_agent.steer(aid, "Capacity released")["queued"])
+        finally:
+            blocker.cancel()
+            await asyncio.gather(blocker, return_exceptions=True)
+
+    async def test_concurrent_agent_queue_admission_is_atomic(self):
+        aid = self.agent()["agent_id"]
+        for i in range(63):
+            self.aruntime.steer(aid, f"queued {i}")
+        barrier = threading.Barrier(2)
+        def offer(text):
+            barrier.wait(timeout=5)
+            try:
+                self.aruntime.steer(aid, text)
+                return True
+            except ValueError:
+                return False
+        outcomes = await asyncio.gather(asyncio.to_thread(offer, "Contender A"),
+                                        asyncio.to_thread(offer, "Contender B"))
+        self.assertEqual(sorted(outcomes), [False, True])
+        self.assertEqual(len(self.aruntime._take_agent_steering(aid, [])), 64)
+
+    async def test_composer_and_modal_rejections_preserve_raw_drafts_and_attachments(self):
+        self.user("Original")
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        self.runtime.running[self.cid] = blocker
+        panel = object.__new__(velox.Panels)
+        panel.services = SimpleNamespace(chats=self.chats, chat=self.runtime, agents=self.agents,
+                                         agent_runtime=self.aruntime)
+        panel.state = velox.UIState()
+        panel.state.active_scope_id = velox.APP_SCOPE_ID
+        panel.state.active_chat_id = self.cid
+        panel._ensure_live_chat_for_action = mock.Mock(return_value=True)
+        panel.widgets = mock.Mock()
+        panel.widgets.font = SimpleNamespace(line_h=20)
+        panel.widgets.renderer = mock.Mock()
+        panel._draw_card_title_text = mock.Mock()
+        panel.widgets.button.side_effect = lambda wid, *a, **k: wid == "modal.steering.send"
+        aid = self.agent()["agent_id"]
+        try:
+            # Mostly whitespace still counts toward the limit before trimming.
+            draft = " " * 100000 + "x"
+            attachments = [{"id": "retained-attachment", "filename": "keep.txt"}]
+            panel.state.composer_text = draft
+            panel.state.queued_attachments = copy.deepcopy(attachments)
+            before = self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)
+            panel._send_composer_message()
+            self.assertEqual(panel.state.composer_text, draft)
+            self.assertEqual(panel.state.queued_attachments, attachments)
+            self.assertEqual(self.chats.load_turns(velox.APP_SCOPE_ID, self.cid), before)
+            panel._open_agent_steering(aid)
+            panel.widgets.multiline_text_input.return_value = draft
+            panel._draw_agent_steering_modal(velox.Rect(0, 0, 1280, 720), panel.state.modal)
+            self.assertEqual(panel.state.modal["message"], draft)
+            self.assertIn("100,000", panel.state.modal["error"])
+            self.assertEqual(self.aruntime._take_agent_steering(aid, []), [])
+            for i in range(64):
+                self._send(f"queued {i}")
+            panel.state.composer_text = "Queue full, preserve me"
+            panel._send_composer_message()
+            self.assertEqual(panel.state.composer_text, "Queue full, preserve me")
+            self.assertEqual(panel.state.queued_attachments, attachments)
+        finally:
+            blocker.cancel()
+            await asyncio.gather(blocker, return_exceptions=True)
+
+    async def test_stop_retains_attachment_history_but_not_fresh_steering(self):
+        self.user("Original request")
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        self.runtime.running[self.cid] = blocker
+        path = self.paths.chat_workspace_dir(self.cid) / "steering-history.txt"
+        path.write_text("STOP_RETAINED_ATTACHMENT", encoding="utf-8")
+        attachment = velox.AttachmentStore(self.storage).attach_file(velox.APP_SCOPE_ID, path, "chat", self.cid)
+        self.runtime.send_from_ui(velox.APP_SCOPE_ID, self.cid, "Old instruction", self.eid, attachments=[attachment])
+        self.runtime.cancel(self.cid)
+        await self.runtime.wait_for_user_stops()
+        await asyncio.gather(blocker, return_exceptions=True)
+        old = next(row for row in self.chats.load_turns(velox.APP_SCOPE_ID, self.cid) if row.get("steering"))
+        self.assertEqual(old["steering_retired_reason"], "user_stop")
+        self.assertFalse(old.get("steering_delivered_at"))
+        self.assertEqual(old["attachments"], [attachment])
+        endpoint = self._provider([{"text": "New response"}])
+        self.runtime.llm = endpoint
+        self._send("New authoritative instruction")
+        await self._settle()
+        body = json.dumps(endpoint.requests[0].messages)
+        self.assertIn("STOP_RETAINED_ATTACHMENT", body)
+        self.assertLess(body.index("Old instruction"), body.index("New authoritative instruction"))
+        self.assertNotIn("NEW USER STEERING MESSAGE", body)
+
+    async def test_legacy_pending_steering_is_not_newer_than_a_subsequent_user_request(self):
+        self.user("Original request")
+        old = velox.make_turn(self.cid, "user", "LEGACY_OLD_GUIDANCE", endpoint_profile_id=self.eid)
+        old["steering"] = True
+        self.chats.append_turn(velox.APP_SCOPE_ID, self.cid, old)
+        self.user("LATEST_GENUINE_REQUEST")
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        self.runtime.running[self.cid] = blocker
+        try:
+            self.assertFalse(self.runtime._chat_steering_pending(self.cid))
+            self.assertEqual(self.runtime._take_chat_steering(velox.APP_SCOPE_ID, self.cid, self.eid, []), [])
+            body = json.dumps(self.messages())
+            self.assertLess(body.index("LEGACY_OLD_GUIDANCE"), body.index("LATEST_GENUINE_REQUEST"))
+            self.assertNotIn("NEW USER STEERING MESSAGE", body)
+        finally:
+            blocker.cancel()
+            await asyncio.gather(blocker, return_exceptions=True)
+
+    def test_steering_schema_and_optional_recovery_metadata_keep_data_compatibility(self):
+        schemas = self.aruntime._native_tools_for_agent(self.agent())
+        schema = next(row["function"]["parameters"] for row in schemas if row["function"]["name"] == "agents_steer")
+        self.assertEqual(schema["properties"]["message"]["maxLength"], 100000)
+        self.assertNotIn("source_kind", schema["properties"])
+        self.assertNotIn("source_agent_id", schema["properties"])
+        agent = self.agent()
+        self.assertNotIn("steering_reconciled_batch_id", agent)
+        original = copy.deepcopy(agent)
+        self.assertEqual(velox.validate_agent_record(agent), original)
+        agent["steering_reconciled_batch_id"] = velox.uuid_v4()
+        self.assertEqual(velox.validate_agent_record(agent)["schema"], "agent.v316")
+        agent["steering_reconciled_batch_id"] = "invalid"
+        with self.assertRaises(ValueError):
+            velox.validate_agent_record(agent)
+
+
+    async def test_legacy_image_handoff_is_not_duplicated_or_left_inside_native_batch(self):
+        aid, calls, slots, messages = self._seed_recovery_batch(completed=True, image=True)
+        path = self.paths.chat_workspace_dir(self.cid) / "recovery-pixels.png"
+        path.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII="))
+        result = copy.deepcopy(slots[0]["execution_result"])
+        result.update(provider_tool_call_id=calls[0]["id"], provider_tool_call=calls[0])
+        result["result"] = {velox.CURRENT_CONTEXT_VISION_RESULT_KEY: {
+            "schema": velox.CURRENT_CONTEXT_VISION_HANDOFF_SCHEMA, "absolute_path": str(path),
+            "mime": "image/png", "prompt": "Inspect preserved pixels", "tool_name": "image_analyze",
+            "tool_call_id": result["tool_call_id"]}}
+        velox._record_agent_tool_result(self.aruntime, aid, {"iteration": 1, "result": result})
+        row = {**velox.openai_tool_result_message(calls[0], self.aruntime._tool_result_message(result), name="image_analyze"),
+               "_velox_steering_ids": []}
+        self.aruntime._append_native_conversation_message(aid, messages, row)
+        vision, _ = velox.build_current_context_vision_message(messages, [result], self.llm.resolve_endpoint(self.eid))
+        self.assertIsNotNone(vision)
+        self.aruntime._append_native_conversation_message(aid, messages, vision)
+        # This older serial image path put a user-role pixel handoff between
+        # call 1 and call 2. The first call and its pixels are already committed.
+        self.agents.update_agent(aid, {"pending_tool_call": slots[1], "tool_call_count": 1})
+        path.write_bytes(b"The original pixels are no longer present on disk")
+        fresh = self._fresh_agent_runtime()
+        replay, _ = fresh._conversation_from_transcript(self.agents.load_agent(aid))
+        with mock.patch.object(self.tools, "execute_tool_call", side_effect=AssertionError("Stale image dispatch")):
+            self.assertTrue((await fresh._execute_pending_tool(aid, self.agents.load_agent(aid), replay))[0])
+        self._assert_protocol(replay)
+        images = [r for r in replay if r.get(velox.CURRENT_CONTEXT_VISION_MESSAGE_MARKER)]
+        self.assertEqual(images, [vision], "Existing pixels were reread or duplicated")
+        self.assertEqual([r for r in replay if r["role"] == "tool"][0], row)
+        self.assertEqual(self.agents.load_agent(aid)["tool_call_count"], 1)
+        self.assertEqual(fresh._conversation_from_transcript(self.agents.load_agent(aid))[0], replay)
+        self.assertEqual(json.dumps(replay).count("BOUNDARY_GUIDANCE"), 1)
+        events = self.agents.load_transcript(aid)
+        self.assertEqual(sum(e["kind"] == "steering_batch_reconciled" for e in events), 1)
+        self.assertFalse(any(e["kind"] == "context_compacted" for e in events))
+
+    async def test_steering_invalidates_malformed_proposals_even_at_exhausted_tool_budget(self):
+        agent = self.agent()
+        aid = agent["agent_id"]
+        config = self.storage.load_config()
+        config["tools"]["agent_max_iterations"] = 2
+        self.storage.write_config(config)
+        self.agents.update_agent(aid, {"tool_call_count": 2, "malformed_tool_call_streak": 1})
+        calls = [_make_test_provider_call("bad-call", "time_now", {"unexpected": "argument"}), *self._calls(2)]
+        def steer(index):
+            if index == 1:
+                self.aruntime.steer(aid, "Return partial results without further tool work")
+        endpoint = self._provider([
+            {"tool_calls": calls, "finish_reason": "tool_calls"},
+            {"text": 'Partial results\n$$AGENT_PROGRESS: {"message":"Done","percent":100}'}], steer)
+        self.aruntime.llm = endpoint
+        with mock.patch.object(self.tools, "execute_tool_call", side_effect=AssertionError("Budget exceeded")):
+            await asyncio.wait_for(self.aruntime._run_agent(aid), 10)
+        current = self.agents.load_agent(aid)
+        self.assertEqual(current["status"], "succeeded")
+        self.assertEqual(current["tool_call_count"], 2)
+        self.assertEqual(current["tool_failure_count"], 0)
+        self.assertEqual(current["malformed_tool_call_streak"], 1)
+        self.assertEqual(len(endpoint.requests), 2)
+        self._assert_protocol(endpoint.requests[-1].messages)
+        results = [json.loads(r["content"]) for r in endpoint.requests[-1].messages if r["role"] == "tool"]
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(r["executed"] is False for r in results))
+
+    async def test_failed_steering_retirement_blocks_send_and_retries_from_durable_state(self):
+        self.user("Original request")
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        self.runtime.running[self.cid] = blocker
+        self._send("Pending instruction to retire")
+        original = self.chats._write_all_turns
+        failed = False
+        def write(scope_id, chat_id, turns):
+            nonlocal failed
+            if any(row.get("steering_retired_at") for row in turns):
+                failed = True
+                raise OSError("retirement disk error")
+            return original(scope_id, chat_id, turns)
+        with mock.patch.object(self.chats, "_write_all_turns", side_effect=write):
+            self.runtime.cancel(self.cid)
+            await self.runtime.wait_for_user_stops()
+            self.assertTrue(failed)
+            with self.assertRaisesRegex(RuntimeError, "message was not sent"):
+                self._send("Must not overtake failed retirement")
+            await self.runtime.wait_for_user_stops()
+            self.assertFalse(any(t.get("text") == "Must not overtake failed retirement"
+                                 for t in self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)))
+        self.runtime.cancel(self.cid)
+        await self.runtime.wait_for_user_stops()
+        await asyncio.gather(blocker, return_exceptions=True)
+        fresh_store = velox.ChatStore(self.storage)
+        turns = fresh_store.load_turns(velox.APP_SCOPE_ID, self.cid)
+        old = next(row for row in turns if row.get("steering"))
+        self.assertTrue(old.get("steering_retired_at"))
+        self.assertFalse(old.get("steering_delivered_at"))
+        self.assertFalse(self.runtime._chat_steering_pending(self.cid))
+
+
 class PromptStabilityTests(_AsyncRuntimeFixture):
     def test_established_messages_are_exact_prefix_across_three_turns(self) -> None:
         self.user("First exact request: caf\u00e9 and literal JSON {\"v\": 1}.")
@@ -44692,12 +45462,12 @@ class ChatSubagentEndpointRegressionTests(_AsyncRuntimeFixture):
 
 class UnifiedReleaseVersionTests(unittest.TestCase):
     def test_current_application_and_compatibility_versions(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 319)
+        self.assertEqual(velox.CURRENT_VERSION, 320)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 316)
-        self.assertEqual(velox.APP_VERSION, 'velox.v319')
-        self.assertEqual(velox.SOURCE_REVISION, '319')
-        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V319]')
-        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/319')
+        self.assertEqual(velox.APP_VERSION, 'velox.v320')
+        self.assertEqual(velox.SOURCE_REVISION, '320')
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V320]')
+        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/320')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v316')
         header = Path(velox.__file__).read_text(encoding='utf-8').splitlines()[:3]
         self.assertIn('# Every commit must bump CURRENT_VERSION (for example, 316 -> 317), no exceptions.', header)
