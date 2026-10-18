@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 320
+CURRENT_VERSION = 321
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -4228,6 +4228,7 @@ ENDPOINT_MODEL_TYPE_KIMI_K3 = "kimi_k3"
 ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH = "glm_5_3_flash"
 ENDPOINT_MODEL_TYPE_DEEPSEEK_V4 = "deepseek_v4"
 ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP = "deepseek_v4_flash_vision_exp"
+ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017 = "deepseek_v4_1_flash_1017"
 ENDPOINT_MODEL_TYPE_GEMMA_4 = "gemma_4"
 ENDPOINT_MODEL_TYPE_GPT_5_2 = "gpt_5_2"
 ENDPOINT_MODEL_TYPE_GPT_5_4 = "gpt_5_4"
@@ -4273,6 +4274,7 @@ ENDPOINT_MODEL_TYPES = (
     ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH,
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4,
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
+    ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
     ENDPOINT_MODEL_TYPE_GEMMA_4,
     ENDPOINT_MODEL_TYPE_GPT_5_2,
     ENDPOINT_MODEL_TYPE_GPT_5_4,
@@ -4286,13 +4288,14 @@ ENDPOINT_MODEL_TYPES = (
 ENDPOINT_MODEL_TYPE_LABELS = {
     ENDPOINT_MODEL_TYPE_CUSTOM: "Custom / other OpenAI-compatible model",
     ENDPOINT_MODEL_TYPE_QWEN_3_6: "Qwen 3.6",
-    ENDPOINT_MODEL_TYPE_QWEN_3_8: "Qwen 3.8",
+    ENDPOINT_MODEL_TYPE_QWEN_3_8: "Qwen 3.8 27B",
     ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT: "Qwen 3.8 Flash Next",
     ENDPOINT_MODEL_TYPE_KIMI_K2_6: "Kimi K2.6",
     ENDPOINT_MODEL_TYPE_KIMI_K3: "Kimi K3",
     ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH: "GLM 5.3 Flash",
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4: "DeepSeek V4",
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP: "DeepSeek V4 Flash Vision Exp",
+    ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017: "DeepSeek V4.1 Flash 1017",
     ENDPOINT_MODEL_TYPE_GEMMA_4: "Gemma 4",
     ENDPOINT_MODEL_TYPE_GPT_5_2: "GPT 5.2",
     ENDPOINT_MODEL_TYPE_GPT_5_4: "GPT 5.4",
@@ -4305,6 +4308,7 @@ ENDPOINT_MODEL_TYPE_LABELS = {
 }
 DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-6-vllm"
 DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-vllm"
+DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-llama-cpp"
 DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-flash-next-vllm"
 DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-flash-next-novita"
 DEFAULT_AGENTIC_CONTEXT_TOKENS = 524_288
@@ -4315,13 +4319,14 @@ DEFAULT_KIMI_K3_BASETEN_ENDPOINT_PROFILE_ID = "endpoint-kimi-k3-baseten"
 DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-flash-0731-vllm"
 DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-flash-vision-exp-vllm"
 DEFAULT_DEEPSEEK_V4_FLASH_0731_NOVITA_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-flash-0731-novita"
+DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-1-flash-1017-baseten"
 DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID = "endpoint-gpt-5-6-sol-openai"
 DEFAULT_GPT_5_6_LUNA_ENDPOINT_PROFILE_ID = "endpoint-gpt-5-6-luna-openai"
 DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID = "endpoint-gpt-6-luna-openai"
 DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID = "endpoint-gpt-6.1-sol-openai"
 DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID = "endpoint-gpt-6-astra-openai"
-DEFAULT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID
-DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID
+DEFAULT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
+DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
 ENDPOINT_RATE_LIMIT_REQUESTS_PER_MINUTE_DEFAULT = 15
 ENDPOINT_ERROR_RECOVERY_ATTEMPTS_DEFAULT = 10
 ENDPOINT_ERROR_RECOVERY_DELAY_SECONDS_DEFAULT = 60
@@ -4353,6 +4358,9 @@ def endpoint_default_token_prices(model_type: str, provider: str) -> dict[str, f
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH): (0.15, 0.03, 0.50),
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT): (0.15, 0.016, 0.47),
         (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP): (0.44, 0.028, 1.32),
+        # Standard rates, not introductory discounts; checked 2026-10-18.
+        # https://www.baseten.co/library/deepseek-v41-flash-1017/
+        (ENDPOINT_PROVIDER_BASETEN, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017): (0.30, 0.007, 1.20),
         # Use the same editable token rates for local and hosted inference.
         (ENDPOINT_PROVIDER_VLLM, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP): (0.44, 0.028, 1.32),
     }.get((provider, model_type), (None, None, None))
@@ -4787,6 +4795,7 @@ ENDPOINT_REASONING_LEVEL_OPTIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH: (("max", "Max"), ("high", "High"), ("low", "Low")),
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4: (("max", "Max"), ("high", "High"), ("low", "Low")),
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP: (("max", "Max"), ("high", "High"), ("low", "Low")),
+    ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017: (("max", "Max"), ("high", "High"), ("none", "None")),
     ENDPOINT_MODEL_TYPE_GEMMA_4: (("on", "On"), ("off", "Off")),
     ENDPOINT_MODEL_TYPE_GPT_5_2: (
         ("none", "None"), ("minimal", "Minimal"), ("low", "Low"),
@@ -4834,6 +4843,7 @@ ENDPOINT_REASONING_LEVEL_DEFAULTS = {
     ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH: "max",
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4: "max",
     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP: "max",
+    ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017: "max",
     ENDPOINT_MODEL_TYPE_GEMMA_4: "off",
     ENDPOINT_MODEL_TYPE_GPT_5_2: "xhigh",
     ENDPOINT_MODEL_TYPE_GPT_5_4: "xhigh",
@@ -4875,6 +4885,14 @@ def endpoint_effective_reasoning_level(profile: dict[str, Any] | None, override:
     if override is None or not str(override).strip():
         return configured
     raw = str(override).strip().lower()
+    if model_type == ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017:
+        # Baseten V4.1 supports none/high/max, not the older V4 low level.
+        # https://docs.baseten.co/inference/model-apis/reasoning
+        if raw in {"none", "minimal", "off"}:
+            return "none"
+        if raw in {"low", "medium", "high", "xhigh", "on"}:
+            return "high"
+        return normalize_endpoint_reasoning_level(model_type, raw)
     if model_type in {
         ENDPOINT_MODEL_TYPE_DEEPSEEK_V4,
         ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
@@ -5081,6 +5099,21 @@ def endpoint_model_type_defaults(model_type: Any) -> dict[str, Any]:
             "top_p": 0.95,
             "reasoning_effort": "max",
         })
+    elif key == ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017:
+        # https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+        # The 1017 revision recommends temperature/top_p 1.0 and supports
+        # text and images in a 1M context. Keep a conservative, editable
+        # 128K output budget; this is not a claim about the server maximum.
+        common.update({
+            "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": DEFAULT_AGENTIC_OUTPUT_TOKENS,
+            "vision": "enabled",
+            "preserve_thinking": True,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "reasoning_effort": "max",
+        })
     elif key == ENDPOINT_MODEL_TYPE_GEMMA_4:
         # Google's Gemma 4 model card recommends temperature 1.0, top_p 0.95,
         # and top_k 64. The 26B A4 QAT profile is multimodal; Gemma 4
@@ -5197,6 +5230,7 @@ def endpoint_model_type_preserves_reasoning(profile: dict[str, Any] | None, over
         ENDPOINT_MODEL_TYPE_KIMI_K2_6, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4,
         ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH,
         ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
+        ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
         ENDPOINT_MODEL_TYPE_QWEN_3_8, ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
     }:
         return bool(profile.get("preserve_thinking", True))
@@ -5353,7 +5387,7 @@ def web_request_headers(
 
 ENDPOINT_IMAGE_ANALYSIS_CONTEXTS = ("inline", "separate")
 ENDPOINT_DEFAULTS_DESCRIPTION = (
-    "Choose defaults for new chats and their subagents separately. Existing tasks retain their endpoints; "
+    "Choose the default chat endpoint and the agent endpoint for new chats. Existing tasks retain their endpoints; "
     "image analysis and reviewers use their owning task's endpoint."
 )
 
@@ -5415,12 +5449,27 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
     """Return the nine current out-of-box endpoint profiles."""
     return [
         default_endpoint_profile(
+            DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID,
+            "DSV41F 1017",
+            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="https://inference.baseten.co/v1/chat/completions",
+            model_type=ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
+            provider=ENDPOINT_PROVIDER_BASETEN,
+        ),
+        default_endpoint_profile(
             DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID,
-            "Qwen 3.8 (vLLM)",
+            "Qwen 3.8 27B (vLLM)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="http://127.0.0.1:8090/v1/chat/completions",
-            model="model",
             model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8,
+        ),
+        default_endpoint_profile(
+            DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID,
+            "Qwen 3.8 27B (llama.cpp)",
+            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="http://localhost:8080/v1/chat/completions",
+            model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8,
+            provider=ENDPOINT_PROVIDER_LLAMA_CPP,
         ),
         default_endpoint_profile(
             DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID,
@@ -5448,15 +5497,6 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
             provider=ENDPOINT_PROVIDER_NOVITA,
         ),
         default_endpoint_profile(
-            DEFAULT_GLM_5_3_FLASH_NOVITA_ENDPOINT_PROFILE_ID,
-            "GLM 5.3 Flash (Novita)",
-            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
-            base_url="https://api.novita.ai/openai/v1/chat/completions",
-            model="zai-org/glm-5.3-flash",
-            model_type=ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH,
-            provider=ENDPOINT_PROVIDER_NOVITA,
-        ),
-        default_endpoint_profile(
             DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
             "DSV4F Exp (vLLM)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
@@ -5468,7 +5508,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID,
-            "OpenAI ChatGPT 6.1 Sol",
+            "ChatGPT 6.1 Sol",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.openai.com/v1/responses",
             model_type=ENDPOINT_MODEL_TYPE_GPT_6_SOL,
@@ -5476,18 +5516,10 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID,
-            "OpenAI ChatGPT 6 Luna",
+            "ChatGPT 6 Luna",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.openai.com/v1/responses",
             model_type=ENDPOINT_MODEL_TYPE_GPT_6_LUNA,
-            provider=ENDPOINT_PROVIDER_OPENAI,
-        ),
-        default_endpoint_profile(
-            DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID,
-            "OpenAI ChatGPT 6 Astra",
-            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
-            base_url="https://api.openai.com/v1/responses",
-            model_type=ENDPOINT_MODEL_TYPE_GPT_6_ASTRA,
             provider=ENDPOINT_PROVIDER_OPENAI,
         ),
     ]
@@ -5718,6 +5750,7 @@ def normalize_endpoint_profile(profile: Any, *, location: str = "endpoint profil
     if out["model_type"] in {
         ENDPOINT_MODEL_TYPE_KIMI_K2_6, ENDPOINT_MODEL_TYPE_KIMI_K3,
         ENDPOINT_MODEL_TYPE_DEEPSEEK_V4, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
+        ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
     }:
         out["preserve_thinking"] = True
     elif out["model_type"] in {ENDPOINT_MODEL_TYPE_QWEN_3_6, ENDPOINT_MODEL_TYPE_GEMMA_4} and out["reasoning_effort"] == "off":
@@ -26695,6 +26728,7 @@ class LLMClient:
             payload["stop"] = list(stop_sequences)
         if model_type in {
             ENDPOINT_MODEL_TYPE_DEEPSEEK_V4, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
+            ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
             ENDPOINT_MODEL_TYPE_KIMI_K3, ENDPOINT_MODEL_TYPE_GLM_5_3_FLASH,
             ENDPOINT_MODEL_TYPE_QWEN_3_8, ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
         }:
@@ -26751,6 +26785,18 @@ class LLMClient:
                     "reasoning_effort": reasoning_level,
                     "clear_thinking": not preserve_reasoning,
                 })
+        elif model_type == ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017:
+            # Baseten's V4.1 example uses template kwargs, while its API also
+            # accepts the top-level effort. Keep the two controls consistent.
+            # https://www.baseten.co/library/deepseek-v41-flash/
+            # https://docs.baseten.co/inference/model-apis/reasoning
+            if provider in {ENDPOINT_PROVIDER_BASETEN, ENDPOINT_PROVIDER_VLLM, ENDPOINT_PROVIDER_LLAMA_CPP}:
+                self._merge_payload_object(payload, "chat_template_kwargs", {
+                    "thinking": reasoning_level != "none",
+                    "reasoning_effort": reasoning_level,
+                })
+            else:
+                payload["thinking"] = {"type": "disabled" if reasoning_level == "none" else "enabled"}
         elif model_type in {
             ENDPOINT_MODEL_TYPE_DEEPSEEK_V4,
             ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
@@ -71805,6 +71851,7 @@ class Panels:
                     ENDPOINT_MODEL_TYPE_KIMI_K2_6, ENDPOINT_MODEL_TYPE_KIMI_K3,
                     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4,
                     ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
+                    ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
                 }
                 reasoning_enabled = current_reasoning not in {"", "off", "none", "minimal"}
                 if preserve_required:
@@ -71834,7 +71881,7 @@ class Panels:
                         enabled=reasoning_enabled and not preserve_required,
                         tooltip=(
                             "Keeps canonical reasoning_content in later tool-result requests when supported. "
-                            "It is forced on for DeepSeek V4, DeepSeek V4 Flash Vision Exp, and Kimi, and forced off while Qwen 3.6 or Gemma reasoning is disabled."
+                            "It is forced on for DeepSeek V4, DeepSeek V4 Flash Vision Exp, DeepSeek V4.1 Flash 1017, and Kimi, and forced off while Qwen 3.6 or Gemma reasoning is disabled."
                         ),
                     )
                 image_context_rect = Rect(right_x, toggle_y, col_w, SETTINGS_CONTROL_H)
@@ -77996,12 +78043,12 @@ class Panels:
         if selected_id not in id_to_display:
             selected_id = endpoint_profile_id_from_config(config)
             llm["default_profile_id"] = selected_id
-        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Default endpoint", Palette.muted2)
+        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Default chat endpoint", Palette.muted2)
         next_display = self.widgets.dropdown(
             "settings.llm.default_profile_id", Rect(input_x, cy, dropdown_w, SETTINGS_CONTROL_H),
             id_to_display.get(selected_id, options[0] if options else "No endpoints"), options,
             tooltip="Used for new chats, unscoped agents, scheduled Personal Assistant tasks and system work. "
-                    "Chat-spawned agents use the separate Chat subagent choice; reviewers use their owning Task's endpoint. "
+                    "Chat-spawned agents use the Default agent endpoint; reviewers use their owning Task's endpoint. "
                     "Existing Tasks keep their selected endpoint.",
         )
         llm["default_profile_id"] = display_to_id.get(next_display, selected_id)
@@ -78011,13 +78058,13 @@ class Panels:
             profile = next((item for item in profiles if str(item.get("id") or "") == selected_id), None)
             if profile is not None:
                 try:
-                    self._open_http_headers_dialog("Default endpoint request headers", self._endpoint_header_preview(profile))
+                    self._open_http_headers_dialog("Default chat endpoint request headers", self._endpoint_header_preview(profile))
                 except Exception as exc:
                     self.state.add_toast("Header preview failed", str(exc), "error")
 
         cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
         subagent_id = chat_subagent_endpoint_profile_id_from_config(config)
-        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Default Chat subagent", Palette.muted2)
+        self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Default agent endpoint", Palette.muted2)
         next_subagent = self.widgets.dropdown(
             "settings.llm.default_chat_subagent_profile_id", Rect(input_x, cy, dropdown_w, SETTINGS_CONTROL_H),
             id_to_display.get(subagent_id, options[0] if options else "No endpoints"), options,
