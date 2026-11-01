@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 321
+CURRENT_VERSION = 323
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -4320,13 +4320,14 @@ DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-flash
 DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-flash-vision-exp-vllm"
 DEFAULT_DEEPSEEK_V4_FLASH_0731_NOVITA_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-flash-0731-novita"
 DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-1-flash-1017-baseten"
+DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID = "endpoint-deepseek-v4-1-flash-1017-novita"
 DEFAULT_GPT_5_6_SOL_ENDPOINT_PROFILE_ID = "endpoint-gpt-5-6-sol-openai"
 DEFAULT_GPT_5_6_LUNA_ENDPOINT_PROFILE_ID = "endpoint-gpt-5-6-luna-openai"
 DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID = "endpoint-gpt-6-luna-openai"
 DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID = "endpoint-gpt-6.1-sol-openai"
 DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID = "endpoint-gpt-6-astra-openai"
-DEFAULT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
-DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
+DEFAULT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID
+DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID = DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID
 ENDPOINT_RATE_LIMIT_REQUESTS_PER_MINUTE_DEFAULT = 15
 ENDPOINT_ERROR_RECOVERY_ATTEMPTS_DEFAULT = 10
 ENDPOINT_ERROR_RECOVERY_DELAY_SECONDS_DEFAULT = 60
@@ -4361,6 +4362,9 @@ def endpoint_default_token_prices(model_type: str, provider: str) -> dict[str, f
         # Standard rates, not introductory discounts; checked 2026-10-18.
         # https://www.baseten.co/library/deepseek-v41-flash-1017/
         (ENDPOINT_PROVIDER_BASETEN, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017): (0.30, 0.007, 1.20),
+        # https://novita.ai/models/model-detail/deepseek-deepseek-v4.1-flash-1017
+        # Standard list prices checked 2026-11-01; editable per endpoint.
+        (ENDPOINT_PROVIDER_NOVITA, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017): (0.30, 0.006, 1.20),
         # Use the same editable token rates for local and hosted inference.
         (ENDPOINT_PROVIDER_VLLM, ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP): (0.44, 0.028, 1.32),
     }.get((provider, model_type), (None, None, None))
@@ -5446,15 +5450,24 @@ def default_endpoint_profile(
 
 
 def default_endpoint_profiles() -> list[dict[str, Any]]:
-    """Return the nine current out-of-box endpoint profiles."""
+    """Return the ten current out-of-box endpoint profiles."""
     return [
         default_endpoint_profile(
             DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID,
-            "DSV41F 1017",
+            "DSV41F 1017 (Baseten)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://inference.baseten.co/v1/chat/completions",
             model_type=ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
             provider=ENDPOINT_PROVIDER_BASETEN,
+        ),
+        default_endpoint_profile(
+            DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID,
+            "DSV41F 1017 (Novita)",
+            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="https://api.novita.ai/openai/v1/chat/completions",
+            model="deepseek/deepseek-v4.1-flash-1017",
+            model_type=ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
+            provider=ENDPOINT_PROVIDER_NOVITA,
         ),
         default_endpoint_profile(
             DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID,
@@ -9562,7 +9575,7 @@ def default_app_manifest() -> dict[str, Any]:
 
 
 def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, location: str) -> None:
-    """Reject missing or unexpected dictionary fields at every schema level.
+    """Reject missing or unexpected fields, except additive Serper settings.
 
     Dictionary keys are structural, arrays remain arrays, and current scalar
     fields retain their JSON type. A successful write therefore cannot create an
@@ -9572,7 +9585,12 @@ def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, locati
         raise UnsupportedDataVersionError(f"{location} must be a JSON object")
     expected = set(template)
     actual = set(value)
-    missing = sorted(str(key) for key in expected.difference(actual))
+    # Existing data roots keep their format generation and remain readable
+    # without rewriting app.json. Absent Serper fields mean disabled/no key.
+    optional = {"serper_enabled", "serper_api_key"} if location in {
+        "settings.web", "app.json.settings.web", "new app.json.settings.web",
+    } else set()
+    missing = sorted(str(key) for key in expected.difference(actual).difference(optional))
     extra = sorted(str(key) for key in actual.difference(expected))
     if missing or extra:
         details: list[str] = []
@@ -9584,6 +9602,8 @@ def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, locati
             f"{location} fields do not match the current data model ({'; '.join(details)})"
         )
     for key, expected_value in template.items():
+        if key in optional and key not in value:
+            continue
         actual_value = value[key]
         child_location = f"{location}.{key}"
         if isinstance(expected_value, dict):
@@ -11899,6 +11919,8 @@ def default_config() -> dict[str, Any]:
         },
         "web": {
             "search_provider": "duckduckgo",
+            "serper_enabled": False,
+            "serper_api_key": "",
             "user_agent_mode": "desktop_firefox",
             **{key: default for key, (default, _minimum, _kind) in WEB_RESOURCE_SETTING_SPECS.items()},
         },
@@ -34115,7 +34137,10 @@ class WebTools:
         return web_setting_int(self.storage.load_config(), "download_max_bytes")
 
     def _search_provider(self) -> str:
-        provider = str(self._web_config().get("search_provider") or "duckduckgo").strip().lower()
+        config = self._web_config()
+        if config.get("serper_enabled", False):
+            return "serper"
+        provider = str(config.get("search_provider") or "duckduckgo").strip().lower()
         return provider if provider in {"duckduckgo", "bing", "google"} else "duckduckgo"
 
     def _user_agent_mode(self) -> str:
@@ -34260,6 +34285,8 @@ class WebTools:
             "max_results": self._default_search_results(),
         }
         provider = self._search_provider()
+        if provider == "serper":
+            return await self._serper_search(ctx, call_args)
         if provider == "google":
             await self._respect_search_rate_limit()
             return await self._google_search(ctx, call_args)
@@ -34281,6 +34308,83 @@ class WebTools:
         except Exception as exc:
             primary["fallback_error"] = f"{type(exc).__name__}: {exc}"
         return primary
+
+    async def _serper_search(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        """Return Google organic results using Serper's JSON API."""
+        query = str(args.get("query") or "").strip()
+        url = "https://google.serper.dev/search"
+        result: dict[str, Any] = {
+            "provider": "serper", "query": query, "status": "error",
+            "results": [], "source_url": url,
+        }
+        api_key = str(self._web_config().get("serper_api_key") or "").strip()
+        if not api_key:
+            result["error"] = "Serper API key is missing. Enter it in Settings > Tools > Web search, or turn off Use Serper."
+            return result
+        ctx.raise_if_cancelled("Web search cancelled")
+        await self._respect_search_rate_limit()
+        ctx.raise_if_cancelled("Web search cancelled")
+        timeout = self._timeout()
+        max_bytes = web_setting_int(self.storage.load_config(), "search_response_max_bytes")
+        max_results = int(args.get("max_results", 10))
+
+        def run() -> Any:
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+                    # Never forward the API key to a redirected destination.
+                    return None
+
+            request = urllib.request.Request(
+                url, data=json.dumps({"q": query, "num": max_results}).encode("utf-8"),
+                headers={"X-API-KEY": api_key, "Content-Type": "application/json", "Accept": "application/json"},
+                method="POST",
+            )
+            # One request per search; do not automatically repeat billable calls.
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+                raw = response.read(max_bytes + 1)
+                if len(raw) > max_bytes:
+                    raise ValueError(f"Serper response exceeded max_bytes={max_bytes}")
+                raw = self._decode_response_body(raw, str(response.headers.get("Content-Encoding") or ""), max_bytes=max_bytes)
+                return json.loads(raw.decode("utf-8"))
+
+        try:
+            payload = await asyncio.to_thread(run)
+            ctx.raise_if_cancelled("Web search cancelled")
+            if not isinstance(payload, dict):
+                raise ValueError("Serper returned an invalid JSON response (expected an object)")
+            if payload.get("message") or payload.get("error"):
+                raise ValueError(str(payload.get("message") or payload.get("error")))
+            organic = payload.get("organic", [])
+            if not isinstance(organic, list):
+                raise ValueError("Serper returned invalid organic results")
+            results = []
+            for item in organic:
+                if not isinstance(item, dict):
+                    continue
+                link = str(item.get("link") or "").strip()
+                if urllib.parse.urlparse(link).scheme not in {"http", "https"}:
+                    continue
+                results.append({
+                    "title": str(item.get("title") or ""), "url": link,
+                    "snippet": str(item.get("snippet") or ""),
+                })
+            result.update(status="ok" if results else "no_results", results=results[:max_results])
+        except ToolCancelledError:
+            raise
+        except urllib.error.HTTPError as exc:
+            hints = {
+                400: "Check the Serper request parameters and account credits.",
+                401: "Check the Serper API key in Settings > Tools > Web search.",
+                402: "Serper credits exhausted. Check your account balance.",
+                403: "Check the Serper API key and account access.",
+                429: "Serper rate limit or credits exhausted. Check your account and try again later.",
+            }
+            result["http_status"] = exc.code
+            result["error"] = f"Serper HTTP {exc.code}. " + hints.get(exc.code, "Serper request failed; try again later.")
+            exc.close()
+        except Exception as exc:
+            result["error"] = redact_endpoint_secrets(f"{type(exc).__name__}: {exc}", (api_key,))
+        return result
 
     async def _duckduckgo_search(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query", "")).strip()
@@ -76932,6 +77036,8 @@ class Panels:
             comfy[comfy_key] = str(comfy.get(comfy_key) or "")
 
         web_cfg = cfg.setdefault("web", {})
+        web_cfg["serper_enabled"] = bool(web_cfg.get("serper_enabled", False))
+        web_cfg["serper_api_key"] = str(web_cfg.get("serper_api_key") or "").strip()
         provider = str(web_cfg.get("search_provider") or "duckduckgo").strip().lower()
         web_cfg["search_provider"] = provider if provider in {"duckduckgo", "bing", "google"} else "duckduckgo"
         ua_mode = str(web_cfg.get("user_agent_mode") or "desktop_firefox").strip().lower()
@@ -77637,7 +77743,7 @@ class Panels:
             "Skills": 1240 + 20,
             "Tools": (
                 defaults_h
-                + SETTINGS_RESOURCE_ROW_H * 2
+                + SETTINGS_RESOURCE_ROW_H * 4
                 + sum(SETTINGS_RESOURCE_CARD_BASE_H + SETTINGS_RESOURCE_ROW_H * len(rows) for _title, rows in WEB_SETTINGS_UI_GROUPS)
                 + sum(SETTINGS_RESOURCE_CARD_BASE_H + SETTINGS_RESOURCE_ROW_H * len(rows) for _title, rows in TOOL_SETTINGS_UI_GROUPS)
                 + gap * (len(WEB_SETTINGS_UI_GROUPS) + len(TOOL_SETTINGS_UI_GROUPS) + 1)
@@ -78959,7 +79065,7 @@ class Panels:
             include_provider: bool = False,
         ) -> int:
             nonlocal y
-            row_count = len(rows) + (2 if include_provider else 0)
+            row_count = len(rows) + (4 if include_provider else 0)
             card_h = SETTINGS_RESOURCE_CARD_BASE_H + SETTINGS_RESOURCE_ROW_H * row_count
             card = self._settings_card_rect(col, y, card_h)
             inner = self._draw_settings_card_shell(card, title)
@@ -78969,14 +79075,27 @@ class Panels:
             numeric_w = min(max(SETTINGS_NUMERIC_INPUT_W, 180), available_w)
             cy = inner.y
             if include_provider:
-                self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Provider", Palette.muted2)
+                web_cfg["serper_enabled"] = self.widgets.toggle(
+                    "settings.web.serper_enabled", Rect(inner.x, cy, inner.w, SETTINGS_CONTROL_H),
+                    "Use Serper (Google Search API)", bool(web_cfg.get("serper_enabled", False)),
+                    tooltip="Use Serper for web_search. Turn off to use the scrape provider selected below.",
+                )
+                cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
+                self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Serper API key", Palette.muted2)
+                web_cfg["serper_api_key"] = self.widgets.text_input(
+                    "settings.web.serper_api_key", Rect(input_x, cy, available_w, SETTINGS_CONTROL_H),
+                    str(web_cfg.get("serper_api_key") or ""), "API key from serper.dev",
+                    password=True, tooltip="Required when Use Serper is on. Saved locally in app.json with your other settings.",
+                )
+                cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
+                self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Scrape provider", Palette.muted2)
                 provider_labels = {"duckduckgo": "DuckDuckGo", "bing": "Bing", "google": "Google"}
                 provider = str(web_cfg.get("search_provider") or "duckduckgo").lower()
                 provider = provider if provider in provider_labels else "duckduckgo"
                 selected = self.widgets.dropdown(
                     "settings.web_search_provider", Rect(input_x, cy, min(260, available_w), SETTINGS_CONTROL_H),
                     provider_labels[provider], sorted(provider_labels.values(), key=str.casefold),
-                    tooltip="Search provider used by web_search.",
+                    tooltip="Search provider used by web_search when Use Serper is off.",
                 )
                 web_cfg["search_provider"] = next((key for key, label in provider_labels.items() if label == selected), "duckduckgo")
                 cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP

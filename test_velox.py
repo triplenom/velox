@@ -1003,7 +1003,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             set(llm),
             {"default_profile_id", "default_chat_subagent_profile_id", "endpoint_profiles", "comfy", "stall_detection_minutes"},
         )
-        self.assertEqual(llm["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
+        self.assertEqual(llm["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
         self.assertEqual(config["chat"], {"auto_compaction_enabled": True})
         self.assertNotIn("fast_profile_id", llm)
         self.assertNotIn("smart_profile_id", llm)
@@ -2358,7 +2358,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertNotIn("persistence_enabled", started)
             self.assertNotIn("persistence_max_prompts", started)
             self.assertIn("decides whether", started["message"])
-            self.assertEqual(started["endpoint_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
+            self.assertEqual(started["endpoint_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
             self.assertTrue(paths.agent_json(agent_id).is_file())
             saved = agents.load_agent(agent_id)
             self.assertNotIn("expert_mode", saved)
@@ -2683,7 +2683,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_default_endpoints_font_and_chunked_file_terminal_helpers(self) -> None:
         cfg = velox.default_config()
-        self.assertEqual(velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)["base_url"], "https://inference.baseten.co/v1/chat/completions")
+        self.assertEqual(velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)["base_url"], "https://api.novita.ai/openai/v1/chat/completions")
         self.assertEqual(cfg["ui"]["font_weight"], "heavy")
         self.assertEqual(velox.normalize_font_weight(None), "heavy")
 
@@ -2747,7 +2747,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             set(cfg),
             {"schema", "data_version", "features", "llm", "web", "tools", "chat", "history", "prompting", "agents", "meshy", "ui", "vault"},
         )
-        self.assertEqual(cfg["llm"]["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
+        self.assertEqual(cfg["llm"]["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
         self.assertNotIn("accounts", cfg)
         self.assertEqual(cfg["chat"], {"auto_compaction_enabled": True})
         agents = cfg["agents"]
@@ -10029,8 +10029,8 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
 
     def test_local_deepseek_profile_payload_and_endpoint_editor_label_width(self) -> None:
         config = velox.default_config()
-        self.assertEqual(config["llm"]["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
-        self.assertEqual(config["llm"]["default_chat_subagent_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
+        self.assertEqual(config["llm"]["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
+        self.assertEqual(config["llm"]["default_chat_subagent_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
         profile = velox.endpoint_profile_ref(
             config, velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
         )
@@ -10276,8 +10276,8 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
 
     def test_new_default_keeps_local_dsv4f_vision_profile_available(self) -> None:
         config = velox.default_config()
-        self.assertEqual(config["llm"]["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
-        self.assertEqual(config["llm"]["default_chat_subagent_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
+        self.assertEqual(config["llm"]["default_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
+        self.assertEqual(config["llm"]["default_chat_subagent_profile_id"], velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
         dsv4f = velox.endpoint_profile_ref(
             config, velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
         )
@@ -14764,7 +14764,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
 
     def test_transport_defaults_and_gpt_profiles(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 9)
+        self.assertEqual(len(profiles), 10)
         by_type = {velox.normalize_endpoint_model_type(row.get("model_type")): row for row in profiles}
         self.assertEqual(set(by_type), {
             velox.ENDPOINT_MODEL_TYPE_QWEN_3_8,
@@ -16090,10 +16090,10 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             velox.ENDPOINT_PROVIDER_BASETEN,
         )
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 9)
+        self.assertEqual(len(profiles), 10)
         labels = {str(profile["label"]) for profile in profiles}
         self.assertEqual(labels, {
-            "DSV41F 1017", "Qwen 3.8 27B (vLLM)", "Qwen 3.8 27B (llama.cpp)",
+            "DSV41F 1017 (Baseten)", "DSV41F 1017 (Novita)", "Qwen 3.8 27B (vLLM)", "Qwen 3.8 27B (llama.cpp)",
             "Qwen 3.8 Flash Next (vLLM)", "Qwen 3.8 Flash (Novita)", "Kimi K3 (Novita)",
             "DSV4F Exp (vLLM)", "ChatGPT 6 Luna", "ChatGPT 6.1 Sol",
         })
@@ -26353,6 +26353,214 @@ class InferenceYieldAndStartupTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertNotIn("migrate_", application_source())
 
 
+class SerperSearchTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.temp = _TemporaryDataDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.storage = _make_test_storage(Path(self.temp.name))
+        self.config = self.storage.load_config()
+        self.config['web'].update(serper_enabled=True, serper_api_key='test-serper-secret', search_provider='bing')
+        self.storage.write_config(self.config)
+        self.web = velox.WebTools(self.storage)
+        self.ctx = velox.ToolContext(velox.APP_SCOPE_ID)
+
+    def response(self, payload: Any) -> io.BytesIO:
+        response = io.BytesIO(json.dumps(payload).encode('utf-8'))
+        response.headers = {'Content-Type': 'application/json'}
+        return response
+
+    def search(self, opener: Any, query: str = 'live Google results') -> dict[str, Any]:
+        with mock.patch.object(velox.urllib.request, 'build_opener', return_value=opener):
+            return asyncio.run(self.web.search(self.ctx, {'query': query}))
+
+    def test_json_request_results_limits_and_provider_routing(self) -> None:
+        self.config['web'].update(default_search_results=2, fetch_timeout_seconds=37)
+        self.storage.write_config(self.config)
+        opener = mock.Mock()
+        opener.open.return_value = self.response({'organic': [
+            {'title': 'First', 'link': 'https://example.com/one', 'snippet': 'Fresh result'},
+            None, {'title': 'Unsafe', 'link': 'javascript:alert(1)'},
+            {'title': 'Second', 'link': 'https://example.com/two'},
+            {'title': 'Third', 'link': 'https://example.com/three'},
+        ]})
+        with mock.patch.object(self.web, '_bing_search', new_callable=mock.AsyncMock) as scrape:
+            result = self.search(opener, '  café & python  ')
+        scrape.assert_not_called()
+        self.assertEqual(result['provider'], 'serper')
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['results'], [
+            {'title': 'First', 'url': 'https://example.com/one', 'snippet': 'Fresh result'},
+            {'title': 'Second', 'url': 'https://example.com/two', 'snippet': ''},
+        ])
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, 'https://google.serper.dev/search')
+        self.assertEqual(request.get_method(), 'POST')
+        self.assertEqual(request.get_header('X-api-key'), 'test-serper-secret')
+        self.assertEqual(request.get_header('Content-type'), 'application/json')
+        self.assertEqual(json.loads(request.data), {'q': 'café & python', 'num': 2})
+        self.assertEqual(opener.open.call_args.kwargs['timeout'], 37)
+        self.assertEqual(len(self.web._search_request_timestamps), 1)
+        self.assertNotIn('test-serper-secret', json.dumps(result))
+
+    def test_toggle_restores_saved_scrape_provider_and_retains_key(self) -> None:
+        self.assertEqual(self.web._search_provider(), 'serper')
+        panel = velox.Panels.__new__(velox.Panels)
+        panel.services = SimpleNamespace(storage=self.storage)
+        panel.state = velox.UIState()
+        config = self.storage.load_config()
+        panel.state.config_draft = panel._settings_config_to_draft(config)
+        panel.state.settings_last_valid_config = copy.deepcopy(config)
+        panel.state.settings_last_saved_config_json = json.dumps(config, ensure_ascii=False, sort_keys=True)
+        panel.state.config_draft['web']['serper_enabled'] = False
+        panel.state.config_draft['web']['serper_api_key'] = '  replacement-key  '
+        panel._autosave_settings_if_changed(panel.state.config_draft)
+        restarted = _ensure_test_storage(velox.Storage(velox.AppPaths(Path(self.temp.name))))
+        saved = restarted.load_config()['web']
+        self.assertFalse(saved['serper_enabled'])
+        self.assertEqual(saved['serper_api_key'], 'replacement-key')
+        self.assertEqual(saved['search_provider'], 'bing')
+        web = velox.WebTools(restarted)
+        with mock.patch.object(web, '_bing_search', new_callable=mock.AsyncMock, return_value={'provider': 'bing'}) as bing:
+            self.assertEqual(asyncio.run(web.search(self.ctx, {'query': 'test'}))['provider'], 'bing')
+        bing.assert_awaited_once()
+
+    def test_missing_key_is_actionable_without_network_or_scrape_fallback(self) -> None:
+        self.config['web']['serper_api_key'] = '   '
+        self.storage.write_config(self.config)
+        opener = mock.Mock()
+        with mock.patch.object(self.web, '_bing_search', new_callable=mock.AsyncMock) as scrape:
+            result = self.search(opener)
+        opener.open.assert_not_called()
+        scrape.assert_not_called()
+        self.assertEqual(result['status'], 'error')
+        self.assertIn('Settings > Tools > Web search', result['error'])
+        self.assertEqual(result['results'], [])
+        self.assertEqual(self.web._search_request_timestamps, [])
+
+    def test_http_errors_do_not_retry_or_leak_credentials(self) -> None:
+        for code in (400, 401, 402, 403, 429, 500):
+            with self.subTest(code=code):
+                self.web._search_request_timestamps.clear()
+                opener = mock.Mock()
+                opener.open.side_effect = urllib.error.HTTPError(
+                    'https://google.serper.dev/search', code, 'test-serper-secret', {},
+                    io.BytesIO(b'test-serper-secret'),
+                )
+                result = self.search(opener)
+                self.assertEqual(result['status'], 'error')
+                self.assertEqual(result['http_status'], code)
+                self.assertNotIn('test-serper-secret', json.dumps(result))
+                opener.open.assert_called_once()
+
+    def test_empty_invalid_oversized_and_failed_responses(self) -> None:
+        cases = [
+            ({'organic': []}, 'no_results'),
+            ({'knowledgeGraph': {'title': 'Answer'}}, 'no_results'),
+            ([], 'error'),
+            ({'organic': {}}, 'error'),
+            ({'error': 'invalid test-serper-secret'}, 'error'),
+        ]
+        for payload, status in cases:
+            with self.subTest(payload=payload):
+                self.web._search_request_timestamps.clear()
+                opener = mock.Mock()
+                opener.open.return_value = self.response(payload)
+                result = self.search(opener)
+                self.assertEqual(result['status'], status)
+                self.assertNotIn('test-serper-secret', json.dumps(result))
+        for failure in (TimeoutError('test-serper-secret timeout'), urllib.error.URLError('offline')):
+            self.web._search_request_timestamps.clear()
+            opener = mock.Mock()
+            opener.open.side_effect = failure
+            self.assertEqual(self.search(opener)['status'], 'error')
+            opener.open.assert_called_once()
+        self.web._search_request_timestamps.clear()
+        opener = mock.Mock()
+        response = io.BytesIO(b'<html>not JSON</html>')
+        response.headers = {}
+        opener.open.return_value = response
+        self.assertEqual(self.search(opener)['status'], 'error')
+        self.config['web']['search_response_max_bytes'] = 12
+        self.storage.write_config(self.config)
+        self.web._search_request_timestamps.clear()
+        opener.open.return_value = self.response({'organic': [{'link': 'https://example.com'}]})
+        self.assertIn('max_bytes=12', self.search(opener)['error'])
+
+    def test_credentials_are_not_forwarded_on_redirects_and_cancellation_propagates(self) -> None:
+        real_build = velox.urllib.request.build_opener
+        with mock.patch.object(velox.urllib.request, 'build_opener', wraps=real_build) as build:
+            with mock.patch.object(velox.urllib.request.OpenerDirector, 'open', return_value=self.response({'organic': []})):
+                asyncio.run(self.web.search(self.ctx, {'query': 'test'}))
+        handler = build.call_args.args[0]
+        self.assertIsNone(handler.redirect_request(None, None, 302, '', {}, 'https://other.example'))
+        self.ctx.cancel_event = threading.Event()
+        self.ctx.cancel_event.set()
+        opener = mock.Mock()
+        with self.assertRaises(velox.ToolCancelledError):
+            self.search(opener)
+        opener.open.assert_not_called()
+        self.ctx.cancel_event.clear()
+        self.web._search_request_timestamps.clear()
+        def cancel_during_request(*args: Any, **kwargs: Any) -> Any:
+            self.ctx.cancel_event.set()
+            return self.response({'organic': []})
+        opener.open.side_effect = cancel_during_request
+        with self.assertRaises(velox.ToolCancelledError):
+            self.search(opener)
+
+    def test_existing_manifest_without_serper_fields_still_loads_without_rewriting(self) -> None:
+        path = self.storage.paths.app_json_path
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        payload['settings']['web'].pop('serper_enabled')
+        payload['settings']['web'].pop('serper_api_key')
+        original = json.dumps(payload).encode('utf-8')
+        path.write_bytes(original)
+        velox.DATA_ROOTS.clear_for_tests()
+        restarted = _ensure_test_storage(velox.Storage(velox.AppPaths(Path(self.temp.name))))
+        self.assertEqual(velox.WebTools(restarted)._search_provider(), 'bing')
+        self.assertEqual(path.read_bytes(), original)
+        for key, bad in (('serper_enabled', 'yes'), ('serper_api_key', 123)):
+            config = restarted.load_config()
+            config['web'][key] = bad
+            with self.subTest(key=key), self.assertRaises(velox.UnsupportedDataVersionError):
+                restarted.write_config(config)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_settings_draw_toggle_masked_key_and_preserve_scrape_choice(self) -> None:
+        panel = velox.Panels.__new__(velox.Panels)
+        panel.widgets = mock.Mock()
+        panel.widgets.font = _TestDummyFont()
+        panel.widgets._wrap_display_rows.return_value = ['Text']
+        panel.widgets.toggle.side_effect = lambda wid, rect, label, value, **kw: not value
+        panel.widgets.text_input.side_effect = lambda wid, rect, value, *args, **kw: value
+        panel.widgets.dropdown.side_effect = lambda wid, rect, value, *args, **kw: value
+        panel.widgets.button_width.return_value = 132
+        panel.widgets.button.return_value = False
+        panel._draw_tool_defaults_card = lambda *args: None
+        panel._settings_card_rect = lambda col, y, h: velox.Rect(col.x, y, col.w, h)
+        cards = []
+        def shell(card: Any, title: str) -> Any:
+            cards.append((card, title))
+            return velox.Rect(card.x + 10, card.y + 40, card.w - 20, card.h - 40)
+        panel._draw_settings_card_shell = shell
+        config = self.storage.load_config()
+        panel._draw_tools_settings_content(velox.Rect(0, 0, 900, 2000), config)
+        self.assertFalse(config['web']['serper_enabled'])
+        self.assertEqual(config['web']['search_provider'], 'bing')
+        self.assertEqual(config['web']['serper_api_key'], 'test-serper-secret')
+        key_call = next(c for c in panel.widgets.text_input.call_args_list if c.args[0] == 'settings.web.serper_api_key')
+        self.assertTrue(key_call.kwargs['password'])
+        toggle = next(c for c in panel.widgets.toggle.call_args_list if c.args[0] == 'settings.web.serper_enabled')
+        self.assertLessEqual(toggle.args[1].y + toggle.args[1].h, key_call.args[1].y)
+        card = next(rect for rect, title in cards if title == 'Web search')
+        for call in panel.widgets.text_input.call_args_list:
+            if call.args[0].startswith('settings.web.') and call.args[1].y < card.y + card.h:
+                self.assertLessEqual(call.args[1].y + call.args[1].h, card.y + card.h)
+        reserved = panel._settings_section_content_height('Tools', content_width=900)
+        self.assertGreaterEqual(reserved, cards[-1][0].y + cards[-1][0].h)
+
+
 class WebResearchAndReviewerRegressionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     """Web retrieval, page serialization and review output."""
 
@@ -32356,7 +32564,7 @@ class GLMFlashProfileTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase)
         for key, value in expected.items():
             with self.subTest(key=key):
                 self.assertEqual(profile[key], value)
-        self.assertEqual(velox.DEFAULT_ENDPOINT_PROFILE_ID, velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID)
+        self.assertEqual(velox.DEFAULT_ENDPOINT_PROFILE_ID, velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID)
         self.assertNotIn(self.eid, {p["id"] for p in velox.default_endpoint_profiles()})
         for key in ("top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "seed"):
             self.assertIsNone(profile[key])
@@ -36991,8 +37199,8 @@ class EndpointDefaultsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_profile_inventory_adds_one_unique_endpoint(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 9)
-        self.assertEqual(len({p['id'] for p in profiles}), 9)
+        self.assertEqual(len(profiles), 10)
+        self.assertEqual(len({p['id'] for p in profiles}), 10)
         self.assertEqual(sum(p['model'] == 'qwen/qwen3.8-flash' for p in profiles), 1)
 
     def test_unrelated_qwen_27b_and_kimi_baseten_defaults_unchanged(self) -> None:
@@ -38235,7 +38443,7 @@ class UnifiedEndpointConfigTests(_LegacyEndpointFixtureMixin, _AsyncRuntimeFixtu
 
     def test_all_bundled_profiles_have_provider_specific_context_defaults(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 9)
+        self.assertEqual(len(profiles), 10)
         for profile in profiles:
             with self.subTest(endpoint=profile['label']):
                 expected = 'inline' if (profile['provider'] == velox.ENDPOINT_PROVIDER_VLLM or (profile['provider'] == 'openai' and profile['model_type'] in velox.ENDPOINT_GPT_6_MODEL_TYPES)) else 'separate'
@@ -44949,8 +45157,8 @@ class CurrentEndpointPresetRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRu
 
     def test_current_inventory_excludes_all_retired_presets(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len(profiles), 9)
-        self.assertEqual(len({p['id'] for p in profiles}), 9)
+        self.assertEqual(len(profiles), 10)
+        self.assertEqual(len({p['id'] for p in profiles}), 10)
         retired = {p['id'] for p in _legacy_endpoint_fixture_profiles()}
         self.assertFalse(retired.intersection(p['id'] for p in profiles))
         self.assertEqual([p['id'] for p in profiles if p['provider'] == velox.ENDPOINT_PROVIDER_BASETEN],
@@ -45050,9 +45258,51 @@ class CurrentEndpointPresetRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRu
 class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
     """Current defaults and their actual serialized provider contracts."""
 
+    def test_novita_profile_sends_provider_model_auth_and_reasoning_contract(self) -> None:
+        eid = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID
+        profile = velox.endpoint_profile_ref(self.storage.load_config(), eid)
+        self.assertEqual(profile['label'], 'DSV41F 1017 (Novita)')
+        self.assertEqual(profile['provider'], velox.ENDPOINT_PROVIDER_NOVITA)
+        self.assertEqual(profile['api_key'], '')
+        self.assertEqual(tuple(profile[key] for key in velox.ENDPOINT_PRICE_FIELDS), (.30, .006, 1.20))
+        self.assertEqual((profile['context_window_tokens'], profile['max_output_tokens']), (1048576, 131072))
+        self.assertEqual((profile['temperature'], profile['top_p']), (1.0, 1.0))
+        self.assertTrue(velox.endpoint_supports_vision(profile))
+        self.assertTrue(velox.endpoint_model_type_preserves_reasoning(profile))
+        self.assertEqual(profile['image_analysis_context'], 'separate')
+        self.assertEqual(velox.normalize_endpoint_profile(profile), profile)
+        self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, eid).update(api_key='novita-test-key'))
+        call = _make_test_provider_call('novita-1017-tool', 'time_now', {})
+        messages = [
+            {'role': 'assistant', 'content': '', 'reasoning_content': 'Saved reasoning.', 'tool_calls': [call]},
+            {'role': 'tool', 'tool_call_id': call['id'], 'content': '12:00'},
+            {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]},
+        ]
+        tools = [{'type': 'function', 'function': {'name': 'time_now', 'parameters': {'type': 'object', 'properties': {}}}}]
+        for stream in (False, True):
+            for effort in ('max', 'high', 'none'):
+                with self.subTest(stream=stream, effort=effort):
+                    request = velox.LLMRequest(velox.APP_SCOPE_ID, eid, messages, native_tools=tools,
+                                               reasoning_effort_override=effort)
+                    endpoint, url, body, headers, timeout, payload = self.llm._payload_and_headers(request, stream=stream)
+                    self.assertEqual(url, 'https://api.novita.ai/openai/v1/chat/completions')
+                    self.assertEqual(headers['Authorization'], 'Bearer novita-test-key')
+                    self.assertEqual(payload['model'], 'deepseek/deepseek-v4.1-flash-1017')
+                    self.assertEqual(payload['max_tokens'], 131072)
+                    self.assertEqual(payload['reasoning_effort'], effort)
+                    self.assertEqual(payload['thinking'], {'type': 'disabled' if effort == 'none' else 'enabled'})
+                    self.assertNotIn('chat_template_kwargs', payload)
+                    self.assertEqual(payload['tools'], tools)
+                    self.assertEqual(payload['messages'][-1]['content'], messages[-1]['content'])
+                    if effort != 'none':
+                        self.assertEqual(payload['messages'][0]['reasoning_content'], 'Saved reasoning.')
+                    self.assertEqual(json.loads(body), payload)
+                    self.assertNotIn('novita-test-key', body.decode())
+
     def test_requested_inventory_labels_and_fresh_task_defaults(self) -> None:
         expected = {
-            velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID: 'DSV41F 1017',
+            velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID: 'DSV41F 1017 (Baseten)',
+            velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID: 'DSV41F 1017 (Novita)',
             velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID: 'Qwen 3.8 27B (vLLM)',
             velox.DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID: 'Qwen 3.8 27B (llama.cpp)',
             velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID: 'Qwen 3.8 Flash Next (vLLM)',
@@ -45065,7 +45315,7 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
         profiles = self.storage.load_config()['llm']['endpoint_profiles']
         self.assertEqual(len(profiles), len(expected))
         self.assertEqual({p['id']: p['label'] for p in profiles}, expected)
-        default = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
+        default = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID
         self.assertEqual(velox.DEFAULT_ENDPOINT_PROFILE_ID, default)
         self.assertEqual(velox.DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID, default)
         config = self.storage.load_config()['llm']
@@ -45078,7 +45328,8 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
         self.assertEqual(agent['endpoint_profile_id'], default)
 
     def test_baseten_profile_uses_standard_prices_and_conservative_editable_budget(self) -> None:
-        profile = velox.endpoint_profile_ref(self.storage.load_config(), self.eid)
+        eid = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
+        profile = velox.endpoint_profile_ref(self.storage.load_config(), eid)
         self.assertEqual(profile['provider'], velox.ENDPOINT_PROVIDER_BASETEN)
         self.assertEqual(profile['model'], 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
         self.assertEqual(profile['base_url'], 'https://inference.baseten.co/v1/chat/completions')
@@ -45102,7 +45353,8 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
         self.assertEqual(panel._endpoint_profile_from_editor_draft(panel._endpoint_profile_editor_draft(edited)), edited)
 
     def test_baseten_wire_preserves_images_tools_reasoning_and_sampling(self) -> None:
-        self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, self.eid).update(api_key='example-not-a-real-key'))
+        eid = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
+        self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, eid).update(api_key='example-not-a-real-key'))
         call = _make_test_provider_call('1017-tool', 'time_now', {})
         messages = [
             {'role': 'system', 'content': 'Fixed instructions.'},
@@ -45116,7 +45368,7 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
         tools = [{'type': 'function', 'function': {'name': 'time_now', 'parameters': {'type': 'object', 'properties': {}}}}]
         for stream in (False, True):
             with self.subTest(stream=stream):
-                request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, messages, native_tools=tools)
+                request = velox.LLMRequest(velox.APP_SCOPE_ID, eid, messages, native_tools=tools)
                 endpoint, url, body, headers, timeout, payload = self.llm._payload_and_headers(request, stream=stream)
                 self.assertEqual(url, 'https://inference.baseten.co/v1/chat/completions')
                 self.assertEqual(json.loads(body), payload)
@@ -45141,19 +45393,20 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
         self.assertEqual(messages, original)
 
     def test_baseten_effort_overrides_use_supported_none_high_max_contract(self) -> None:
+        eid = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
         family = velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017
         self.assertEqual(velox.endpoint_reasoning_level_options(family), (('max', 'Max'), ('high', 'High'), ('none', 'None')))
         cases = ((None, 'max'), ('max', 'max'), ('high', 'high'), ('low', 'high'),
                  ('medium', 'high'), ('xhigh', 'high'), ('none', 'none'), ('minimal', 'none'), ('off', 'none'))
         for override, expected in cases:
             with self.subTest(override=override):
-                request = velox.LLMRequest(velox.APP_SCOPE_ID, self.eid, [{'role': 'user', 'content': 'Hello'}],
+                request = velox.LLMRequest(velox.APP_SCOPE_ID, eid, [{'role': 'user', 'content': 'Hello'}],
                                            reasoning_effort_override=override)
                 payload = self.llm._payload_and_headers(request, stream=False)[-1]
                 self.assertEqual(payload['reasoning_effort'], expected)
                 self.assertEqual(payload['chat_template_kwargs'], {'thinking': expected != 'none', 'reasoning_effort': expected})
                 self.assertNotIn('thinking', payload)
-        self.assertEqual(self.llm.resolve_endpoint(self.eid)['reasoning_effort'], 'max')
+        self.assertEqual(self.llm.resolve_endpoint(eid)['reasoning_effort'], 'max')
 
     def test_both_qwen_27b_presets_send_xhigh_with_distinct_local_connections(self) -> None:
         for eid, label, provider, url, image_context in (
@@ -45187,6 +45440,7 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
             _install_legacy_endpoint_fixtures(storage)
             config = storage.load_config()
             new_ids = {velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID,
+                       velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID,
                        velox.DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID}
             config['llm']['endpoint_profiles'] = [p for p in config['llm']['endpoint_profiles'] if p['id'] not in new_ids]
             config['llm']['default_profile_id'] = velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID
@@ -45624,12 +45878,12 @@ class ChatSubagentEndpointRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRun
 
 class UnifiedReleaseVersionTests(unittest.TestCase):
     def test_current_application_and_compatibility_versions(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 321)
+        self.assertEqual(velox.CURRENT_VERSION, 323)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 316)
-        self.assertEqual(velox.APP_VERSION, 'velox.v321')
-        self.assertEqual(velox.SOURCE_REVISION, '321')
-        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V321]')
-        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/321')
+        self.assertEqual(velox.APP_VERSION, 'velox.v323')
+        self.assertEqual(velox.SOURCE_REVISION, '323')
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V323]')
+        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/323')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v316')
         header = Path(velox.__file__).read_text(encoding='utf-8').splitlines()[:3]
         self.assertIn('# Every commit must bump CURRENT_VERSION (for example, 316 -> 317), no exceptions.', header)
@@ -46006,6 +46260,7 @@ class EndpointTokenPricingTests(_LegacyEndpointFixtureMixin, _StorageFixture):
     def test_verified_default_usd_rates_for_requested_endpoints(self) -> None:
         for pid, values in (
             (velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID, (.30, .007, 1.20)),
+            (velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID, (.30, .006, 1.20)),
             (velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID, (.10, .01, .50)),
             (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, (2., .10, 10.)),
             (velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID, (10., 1., 50.)),
