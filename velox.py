@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 324
+CURRENT_VERSION = 325
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -769,6 +769,43 @@ EMOJI_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
     "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
 ]
+
+# Open these only when text actually needs a glyph missing from the main and
+# emoji fonts. Kaomoji commonly mix Japanese, fullwidth, Kannada, Thai, Tibetan
+# and Canadian Aboriginal characters; selecting one UI face cannot cover them.
+UNICODE_FALLBACK_FONT_CANDIDATES = [
+    str(Path(__file__).resolve().parent / "fonts" / name)
+    for name in ("VeloxKaomojiCJK.otf", "NotoSansKannada-Regular.ttf",
+                 "NotoSansThai-Regular.ttf", "NotoSerifTibetan-Regular.ttf",
+                 "NotoSansCanadianAboriginal-Regular.ttf")
+] + [
+    "C:/Windows/Fonts/seguisym.ttf", "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/YuGothR.ttc",
+    "C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/msgothic.ttc",
+    "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msjh.ttc",
+    "C:/Windows/Fonts/malgun.ttf", "C:/Windows/Fonts/Nirmala.ttf",
+    "C:/Windows/Fonts/leelawui.ttf", "C:/Windows/Fonts/himalaya.ttf",
+    "C:/Windows/Fonts/gadugi.ttf", "C:/Windows/Fonts/ebrima.ttf",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Kohinoor Kannada.ttc",
+    "/System/Library/Fonts/Supplemental/Kailasa.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansKannada-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSerifTibetan-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCanadianAboriginal-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+]
+FONT_DYNAMIC_GLYPH_CAPACITY = 512
+FONT_GLYPH_MISS_CACHE_LIMIT = 4096
+
 def _build_common_emoji_chars() -> str:
     """Return a broad single-codepoint emoji/symbol atlas set.
 
@@ -919,7 +956,7 @@ def is_emoji_char(ch: str) -> bool:
         or 0x2600 <= cp <= 0x27BF
         or 0x2300 <= cp <= 0x23FF
         or 0x2B00 <= cp <= 0x2BFF
-        or cp in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139,
+        or cp in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x20E3, 0x2122, 0x2139,
                   0x3030, 0x303D, 0x3297, 0x3299)
     )
 
@@ -9081,6 +9118,9 @@ def font_render_chars(font: Any, ch: str) -> str:
     if isinstance(forced_map, dict) and ch in forced_map:
         return usable_mapping(forced_map.get(ch))
     if isinstance(glyphs, dict) and ch in glyphs:
+        return ch
+    ensure_glyph = getattr(font, "ensure_glyph", None)
+    if callable(ensure_glyph) and ensure_glyph(ch):
         return ch
     if isinstance(fallback_map, dict) and ch in fallback_map:
         return usable_mapping(fallback_map.get(ch))
@@ -57758,8 +57798,7 @@ class Renderer:
             # SDL's software renderer can replace destination alpha with 255
             # when unmodulated glyph pixels blend onto a transparent target.
             # This makes cached emoji/white text acquire opaque black fringes.
-            # Direct atlas geometry avoids that faulty intermediate target and
-            # still uses the existing bounded geometry cache for larger runs.
+            # The direct atlas path avoids that faulty intermediate target.
             self._render_text_runs_geometry([(text, x, y, color, None, None)])
             return
         if not (self.font.texture and hasattr(sdl, "SDL_CreateTexture") and hasattr(sdl, "SDL_SetRenderTarget") and hasattr(sdl, "SDL_RenderGeometry") and hasattr(sdl, "SDL_BLENDMODE_BLEND_PREMULTIPLIED")):
@@ -57772,11 +57811,11 @@ class Renderer:
             # point one label at another label's cached texture. Python caches
             # string hashes, and the digest is computed only the first time this
             # exact run/color/font tuple is seen.
-            cache_tuple = (id(self.font), int(self.font.font_size), normalize_font_weight(getattr(self.font, "font_weight", "heavy")), color_key, str(text))
+            cache_tuple = (id(self.font), int(self.font.font_size), normalize_font_weight(getattr(self.font, "font_weight", "heavy")), int(getattr(self.font, "_atlas_revision", 0)), color_key, str(text))
             key = self._text_run_key_cache.get(cache_tuple)
             if key is None:
                 digest = hashlib.blake2b(str(text).encode("utf-8", errors="replace"), digest_size=16).hexdigest()
-                key = f"text_run:{cache_tuple[0]}:{cache_tuple[1]}:{cache_tuple[2]}:{color_key}:{len(str(text))}:{digest}"
+                key = f"text_run:{cache_tuple[0]}:{cache_tuple[1]}:{cache_tuple[2]}:r{cache_tuple[3]}:{color_key}:{len(str(text))}:{digest}"
                 if len(self._text_run_key_cache) > self.text_texture_cache_max * 2:
                     self._text_run_key_cache.clear()
                 self._text_run_key_cache[cache_tuple] = key
@@ -57873,10 +57912,61 @@ class Renderer:
     def _render_glyphs(self, quads: list[GlyphQuad]) -> None:
         if not self.font:
             return
-        if self.font.texture and hasattr(sdl, "SDL_RenderGeometry") and hasattr(sdl, "SDL_Vertex"):
+        if self.font.texture and not self._text_geometry_backend_supported():
+            self._render_glyphs_texture_copies(quads)
+        elif self.font.texture and hasattr(sdl, "SDL_RenderGeometry") and hasattr(sdl, "SDL_Vertex"):
             self._render_glyphs_geometry(quads)
         else:
             self._render_glyphs_debug_fallback(quads)
+
+    def _text_geometry_backend_supported(self) -> bool:
+        cached = getattr(self, "_text_geometry_backend_ok", None)
+        if cached is None:
+            cached = True
+            get_name = getattr(sdl, "SDL_GetRendererName", None)
+            if get_name is not None:
+                try:
+                    name = get_name(self.host.renderer)
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8", errors="replace")
+                    cached = str(name or "").lower() != "software"
+                except Exception:
+                    pass
+            self._text_geometry_backend_ok = cached
+        return bool(cached)
+
+    def _render_glyphs_texture_copies(self, quads: list[GlyphQuad]) -> None:
+        """Keep complete glyph ink on SDL's software renderer.
+
+        Its geometry rasterizer can lose the bottom rows of an atlas cell,
+        erasing underscores and clipping descenders. Integer source rectangles
+        through RenderTexture preserve those rows without a transparent target.
+        """
+        if not self.font or not self.font.texture or not quads:
+            return
+        font = self.font
+        texture = font.texture
+        previous_color = None
+        self.last_glyph_count += len(quads)
+        try:
+            for quad in quads:
+                color = (quad.color.r & 255, quad.color.g & 255,
+                         quad.color.b & 255, quad.color.a & 255)
+                if color != previous_color:
+                    sdl.SDL_SetTextureColorMod(texture, *color[:3])
+                    sdl.SDL_SetTextureAlphaMod(texture, color[3])
+                    previous_color = color
+                left = round(quad.u0 * font.atlas_w)
+                top = round(quad.v0 * font.atlas_h)
+                right = round(quad.u1 * font.atlas_w)
+                bottom = round(quad.v1 * font.atlas_h)
+                source = sdl.SDL_FRect(left, top, right - left, bottom - top)
+                target = sdl.SDL_FRect(quad.x, quad.y, quad.w, quad.h)
+                sdl.SDL_RenderTexture(self.host.renderer, texture,
+                                      ctypes.byref(source), ctypes.byref(target))
+        finally:
+            sdl.SDL_SetTextureColorMod(texture, 255, 255, 255)
+            sdl.SDL_SetTextureAlphaMod(texture, 255)
 
     def _ensure_geometry_buffers(self, quad_count: int) -> tuple[Any, Any]:
         v_needed = max(0, quad_count * 4)
@@ -57943,6 +58033,9 @@ class Renderer:
 
     def _render_glyphs_geometry(self, quads: list[GlyphQuad]) -> None:
         assert self.font is not None
+        if not self._text_geometry_backend_supported():
+            self._render_glyphs_texture_copies(quads)
+            return
         n = len(quads)
         self.last_glyph_count += n
         if n <= 0:
@@ -58079,11 +58172,12 @@ class Renderer:
         # character numeric glyph plans to minimize compilation cost.
         if not self.font:
             return
-        if not (self.font.texture and hasattr(sdl, "SDL_RenderGeometry") and hasattr(sdl, "SDL_Vertex")):
+        if not (self.font.texture and hasattr(sdl, "SDL_RenderGeometry")
+                and hasattr(sdl, "SDL_Vertex") and self._text_geometry_backend_supported()):
             quads: list[GlyphQuad] = []
             for text, x, y, color, clip_left, clip_right in runs:
                 quads.extend(self.font.layout_text_to_quads_visible(text, x, y, color, clip_left, clip_right))
-            self._render_glyphs_debug_fallback(quads)
+            self._render_glyphs(quads)
             return
 
         self._ensure_text_geometry_cache_state()
@@ -58305,6 +58399,15 @@ class FontAtlas:
         self._glyph_source_fonts: dict[str, Any] = {}
         self._glyph_scales: dict[str, float] = {}
         self._color_glyphs: set[str] = set()
+        self._fallback_ttf_fonts: list[Any] = []
+        self._fallback_font_paths: list[str] | None = None
+        self._fallback_font_next = 0
+        self._atlas_free_slots: list[tuple[int, int]] = []
+        self._atlas_cell_size: tuple[int, int] = (0, 0)
+        self._atlas_pixel_format: Any = None
+        self._glyph_misses: collections.OrderedDict[str, None] = collections.OrderedDict()
+        self._font_owner_thread = threading.get_ident()
+        self._ttf_initialized = False
         self.glyphs: dict[str, Glyph] = {}
         self.atlas_w = 0
         self.atlas_h = 0
@@ -58348,6 +58451,8 @@ class FontAtlas:
 
     def build(self) -> None:
         # Feature: pre-render Latin/basic UTF-8 glyphs into a texture atlas.
+        if self.texture or self.ttf_font or self.emoji_ttf_font or self._fallback_ttf_fonts or self._ttf_initialized:
+            self.destroy()
         self._atlas_revision = int(getattr(self, "_atlas_revision", 0) or 0) + 1
         self._glyph_geometry_plan_cache.clear()
         self._glyph_source_fonts.clear()
@@ -58356,11 +58461,14 @@ class FontAtlas:
         self._measure_cache.clear()
         self._measure_cache_chars = 0
         self._prefix_cache.clear()
+        self._atlas_free_slots.clear()
+        self._glyph_misses.clear()
+        self._font_owner_thread = threading.get_ident()
         if sdl is None:
             return
         try:
             if hasattr(sdl, "TTF_Init"):
-                sdl.TTF_Init()
+                self._ttf_initialized = bool(sdl.TTF_Init())
             font_path = self._resolve_font_path()
             if font_path and hasattr(sdl, "TTF_OpenFont"):
                 self.ttf_font = sdl.TTF_OpenFont(str(font_path).encode(), float(self.font_size))
@@ -58480,9 +58588,19 @@ class FontAtlas:
         emphasis text keep natural spacing.
         """
         fallback = max(1, int(fallback_width or self.char_w))
+        if unicodedata.category(ch) == "Mn":
+            # Some monospace faces allocate an entire cell to combining marks,
+            # and synthetic bold can add a small advance to zero-width marks.
+            # Unicode nonspacing marks must not move the pen in either case.
+            return 0
         if not self.ttf_font or sdl is None:
             return fallback
         source_font = self._glyph_source_fonts.get(ch, self.ttf_font)
+        if unicodedata.category(ch) == "Me":
+            metrics = self._glyph_metrics(ch, source_font)
+            if metrics is not None:
+                return max(0, int(round(metrics[4] * self._glyph_scales.get(ch, 1.0))))
+            return 0
         if source_font != self.ttf_font:
             # A fallback emoji is often twice the main font's missing-glyph
             # advance. Its pixels and metrics must come from the same face.
@@ -58501,6 +58619,61 @@ class FontAtlas:
             finally:
                 self._set_ttf_style_flags(render_flags)
         return self._measure_glyph_advance_current_style(ch, fallback)
+
+    def _glyph_metrics(self, ch: str, font: Any) -> tuple[int, int, int, int, int] | None:
+        for name in ("TTF_GetGlyphMetrics", "TTF_GlyphMetrics32", "TTF_GlyphMetrics"):
+            fn = getattr(sdl, name, None)
+            if fn is None:
+                continue
+            values = [ctypes.c_int() for _ in range(5)]
+            try:
+                result = fn(font, ord(ch), *(ctypes.byref(value) for value in values))
+                if result is False:
+                    continue
+                return tuple(value.value for value in values)
+            except Exception:
+                continue
+        return None
+
+    def _atlas_glyph(self, ch: str, ax: int, ay: int, width: int, height: int) -> Glyph:
+        """Use the same source-font metrics for preloaded and on-demand glyphs."""
+        advance = self._measure_glyph_advance(ch, width)
+        source = self._glyph_source_fonts.get(ch, self.ttf_font)
+        scale = self._glyph_scales.get(ch, 1.0)
+        offset_x = 0
+        if advance == 0 and unicodedata.category(ch) in {"Mn", "Me"}:
+            metrics = self._glyph_metrics(ch, source)
+            if metrics is not None:
+                # SDL_ttf surfaces shift negative left bearings into their
+                # bitmap. Restore the bearing to draw accents over the base.
+                bearing = min(0, metrics[0])
+                if unicodedata.category(ch) == "Mn" and metrics[4] > 0:
+                    fixed_width = source == self.ttf_font and self.font_role == "Mono"
+                    for name in ("TTF_FontIsFixedWidth", "TTF_FontFaceIsFixedWidth"):
+                        query = getattr(sdl, name, None)
+                        if query is not None:
+                            try:
+                                value = query(source)
+                                fixed_width = bool(getattr(value, "value", value))
+                                break
+                            except Exception:
+                                continue
+                    # A spacing-style mark is drawn inside a full native cell;
+                    # move that cell over the preceding base. Proportional
+                    # marks with negative bearings are already anchored to the
+                    # pen, so ignore only their synthetic-bold advance there.
+                    if fixed_width or metrics[0] >= 0:
+                        bearing -= metrics[4]
+                offset_x = int(round(bearing * scale))
+        offset_y = 0
+        if source != self.ttf_font:
+            ascent = self._ttf_metric_int(("TTF_GetFontAscent", "TTF_FontAscent"), self.baseline_px)
+            source_ascent = self._ttf_metric_int(
+                ("TTF_GetFontAscent", "TTF_FontAscent"), height, font=source,
+            )
+            offset_y = max(0, min(self.line_h - height, ascent - int(round(source_ascent * scale))))
+        return Glyph(ch, ax, ay, width, height, advance, x_offset=offset_x,
+            y_offset=offset_y, is_color=ch in self._color_glyphs)
 
     def _measure_glyph_advance_current_style(self, ch: str, fallback: int, *, font: Any = None) -> int:
         """Compatibility ladder for whatever SDL_ttf advance APIs are present."""
@@ -58546,7 +58719,8 @@ class FontAtlas:
 
     def _prefix_widths(self, text: str) -> tuple[int, ...]:
         text = str(text or "")
-        cached = self._prefix_cache.get(text)
+        cacheable = not getattr(self, "ready", False) or threading.get_ident() == self._font_owner_thread
+        cached = self._prefix_cache.get(text) if cacheable else None
         if cached is not None:
             return cached
         glyphs = self.glyphs
@@ -58560,10 +58734,11 @@ class FontAtlas:
                 adv += g.advance if g else self.char_w
             acc += adv
             widths.append(acc)
-        if len(self._prefix_cache) > 4096:
-            self._prefix_cache.clear()
         out = tuple(widths)
-        self._prefix_cache[text] = out
+        if cacheable:
+            if len(self._prefix_cache) > 4096:
+                self._prefix_cache.clear()
+            self._prefix_cache[text] = out
         return out
 
     def visible_text_span(self, text: str, x: int | float, clip_left: int | None, clip_right: int | None, guard: int | None = None) -> tuple[int, int, int]:
@@ -58615,7 +58790,44 @@ class FontAtlas:
                 continue
         return None
 
-    def _render_glyph_surface(self, ch: str, color: Any) -> Any:
+    def _iter_fallback_fonts(self) -> Iterable[Any]:
+        """Reuse opened fallback faces and lazily open remaining installed ones."""
+        yield from self._fallback_ttf_fonts
+        if self._fallback_font_paths is None:
+            self._fallback_font_paths = []
+            seen: set[str] = set()
+            for raw in UNICODE_FALLBACK_FONT_CANDIDATES:
+                try:
+                    path = Path(raw)
+                    key = str(path.resolve())
+                    if key not in seen and path.is_file():
+                        seen.add(key)
+                        self._fallback_font_paths.append(str(path))
+                except OSError:
+                    continue
+        while self._fallback_font_next < len(self._fallback_font_paths):
+            path = self._fallback_font_paths[self._fallback_font_next]
+            self._fallback_font_next += 1
+            font = None
+            try:
+                font = sdl.TTF_OpenFont(path.encode("utf-8"), float(self.font_size))
+                if not font:
+                    continue
+                if hasattr(sdl, "TTF_SetFontStyle"):
+                    sdl.TTF_SetFontStyle(font, self._ttf_style_flags())
+                if hasattr(sdl, "TTF_SetFontKerning"):
+                    sdl.TTF_SetFontKerning(font, 0)
+                self._fallback_ttf_fonts.append(font)
+                yield font
+            except Exception:
+                if font:
+                    try:
+                        sdl.TTF_CloseFont(font)
+                    except Exception:
+                        pass
+                continue
+
+    def _render_glyph_surface(self, ch: str, color: Any, *, allow_fallback: bool = False) -> Any:
         # Best-effort emoji and common-Unicode support without a shaping
         # dependency. Reject a font's missing-glyph box when SDL_ttf can report
         # availability, then try the emoji and primary fonts in order.
@@ -58644,7 +58856,8 @@ class FontAtlas:
             font_candidates.append(self.emoji_ttf_font)
         if self.ttf_font:
             font_candidates.append(self.ttf_font)
-        for font in font_candidates:
+        fonts = itertools.chain(font_candidates, self._iter_fallback_fonts() if allow_fallback else ())
+        for font in fonts:
             if self._ttf_font_has_glyph(font, ch) is False:
                 continue
             for fn in candidates:
@@ -58692,14 +58905,14 @@ class FontAtlas:
         return bool(self.emoji_ttf_font and font == self.emoji_ttf_font)
 
     def _fit_emoji_surface(self, ch: str, surface: Any) -> Any:
-        """Consume a fallback emoji surface and fit bitmap strikes to UI size.
+        """Consume a fallback-font surface and fit it to the main UI height.
 
         Bitmap emoji fonts may return a fixed 128-pixel strike for a requested
         16-pixel font. Scale the pixels once before sizing the atlas, and retain
         the same scale for advances and baseline alignment.
         """
         source = self._glyph_source_fonts.get(ch, self.ttf_font)
-        if source == self.ttf_font or not is_emoji_char(ch):
+        if source == self.ttf_font:
             return surface
         width, height = self._surface_size(surface)
         target_height = max(1, self._ttf_metric_int(("TTF_GetFontHeight", "TTF_FontHeight"), self.font_size))
@@ -58730,6 +58943,69 @@ class FontAtlas:
             sdl.SDL_DestroySurface(surface)
             if scaled and not success:
                 sdl.SDL_DestroySurface(scaled)
+
+    def _remember_glyph_miss(self, ch: str) -> None:
+        self._glyph_misses[ch] = None
+        self._glyph_misses.move_to_end(ch)
+        while len(self._glyph_misses) > FONT_GLYPH_MISS_CACHE_LIMIT:
+            self._glyph_misses.popitem(last=False)
+
+    def ensure_glyph(self, ch: str) -> bool:
+        """Add one encountered Unicode glyph without resizing existing cells.
+
+        Font operations stay on the owning UI thread. Slots, open fallback faces
+        and failed lookups are bounded; an exhausted atlas never rescans fonts.
+        """
+        if ch in self.glyphs:
+            return True
+        if ch in self._glyph_misses:
+            self._glyph_misses.move_to_end(ch)
+            return False
+        if (len(ch) != 1 or not self.ready or not self.texture or sdl is None
+                or threading.get_ident() != self._font_owner_thread
+                or not self._atlas_free_slots
+                or unicodedata.category(ch) in {"Cc", "Cs"}):
+            return False
+        surface = None
+        converted = None
+        try:
+            surface = self._render_glyph_surface(ch, sdl.SDL_Color(255, 255, 255, 255), allow_fallback=True)
+            if surface:
+                surface = self._fit_emoji_surface(ch, surface)
+            if not surface:
+                self._remember_glyph_miss(ch)
+                return False
+            width, height = self._surface_size(surface)
+            cell_w, cell_h = self._atlas_cell_size
+            if width <= 0 or height <= 0 or width > cell_w - 2 or height > cell_h - 2:
+                self._remember_glyph_miss(ch)
+                return False
+            converted = sdl.SDL_ConvertSurface(surface, self._atlas_pixel_format)
+            if not converted:
+                self._remember_glyph_miss(ch)
+                return False
+            ax, ay = self._atlas_free_slots[-1]
+            rect = sdl.SDL_Rect(ax, ay, width, height)
+            if not sdl.SDL_UpdateTexture(self.texture, ctypes.byref(rect),
+                    converted.contents.pixels, converted.contents.pitch):
+                self._remember_glyph_miss(ch)
+                return False
+            self.glyphs[ch] = self._atlas_glyph(ch, ax, ay, width, height)
+            self._atlas_free_slots.pop()
+            self._atlas_revision += 1
+            self._measure_cache.clear()
+            self._measure_cache_chars = 0
+            self._prefix_cache.clear()
+            self._glyph_geometry_plan_cache.pop(ch, None)
+            return True
+        except Exception:
+            self._remember_glyph_miss(ch)
+            return False
+        finally:
+            if converted:
+                sdl.SDL_DestroySurface(converted)
+            if surface:
+                sdl.SDL_DestroySurface(surface)
 
     def _build_atlas_from_ttf(self) -> None:
         chars = self._glyph_charset()
@@ -58775,11 +59051,24 @@ class FontAtlas:
         cell_h = max(1, max_h) + 2
         cols = 64 if len(chars) > 2048 else 32
         rows = math.ceil(len(chars) / cols)
+        unused_cells = [i for i in range(rows * cols)
+                        if i >= len(chars) or chars[i] not in glyph_surfaces]
+        # Most fonts already leave many cells empty. Reserve extra rows only
+        # when a broad face would otherwise leave too little on-demand space.
+        extra_rows = math.ceil(max(0, FONT_DYNAMIC_GLYPH_CAPACITY - len(unused_cells)) / cols)
+        unused_cells.extend(range(rows * cols, (rows + extra_rows) * cols))
+        rows += extra_rows
+        self._atlas_cell_size = (cell_w, cell_h)
+        self._atlas_free_slots = [
+            ((i % cols) * cell_w + 1, (i // cols) * cell_h + 1)
+            for i in unused_cells[:FONT_DYNAMIC_GLYPH_CAPACITY]
+        ]
         self.atlas_w = cols * cell_w
         self.atlas_h = rows * cell_h
         atlas_surface = None
         if hasattr(sdl, "SDL_CreateSurface") and hasattr(sdl, "SDL_BlitSurface"):
             fmt = getattr(sdl, "SDL_PIXELFORMAT_RGBA32", getattr(sdl, "SDL_PIXELFORMAT_ARGB8888", 0))
+            self._atlas_pixel_format = fmt
             atlas_surface = sdl.SDL_CreateSurface(self.atlas_w, self.atlas_h, fmt)
         if not atlas_surface:
             for surf in glyph_surfaces.values():
@@ -58811,18 +59100,13 @@ class FontAtlas:
                     sdl.SDL_BlitSurface(surf, None, atlas_surface, ctypes.byref(dst))
                 except Exception:
                     pass
-                adv = self._measure_glyph_advance(ch, w)
-                offset_y = 0
-                source_font = self._glyph_source_fonts.get(ch, self.ttf_font)
-                if source_font != self.ttf_font:
-                    source_ascent = self._ttf_metric_int(
-                        ("TTF_GetFontAscent", "TTF_FontAscent"), h, font=source_font,
-                    )
-                    offset_y = max(0, min(self.line_h - h,
-                        ascent - int(round(source_ascent * self._glyph_scales.get(ch, 1.0)))))
-                self.glyphs[ch] = Glyph(ch, ax, ay, w, h, adv,
-                    y_offset=offset_y, is_color=ch in self._color_glyphs)
+                self.glyphs[ch] = self._atlas_glyph(ch, ax, ay, w, h)
             self.texture = sdl.SDL_CreateTextureFromSurface(self.renderer.host.renderer, atlas_surface)
+            if self.texture and hasattr(sdl, "SDL_GetTextureProperties") and hasattr(sdl, "SDL_GetNumberProperty"):
+                properties = sdl.SDL_GetTextureProperties(self.texture)
+                self._atlas_pixel_format = sdl.SDL_GetNumberProperty(properties,
+                    getattr(sdl, "SDL_PROP_TEXTURE_FORMAT_NUMBER", b"SDL.texture.format"),
+                    self._atlas_pixel_format)
             if self.texture and hasattr(sdl, "SDL_SetTextureBlendMode"):
                 sdl.SDL_SetTextureBlendMode(self.texture, getattr(sdl, "SDL_BLENDMODE_BLEND", 1))
             if self.texture and hasattr(sdl, "SDL_SetTextureScaleMode"):
@@ -58862,7 +59146,9 @@ class FontAtlas:
 
     def measure_text(self, text: str) -> int:
         text = str(text)
-        cacheable = len(text) <= FONT_MEASURE_CACHE_MAX_TEXT_CHARS
+        cacheable = (len(text) <= FONT_MEASURE_CACHE_MAX_TEXT_CHARS
+                     and (not getattr(self, "ready", False)
+                          or threading.get_ident() == self._font_owner_thread))
         if cacheable:
             cached = self._measure_cache.get(text)
             if cached is not None:
@@ -58981,19 +59267,44 @@ class FontAtlas:
 
     def destroy(self) -> None:
         # Feature: font atlas resources are released on shutdown.
+        texture, self.texture = self.texture, None
+        fonts = [self.ttf_font, self.emoji_ttf_font, *self._fallback_ttf_fonts]
+        self.ttf_font = self.emoji_ttf_font = None
+        initialized, self._ttf_initialized = self._ttf_initialized, False
+        self._fallback_ttf_fonts.clear()
+        self._fallback_font_paths = None
+        self._fallback_font_next = 0
+        self.ready = False
+        self.glyphs.clear()
+        self._atlas_free_slots.clear()
+        self._glyph_misses.clear()
+        self._glyph_source_fonts.clear()
+        self._glyph_scales.clear()
+        self._color_glyphs.clear()
+        self._measure_cache.clear()
+        self._measure_cache_chars = 0
+        self._prefix_cache.clear()
+        self._glyph_geometry_plan_cache.clear()
         if sdl is None:
             return
-        try:
-            if self.texture:
-                sdl.SDL_DestroyTexture(self.texture)
-            if self.ttf_font and hasattr(sdl, "TTF_CloseFont"):
-                sdl.TTF_CloseFont(self.ttf_font)
-            if self.emoji_ttf_font and hasattr(sdl, "TTF_CloseFont"):
-                sdl.TTF_CloseFont(self.emoji_ttf_font)
-            if hasattr(sdl, "TTF_Quit"):
+        if texture:
+            try:
+                sdl.SDL_DestroyTexture(texture)
+            except Exception:
+                pass
+        closed: set[int] = set()
+        for font in fonts:
+            if font and id(font) not in closed:
+                closed.add(id(font))
+                try:
+                    sdl.TTF_CloseFont(font)
+                except Exception:
+                    pass
+        if initialized and hasattr(sdl, "TTF_Quit"):
+            try:
                 sdl.TTF_Quit()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -59012,6 +59323,7 @@ class MarkdownLayoutEngine:
 
     ESCAPABLE = r"\\`*_{}[]()#+-.!|<>~"
     INLINE_TOKEN_RE = re.compile(r"\n|[ \t]+|[^ \t\n]+")
+    _EMOTICON_EYE_PAIRS = frozenset(ch + ch for ch in "^-.=@~;¬°•●◦◉◎⊙ʘಠಥರ눈TtOoUuVvXxQqn") | {"><", "oO", "Oo"}
 
     def __init__(self, font: FontAtlas, code_font: FontAtlas | None = None, bold_font: FontAtlas | None = None, italic_font: FontAtlas | None = None, bold_italic_font: FontAtlas | None = None, *, table_word_wrap: bool = False):
         self.font = font
@@ -59363,9 +59675,20 @@ class MarkdownLayoutEngine:
                     add_children(children, {"href": url})
                     i = end
                     continue
+            if ch == "_":
+                literal_end = self._literal_emoticon_underscore_end(text, i)
+                if literal_end > i:
+                    append_text(text[i:literal_end], base_style)
+                    i = literal_end
+                    continue
             for marker, style_key in (("~~", "strike"), ("**", "bold"), ("__", "bold")):
                 if text.startswith(marker, i):
                     j = text.find(marker, i + len(marker))
+                    while marker == "__" and j != -1:
+                        literal_end = self._literal_emoticon_underscore_end(text, j)
+                        if literal_end <= j:
+                            break
+                        j = text.find(marker, literal_end)
                     if j != -1:
                         add_children(self.parse_inline(text[i + len(marker):j], base=base_style), {style_key: True})
                         i = j + len(marker)
@@ -59427,6 +59750,40 @@ class MarkdownLayoutEngine:
         keys = {"bold", "italic", "strike", "code", "href", "local_path", "image", "alt", "hardbreak"}
         return all(span.get(k) == style.get(k) for k in keys)
 
+    @classmethod
+    def _literal_emoticon_underscore_end(cls, text: str, index: int) -> int:
+        """Protect familiar face mouths/arms from cross-face emphasis matching.
+
+        This is a small chat-rendering exception, not general delimiter parsing.
+        Bounded local scans avoid repeatedly walking arbitrary underscore or
+        combining-mark runs. Backslash escapes and inline code are handled by
+        the caller before this check.
+        """
+        if text.startswith("_/¯", index) and text[max(0, index - 7):index].endswith(
+            ("¯_(ツ)", "¯\\_(ツ)", "¯\\\\_(ツ)"),
+        ):
+            return index + 1
+        start = index
+        for _ in range(3):
+            if start > 0 and text[start - 1] == "_":
+                start -= 1
+            else:
+                break
+        end = index + 1
+        while end < len(text) and end - start <= 3 and text[end] == "_":
+            end += 1
+        if end - start > 3 or (start > 0 and text[start - 1] == "_"):
+            return index
+        left = start - 1
+        for _ in range(4):
+            if left >= 0 and unicodedata.category(text[left]).startswith("M"):
+                left -= 1
+            else:
+                break
+        if left >= 0 and end < len(text) and text[left] + text[end] in cls._EMOTICON_EYE_PAIRS:
+            return end
+        return index
+
     def _find_single_emphasis_close(self, text: str, marker: str, start: int) -> int:
         i = start
         while i < len(text):
@@ -59434,6 +59791,11 @@ class MarkdownLayoutEngine:
                 i += 2
                 continue
             if text[i] == marker:
+                if marker == "_":
+                    literal_end = self._literal_emoticon_underscore_end(text, i)
+                    if literal_end > i:
+                        i = literal_end
+                        continue
                 if marker == "_" and i > 0 and i + 1 < len(text) and text[i - 1].isalnum() and text[i + 1].isalnum():
                     i += 1
                     continue
