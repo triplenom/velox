@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 323
+CURRENT_VERSION = 324
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -840,7 +840,7 @@ COMMON_CHAT_GLYPH_RANGES: tuple[tuple[int, int], ...] = (
     (0x27C0, 0x2800),  # supplemental mathematical symbols/arrows
     (0x2E00, 0x2E80),  # supplemental punctuation
 )
-COMMON_CHAT_GLYPH_EXTRA = "’‘“”–—…•·‚„′″‹›«»‑−×÷±≤≥≠≈→←↑↓✓✔✕✖★☆⚙⌘⌥⌫⌦↵⇧�"
+COMMON_CHAT_GLYPH_EXTRA = "’‘“”–—…•·‚„′″‹›«»‑−×÷±≤≥≠≈→←↑↓✓✔✕✖★☆⚙⌘⌥⌫⌦↵⇧�〰〽㊗㊙"
 # Keep the atlas cardinality stable across Python 3.10+ Unicode database
 # revisions. Newly assigned symbols can otherwise change the count, texture
 # dimensions, VRAM estimate, and tests from one supported Python release to
@@ -915,9 +915,12 @@ def is_emoji_char(ch: str) -> bool:
         return False
     cp = ord(ch[0])
     return (
-        0x1F300 <= cp <= 0x1FAFF
+        0x1F000 <= cp <= 0x1FAFF
         or 0x2600 <= cp <= 0x27BF
-        or 0xFE00 <= cp <= 0xFE0F
+        or 0x2300 <= cp <= 0x23FF
+        or 0x2B00 <= cp <= 0x2BFF
+        or cp in (0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139,
+                  0x3030, 0x303D, 0x3297, 0x3299)
     )
 
 def emoji_font_path() -> str:
@@ -9033,7 +9036,8 @@ FONT_FORCED_FALLBACK_MAP = {
     "\u00a0": " ",       # no-break space
     "\u202f": " ",       # narrow no-break space
     "\u00ad": "",        # discretionary soft hyphen
-    "\ufe0f": "", "\ufe0e": "", "\u200d": "",
+    "\ufe0f": "", "\ufe0e": "", "\u200b": "", "\u200c": "", "\u200d": "",
+    "\u2060": "", "\ufeff": "",
 }
 
 # These substitutions are used only when the selected font lacks the native
@@ -9058,6 +9062,13 @@ def font_render_chars(font: Any, ch: str) -> str:
     glyphs = getattr(font, "glyphs", {})
     forced_map = getattr(font, "forced_fallback_map", FONT_FORCED_FALLBACK_MAP)
     fallback_map = getattr(font, "fallback_map", FONT_FALLBACK_MAP)
+
+    # Variation selectors and emoji tag characters have no independent ink or
+    # advance. The component-glyph fallback must not turn them into '?' boxes.
+    if len(ch) == 1 and (0xFE00 <= ord(ch) <= 0xFE0F
+                         or 0xE0020 <= ord(ch) <= 0xE007F
+                         or 0xE0100 <= ord(ch) <= 0xE01EF):
+        return ""
 
     def usable_mapping(mapping: Any) -> str:
         mapped = str(mapping or "")
@@ -21367,14 +21378,31 @@ class GoogleCalendarIntegration:
             )
         cancelled_missing = 0
         if full_sync:
-            window_start_day = date.fromisoformat(window_start[:10])
-            window_end_day = date.fromisoformat(window_end[:10])
+            window_start_dt = _comparable_datetime(window_start)
+            window_end_dt = _comparable_datetime(window_end)
             for existing in existing_events:
                 try:
-                    existing_start, existing_end = self.calendar._event_local_dates(existing)
+                    if bool(existing.get("all_day")):
+                        # Google filters all-day Events using their source
+                        # Calendar's timezone, independently of the UI timezone.
+                        zone_name = str(row.get("time_zone") or existing.get("time_zone") or "").strip()
+                        calendar_zone = ZoneInfo(zone_name)
+                        existing_start = datetime.combine(
+                            date.fromisoformat(str(existing["start"])), datetime_time.min, calendar_zone,
+                        )
+                        existing_end = datetime.combine(
+                            date.fromisoformat(str(existing["end"])), datetime_time.min, calendar_zone,
+                        )
+                    else:
+                        existing_start = _comparable_datetime(existing.get("start"))
+                        existing_end = _comparable_datetime(existing.get("end"))
                 except Exception:
+                    # Unknown timing cannot establish that an Event was inside
+                    # the query. Keep the retained record until it can be synced.
                     continue
-                if existing_end < window_start_day or existing_start >= window_end_day:
+                # Events.list uses exclusive timeMin for end and exclusive
+                # timeMax for start. Compare instants, not display-local dates.
+                if existing_end <= window_start_dt or existing_start >= window_end_dt:
                     continue
                 if calendar_event_external_identity(existing) in seen_identities:
                     continue
@@ -34362,7 +34390,16 @@ class WebTools:
                 if not isinstance(item, dict):
                     continue
                 link = str(item.get("link") or "").strip()
-                if urllib.parse.urlparse(link).scheme not in {"http", "https"}:
+                if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in link):
+                    continue
+                try:
+                    parsed = urllib.parse.urlparse(link)
+                    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                        continue
+                    # Parsing the port also validates malformed/out-of-range ports.
+                    _ = parsed.port
+                except ValueError:
+                    # One malformed provider result must not discard valid links.
                     continue
                 results.append({
                     "title": str(item.get("title") or ""), "url": link,
@@ -55625,6 +55662,7 @@ class Glyph:
     advance: int
     x_offset: int = 0
     y_offset: int = 0
+    is_color: bool = False
 
 
 @dataclass(slots=True)
@@ -56691,6 +56729,7 @@ class Renderer:
         # Two-hit admission keeps one-frame streaming fragments out of the SDL
         # texture cache. Stable labels become textures on their second draw.
         self._text_texture_admission_counts: dict[str, int] = {}
+        self._text_texture_cache_supported: bool | None = None
         self._round_outline_cache: dict[tuple[int, int, int], list[tuple[int, int, int, int]]] = {}
         self._rounded_strip_offsets_cache: dict[tuple[int, int, int, int], list[tuple[int, int, int]]] = {}
         self._chat_section_color_cache: dict[str, tuple[Color, Color, Color]] = {}
@@ -57702,7 +57741,28 @@ class Renderer:
     def _render_cached_text(self, text: str, x: int, y: int, color: Color) -> None:
         if not self.font or not text:
             return
-        if not (self.font.texture and hasattr(sdl, "SDL_CreateTexture") and hasattr(sdl, "SDL_SetRenderTarget") and hasattr(sdl, "SDL_RenderGeometry")):
+        cache_supported = getattr(self, "_text_texture_cache_supported", None)
+        if cache_supported is None:
+            cache_supported = True
+            get_name = getattr(sdl, "SDL_GetRendererName", None)
+            if get_name is not None:
+                try:
+                    name = get_name(self.host.renderer)
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8", errors="replace")
+                    cache_supported = str(name or "").lower() != "software"
+                except Exception:
+                    cache_supported = False
+            self._text_texture_cache_supported = cache_supported
+        if not cache_supported:
+            # SDL's software renderer can replace destination alpha with 255
+            # when unmodulated glyph pixels blend onto a transparent target.
+            # This makes cached emoji/white text acquire opaque black fringes.
+            # Direct atlas geometry avoids that faulty intermediate target and
+            # still uses the existing bounded geometry cache for larger runs.
+            self._render_text_runs_geometry([(text, x, y, color, None, None)])
+            return
+        if not (self.font.texture and hasattr(sdl, "SDL_CreateTexture") and hasattr(sdl, "SDL_SetRenderTarget") and hasattr(sdl, "SDL_RenderGeometry") and hasattr(sdl, "SDL_BLENDMODE_BLEND_PREMULTIPLIED")):
             self._render_glyphs(self.font.layout_text_to_quads(text, x, y, color))
             return
         try:
@@ -57754,7 +57814,10 @@ class Renderer:
                 previous = None
                 try:
                     if hasattr(sdl, "SDL_SetTextureBlendMode"):
-                        sdl.SDL_SetTextureBlendMode(texture, getattr(sdl, "SDL_BLENDMODE_BLEND", 1))
+                        # Rendering atlas quads onto a transparent target stores
+                        # premultiplied RGB. Its final copy must not apply alpha
+                        # to RGB a second time (visible as dark emoji/text edges).
+                        sdl.SDL_SetTextureBlendMode(texture, sdl.SDL_BLENDMODE_BLEND_PREMULTIPLIED)
                     if hasattr(sdl, "SDL_SetTextureScaleMode"):
                         antialias = bool(getattr(self.host, "config", {}).get("ui", {}).get("font_antialias", True))
                         if getattr(self.font, "font_role", "Sans") == "Mono":
@@ -58148,7 +58211,7 @@ class Renderer:
                     for draw_ch in font_render_chars(font, ch):
                         glyph = glyphs.get(draw_ch) or fallback_glyph
                         if glyph is None:
-                            resolved.append((False, char_w, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0))
+                            resolved.append((False, char_w, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, False))
                             continue
                         drawable = bool(
                             draw_ch != " " and atlas_w > 0 and atlas_h > 0
@@ -58161,15 +58224,16 @@ class Renderer:
                                 glyph.ax / atlas_w, glyph.ay / atlas_h,
                                 (glyph.ax + glyph.aw) / atlas_w,
                                 (glyph.ay + glyph.ah) / atlas_h,
+                                bool(getattr(glyph, "is_color", False)),
                             ))
                         else:
                             resolved.append((
                                 False, int(glyph.advance), int(glyph.x_offset), int(glyph.y_offset),
-                                int(glyph.aw), int(glyph.ah), 0.0, 0.0, 0.0, 0.0,
+                                int(glyph.aw), int(glyph.ah), 0.0, 0.0, 0.0, 0.0, False,
                             ))
                     plan = tuple(resolved)
                     plan_cache[ch] = plan
-                for drawable, advance, x_offset, y_offset, glyph_w, glyph_h, u0, v0, u1, v1 in plan:
+                for drawable, advance, x_offset, y_offset, glyph_w, glyph_h, u0, v0, u1, v1, is_color in plan:
                     if drawable:
                         gx = float(int(pen_x + x_offset))
                         gy = float(int(pen_y + y_offset))
@@ -58178,9 +58242,11 @@ class Renderer:
                         ):
                             emit_quad(
                                 gx, gy, float(glyph_w), float(glyph_h),
-                                u0, v0, u1, v1, color, alpha_scale=normal_alpha,
+                                u0, v0, u1, v1,
+                                Color(255, 255, 255, color.a) if is_color else color,
+                                alpha_scale=1.0 if is_color else normal_alpha,
                             )
-                            if heavy:
+                            if heavy and not is_color:
                                 emit_quad(
                                     gx, gy, float(glyph_w), float(glyph_h),
                                     u0, v0, u1, v1, color,
@@ -58236,6 +58302,9 @@ class FontAtlas:
         self.texture = None
         self.ttf_font = None
         self.emoji_ttf_font = None
+        self._glyph_source_fonts: dict[str, Any] = {}
+        self._glyph_scales: dict[str, float] = {}
+        self._color_glyphs: set[str] = set()
         self.glyphs: dict[str, Glyph] = {}
         self.atlas_w = 0
         self.atlas_h = 0
@@ -58281,6 +58350,12 @@ class FontAtlas:
         # Feature: pre-render Latin/basic UTF-8 glyphs into a texture atlas.
         self._atlas_revision = int(getattr(self, "_atlas_revision", 0) or 0) + 1
         self._glyph_geometry_plan_cache.clear()
+        self._glyph_source_fonts.clear()
+        self._glyph_scales.clear()
+        self._color_glyphs.clear()
+        self._measure_cache.clear()
+        self._measure_cache_chars = 0
+        self._prefix_cache.clear()
         if sdl is None:
             return
         try:
@@ -58378,16 +58453,17 @@ class FontAtlas:
             except Exception:
                 return self.char_w, self.line_h
 
-    def _ttf_metric_int(self, names: tuple[str, ...], default: int = 0) -> int:
+    def _ttf_metric_int(self, names: tuple[str, ...], default: int = 0, *, font: Any = None) -> int:
         """Read one SDL_ttf integer metric across SDL2/SDL3 binding spellings."""
-        if not self.ttf_font or sdl is None:
+        font = self.ttf_font if font is None else font
+        if not font or sdl is None:
             return int(default)
         for name in names:
             fn = getattr(sdl, name, None)
             if not fn:
                 continue
             try:
-                value = fn(self.ttf_font)
+                value = fn(font)
                 if hasattr(value, "value"):
                     value = value.value
                 return int(value)
@@ -58406,6 +58482,14 @@ class FontAtlas:
         fallback = max(1, int(fallback_width or self.char_w))
         if not self.ttf_font or sdl is None:
             return fallback
+        source_font = self._glyph_source_fonts.get(ch, self.ttf_font)
+        if source_font != self.ttf_font:
+            # A fallback emoji is often twice the main font's missing-glyph
+            # advance. Its pixels and metrics must come from the same face.
+            scale = self._glyph_scales.get(ch, 1.0)
+            native_fallback = max(1, int(round(fallback / scale)))
+            advance = self._measure_glyph_advance_current_style(ch, native_fallback, font=source_font)
+            return max(1, int(round(advance * scale)))
         if self.font_style in {"italic", "bold_italic"} and hasattr(sdl, "TTF_SetFontStyle"):
             render_flags = self._ttf_style_flags(include_italic=True)
             metric_flags = self._ttf_style_flags(include_italic=False)
@@ -58418,10 +58502,11 @@ class FontAtlas:
                 self._set_ttf_style_flags(render_flags)
         return self._measure_glyph_advance_current_style(ch, fallback)
 
-    def _measure_glyph_advance_current_style(self, ch: str, fallback: int) -> int:
+    def _measure_glyph_advance_current_style(self, ch: str, fallback: int, *, font: Any = None) -> int:
         """Compatibility ladder for whatever SDL_ttf advance APIs are present."""
         fallback = max(1, int(fallback or self.char_w))
-        if not self.ttf_font or sdl is None:
+        font = self.ttf_font if font is None else font
+        if not font or sdl is None:
             return fallback
         for fn_name in ("TTF_GetStringSize", "TTF_SizeUTF8", "TTF_SizeText"):
             fn = getattr(sdl, fn_name, None)
@@ -58432,9 +58517,9 @@ class FontAtlas:
                 h = ctypes.c_int(0)
                 data = ch.encode("utf-8")
                 try:
-                    fn(self.ttf_font, data, len(data), ctypes.byref(w), ctypes.byref(h))
+                    fn(font, data, len(data), ctypes.byref(w), ctypes.byref(h))
                 except TypeError:
-                    fn(self.ttf_font, data, ctypes.byref(w), ctypes.byref(h))
+                    fn(font, data, ctypes.byref(w), ctypes.byref(h))
                 if int(w.value) > 0:
                     return int(w.value)
             except Exception:
@@ -58446,9 +58531,9 @@ class FontAtlas:
             try:
                 minx = ctypes.c_int(0); maxx = ctypes.c_int(0); miny = ctypes.c_int(0); maxy = ctypes.c_int(0); adv = ctypes.c_int(0)
                 try:
-                    fn(self.ttf_font, ord(ch), ctypes.byref(minx), ctypes.byref(maxx), ctypes.byref(miny), ctypes.byref(maxy), ctypes.byref(adv))
+                    fn(font, ord(ch), ctypes.byref(minx), ctypes.byref(maxx), ctypes.byref(miny), ctypes.byref(maxy), ctypes.byref(adv))
                 except TypeError:
-                    fn(self.ttf_font, ch.encode("utf-8"), ctypes.byref(minx), ctypes.byref(maxx), ctypes.byref(miny), ctypes.byref(maxy), ctypes.byref(adv))
+                    fn(font, ch.encode("utf-8"), ctypes.byref(minx), ctypes.byref(maxx), ctypes.byref(miny), ctypes.byref(maxy), ctypes.byref(adv))
                 if adv.value > 0:
                     return int(adv.value)
                 if maxx.value > minx.value:
@@ -58491,7 +58576,7 @@ class FontAtlas:
         right = int(clip_right) + guard - int(x)
         if right < 0:
             return 0, 0, 0
-        if self.monospace:
+        if self.monospace and text.isascii() and text.isprintable():
             cw = max(1, self.char_w)
             start = max(0, left // cw)
             end = min(len(text), right // cw + 2)
@@ -58538,7 +58623,9 @@ class FontAtlas:
         # to the main UI font and finally the textual fallback map.
         data = ch.encode("utf-8")
         antialias = bool(getattr(self.renderer.host, "config", {}).get("ui", {}).get("font_antialias", True))
-        if antialias:
+        # Solid rendering discards a color emoji's palette. Keep its native
+        # blended bitmap even when antialiasing for ordinary text is disabled.
+        if antialias or is_emoji_char(ch):
             candidates = [
                 getattr(sdl, "TTF_RenderText_Blended", None),
                 getattr(sdl, "TTF_RenderGlyph_Blended", None),
@@ -58577,8 +58664,72 @@ class FontAtlas:
                 except Exception:
                     continue
                 if surface:
+                    self._glyph_source_fonts[ch] = font
+                    if is_emoji_char(ch) and self._ttf_glyph_is_color(font, ch):
+                        self._color_glyphs.add(ch)
                     return surface
         return None
+
+    def _ttf_glyph_is_color(self, font: Any, ch: str) -> bool:
+        """Distinguish intrinsic emoji colors from tintable monochrome masks."""
+        query = getattr(sdl, "TTF_GetGlyphImage", None)
+        destroy = getattr(sdl, "SDL_DestroySurface", None)
+        image = None
+        if query is not None and destroy is not None:
+            try:
+                image_type = getattr(sdl, "TTF_ImageType", ctypes.c_int)()
+                image = query(font, ord(ch), ctypes.byref(image_type))
+                if image:
+                    color_type = getattr(sdl, "TTF_IMAGE_COLOR", 2)
+                    return image_type.value == getattr(color_type, "value", color_type)
+            except Exception:
+                pass
+            finally:
+                if image:
+                    destroy(image)
+        # Older bindings cannot report image type. Dedicated emoji fonts should
+        # still retain their colors; main-font symbol masks remain tintable.
+        return bool(self.emoji_ttf_font and font == self.emoji_ttf_font)
+
+    def _fit_emoji_surface(self, ch: str, surface: Any) -> Any:
+        """Consume a fallback emoji surface and fit bitmap strikes to UI size.
+
+        Bitmap emoji fonts may return a fixed 128-pixel strike for a requested
+        16-pixel font. Scale the pixels once before sizing the atlas, and retain
+        the same scale for advances and baseline alignment.
+        """
+        source = self._glyph_source_fonts.get(ch, self.ttf_font)
+        if source == self.ttf_font or not is_emoji_char(ch):
+            return surface
+        width, height = self._surface_size(surface)
+        target_height = max(1, self._ttf_metric_int(("TTF_GetFontHeight", "TTF_FontHeight"), self.font_size))
+        if height <= target_height:
+            return surface
+        scale = target_height / max(1, height)
+        target_width = max(1, int(round(width * scale)))
+        scaled = None
+        success = False
+        try:
+            fmt = getattr(sdl, "SDL_PIXELFORMAT_RGBA32", getattr(sdl, "SDL_PIXELFORMAT_ARGB8888", 0))
+            scaled = sdl.SDL_CreateSurface(target_width, target_height, fmt)
+            if not scaled:
+                return None
+            sdl.SDL_SetSurfaceBlendMode(surface, getattr(sdl, "SDL_BLENDMODE_NONE", 0))
+            success = bool(sdl.SDL_BlitSurfaceScaled(
+                surface, None, scaled, None, getattr(sdl, "SDL_SCALEMODE_LINEAR", 1),
+            ))
+            if success:
+                self._glyph_scales[ch] = scale
+                return scaled
+            return None
+        except Exception:
+            # An unavailable scaler must not create a hundreds-of-megabytes
+            # atlas or overlapping UI. The normal missing-glyph fallback applies.
+            return None
+        finally:
+            sdl.SDL_DestroySurface(surface)
+            if scaled and not success:
+                sdl.SDL_DestroySurface(scaled)
 
     def _build_atlas_from_ttf(self) -> None:
         chars = self._glyph_charset()
@@ -58588,6 +58739,8 @@ class FontAtlas:
         color = sdl.SDL_Color(255, 255, 255, 255)
         for ch in chars:
             surface = self._render_glyph_surface(ch, color)
+            if surface:
+                surface = self._fit_emoji_surface(ch, surface)
             if surface:
                 w, h = self._surface_size(surface)
                 glyph_surfaces[ch] = surface
@@ -58651,12 +58804,24 @@ class FontAtlas:
                 dst = sdl.SDL_Rect(ax, ay, w, h)
                 try:
                     if hasattr(sdl, "SDL_SetSurfaceBlendMode"):
-                        sdl.SDL_SetSurfaceBlendMode(surf, getattr(sdl, "SDL_BLENDMODE_BLEND", 1))
+                        # Copy straight RGBA into the atlas. Blending onto its
+                        # transparent background premultiplies RGB, which would
+                        # then be multiplied by alpha a second time on screen.
+                        sdl.SDL_SetSurfaceBlendMode(surf, getattr(sdl, "SDL_BLENDMODE_NONE", 0))
                     sdl.SDL_BlitSurface(surf, None, atlas_surface, ctypes.byref(dst))
                 except Exception:
                     pass
                 adv = self._measure_glyph_advance(ch, w)
-                self.glyphs[ch] = Glyph(ch, ax, ay, w, h, adv)
+                offset_y = 0
+                source_font = self._glyph_source_fonts.get(ch, self.ttf_font)
+                if source_font != self.ttf_font:
+                    source_ascent = self._ttf_metric_int(
+                        ("TTF_GetFontAscent", "TTF_FontAscent"), h, font=source_font,
+                    )
+                    offset_y = max(0, min(self.line_h - h,
+                        ascent - int(round(source_ascent * self._glyph_scales.get(ch, 1.0)))))
+                self.glyphs[ch] = Glyph(ch, ax, ay, w, h, adv,
+                    y_offset=offset_y, is_color=ch in self._color_glyphs)
             self.texture = sdl.SDL_CreateTextureFromSurface(self.renderer.host.renderer, atlas_surface)
             if self.texture and hasattr(sdl, "SDL_SetTextureBlendMode"):
                 sdl.SDL_SetTextureBlendMode(self.texture, getattr(sdl, "SDL_BLENDMODE_BLEND", 1))
@@ -58787,6 +58952,8 @@ class FontAtlas:
             draw_ch = mapped
             glyph = glyphs.get(draw_ch)
             glyph = glyph or missing_glyph
+            is_color = bool(getattr(glyph, "is_color", False))
+            glyph_color = Color(255, 255, 255, color.a) if is_color else base_color
             if draw_ch != " " and atlas_w > 0 and atlas_h > 0 and glyph.aw > 0 and glyph.ah > 0:
                 gx = float(int(pen_x + glyph.x_offset))
                 gy = float(int(pen_y + glyph.y_offset))
@@ -58800,14 +58967,14 @@ class FontAtlas:
                     v0=glyph.ay / atlas_h,
                     u1=(glyph.ax + glyph.aw) / atlas_w,
                     v1=(glyph.ay + glyph.ah) / atlas_h,
-                    color=base_color,
+                    color=glyph_color,
                 )
                 quads.append(base_quad)
-                if heavy:
+                if heavy and not is_color:
                     quads.append(dataclasses.replace(base_quad, x=gx + FONT_HEAVY_X_OFFSET, color=heavy_color))
             elif not texture_enabled and draw_ch != " ":
-                quads.append(GlyphQuad(char=draw_ch, x=pen_x, y=pen_y, w=char_w, h=line_h, u0=0, v0=0, u1=1, v1=1, color=base_color))
-                if heavy:
+                quads.append(GlyphQuad(char=draw_ch, x=pen_x, y=pen_y, w=char_w, h=line_h, u0=0, v0=0, u1=1, v1=1, color=glyph_color))
+                if heavy and not is_color:
                     quads.append(GlyphQuad(char=draw_ch, x=pen_x + FONT_HEAVY_X_OFFSET, y=pen_y, w=char_w, h=line_h, u0=0, v0=0, u1=1, v1=1, color=heavy_color))
             pen_x += glyph.advance
         return quads
@@ -62549,7 +62716,7 @@ class Widgets:
                     saw_nonspace = False
                     while scan < line_end:
                         ch = text[scan]
-                        advance = max(1, self._font_char_advance(self.font, ch))
+                        advance = self._font_char_advance(self.font, ch)
                         if scan > position and used + advance > max_width:
                             break
                         used += advance
@@ -62560,8 +62727,9 @@ class Widgets:
                                 width_at_break = used
                         else:
                             saw_nonspace = True
-                        if used >= max_width:
-                            break
+                        # Keep following zero-width selectors/joiners with this
+                        # row. The next visible character performs the width
+                        # check above; scan always advances, including at zero.
                     if scan < line_end and last_break > position:
                         row_end = last_break
                         row_width = width_at_break

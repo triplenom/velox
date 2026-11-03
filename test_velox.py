@@ -9065,7 +9065,12 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(service.calendar_list_resource.calls), 2)
 
     def test_full_resync_marks_missing_event_cancelled_and_preserves_link(self) -> None:
-        with _TemporaryDataDirectory() as td:
+        # The fixtures are in July 2026. A real clock eventually moves them
+        # outside the bounded sync window, where retaining them is correct.
+        window = velox.google_calendar_sync_window(velox.default_config(), today=date(2026, 7, 30))
+        with _TemporaryDataDirectory() as td, mock.patch.object(
+            velox, "google_calendar_sync_window", return_value=window,
+        ):
             _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
             self._seed_one_calendar(integration)
             row = velox.normalize_google_calendar_row(self._calendar_resource())
@@ -9093,6 +9098,104 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(disappeared["status"], "cancelled")
             self.assertEqual(calendar.get_item(item["item_id"])["linked_event_id"], missing["event_id"])
             self.assertEqual(len(calendar.list_all_events()), 2)
+
+    def test_full_resync_respects_exact_utc_bounds_in_every_display_timezone(self) -> None:
+        window = ("2026-07-30T00:00:00Z", "2026-08-02T00:00:00Z", 3)
+        cases = (
+            ("old", "2026-07-29T20:00:00Z", "2026-07-29T21:00:00Z", "confirmed"),
+            ("ends-at-start", "2026-07-29T23:00:00Z", "2026-07-30T00:00:00Z", "confirmed"),
+            ("crosses-start", "2026-07-29T23:30:00Z", "2026-07-30T00:30:00Z", "cancelled"),
+            ("early", "2026-07-30T00:30:00Z", "2026-07-30T01:00:00Z", "cancelled"),
+            ("late", "2026-08-01T23:00:00Z", "2026-08-01T23:30:00Z", "cancelled"),
+            ("crosses-end", "2026-08-01T23:30:00Z", "2026-08-02T00:30:00Z", "cancelled"),
+            ("starts-at-end", "2026-08-02T00:00:00Z", "2026-08-02T01:00:00Z", "confirmed"),
+            ("future", "2026-08-02T02:00:00Z", "2026-08-02T03:00:00Z", "confirmed"),
+        )
+        for offset in (-7, 0, 14):
+            with self.subTest(display_utc_offset=offset), _TemporaryDataDirectory() as td:
+                _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
+                row = velox.normalize_google_calendar_row(self._calendar_resource())
+                saved = {
+                    event_id: calendar.upsert_event(velox.google_calendar_event_payload(
+                        self._timed_event(event_id, start=start, end=end), row, "mike@example.com",
+                    ))
+                    for event_id, start, end, _status in cases
+                }
+                item = calendar.create_item("Keep boundary link", linked_event_id=saved["early"]["event_id"])
+                service = _FakeGoogleService(
+                    lambda *_args: self.fail("Direct Event sync must not query CalendarList"),
+                    lambda _kwargs, _index: {"items": [], "nextSyncToken": "bounded-token"},
+                )
+                with mock.patch.object(velox, "google_calendar_sync_window", return_value=window), mock.patch.object(
+                    calendar, "display_timezone", return_value=timezone(timedelta(hours=offset)),
+                ):
+                    result = integration._sync_one_calendar(service, row, "mike@example.com")
+                self.assertEqual(result["missing_events_cancelled"], 4)
+                self.assertEqual(service.events_resource.calls[0]["timeMin"], window[0])
+                self.assertEqual(service.events_resource.calls[0]["timeMax"], window[1])
+                for event_id, _start, _end, expected_status in cases:
+                    with self.subTest(event=event_id):
+                        self.assertEqual(calendar.get_event(saved[event_id]["event_id"])["status"], expected_status)
+                self.assertEqual(calendar.get_item(item["item_id"])["linked_event_id"], saved["early"]["event_id"])
+
+    def test_full_resync_uses_source_calendar_timezone_for_all_day_bounds(self) -> None:
+        window = ("2026-07-30T00:00:00Z", "2026-08-02T00:00:00Z", 3)
+        cases = (
+            ("America/Los_Angeles", {"2026-07-29", "2026-07-30", "2026-08-01"}),
+            ("Asia/Tokyo", {"2026-07-30", "2026-08-01", "2026-08-02"}),
+        )
+        for source_zone, cancelled_days in cases:
+            with self.subTest(calendar_timezone=source_zone), _TemporaryDataDirectory() as td:
+                _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
+                row = velox.normalize_google_calendar_row(self._calendar_resource())
+                row["time_zone"] = source_zone
+                saved: dict[str, Any] = {}
+                for day in ("2026-07-28", "2026-07-29", "2026-07-30", "2026-08-01", "2026-08-02", "2026-08-03"):
+                    raw = self._all_day_event("day-" + day)
+                    raw["start"]["date"] = day
+                    raw["end"]["date"] = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+                    saved[day] = calendar.upsert_event(velox.google_calendar_event_payload(raw, row, "mike@example.com"))
+                service = _FakeGoogleService(
+                    lambda *_args: self.fail("Direct Event sync must not query CalendarList"),
+                    lambda _kwargs, _index: {"items": [], "nextSyncToken": "all-day-token"},
+                )
+                with mock.patch.object(velox, "google_calendar_sync_window", return_value=window), mock.patch.object(
+                    calendar, "display_timezone", return_value=timezone.utc,
+                ):
+                    result = integration._sync_one_calendar(service, row, "mike@example.com")
+                self.assertEqual(result["missing_events_cancelled"], len(cancelled_days))
+                for day, event in saved.items():
+                    expected = "cancelled" if day in cancelled_days else "confirmed"
+                    self.assertEqual(calendar.get_event(event["event_id"])["status"], expected, day)
+
+    def test_full_resync_failed_later_page_does_not_change_retained_events(self) -> None:
+        with _TemporaryDataDirectory() as td:
+            _paths, _storage, _chats, calendar, integration = self._stack(Path(td))
+            row = velox.normalize_google_calendar_row(self._calendar_resource())
+            original = calendar.upsert_event(velox.google_calendar_event_payload(
+                self._timed_event(summary="Retain until complete"), row, "mike@example.com",
+            ))
+            missing = calendar.upsert_event(velox.google_calendar_event_payload(
+                self._timed_event("unseen-on-page-one"), row, "mike@example.com",
+            ))
+
+            def events(kwargs: dict[str, Any], index: int) -> Any:
+                if index == 0:
+                    return {
+                        "items": [self._timed_event(summary="Incomplete update")],
+                        "nextPageToken": "page-two",
+                    }
+                self.assertEqual(kwargs.get("pageToken"), "page-two")
+                return RuntimeError("Second page unavailable")
+
+            service = _FakeGoogleService(lambda *_args: {}, events)
+            window = velox.google_calendar_sync_window(velox.default_config(), today=date(2026, 7, 30))
+            with mock.patch.object(velox, "google_calendar_sync_window", return_value=window):
+                with self.assertRaisesRegex(RuntimeError, "Second page unavailable"):
+                    integration._sync_one_calendar(service, row, "mike@example.com")
+            self.assertEqual(calendar.get_event(original["event_id"]), original)
+            self.assertEqual(calendar.get_event(missing["event_id"]), missing)
+            self.assertEqual(row["sync_token"], "")
 
     def test_deleted_calendar_cancels_retained_events_without_deleting_items(self) -> None:
         with _TemporaryDataDirectory() as td:
@@ -17231,7 +17334,10 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertIn("persisted schemas", velox.__doc__ or "")
         self.assertEqual(velox.DATA_FILE_VERSION, f"v{velox.BACKWARD_COMPATIBLE_VERSION}")
         self.assertEqual(velox.APP_SCHEMA, velox.data_schema('velox_app'))
-        self.assertEqual(len(velox.default_config()["llm"]["endpoint_profiles"]), 9)
+        config = velox.default_config()
+        for key in ("default_profile_id", "default_chat_subagent_profile_id"):
+            default_profile = velox.endpoint_profile_ref(config, config["llm"][key])
+            self.assertIn(default_profile["label"], readme)
 
 
 class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
@@ -26403,6 +26509,33 @@ class SerperSearchTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(len(self.web._search_request_timestamps), 1)
         self.assertNotIn('test-serper-secret', json.dumps(result))
 
+    def test_malformed_urls_do_not_discard_valid_search_results(self) -> None:
+        invalid = [
+            'https://[broken', 'https://[not-ipv6]/', 'https:///missing-host',
+            'https://', 'http:relative', '//example.com/relative',
+            'https://exa mple.com', 'https://example.com:bad',
+            'https://example.com:99999', 'https://example.com/\npath',
+            'https://example.com/\x00path', 'javascript:alert(1)',
+        ]
+        valid = [
+            {'title': 'First', 'link': 'https://example.com/one', 'snippet': 'Kept first'},
+            {'title': 'Second', 'link': 'https://[2001:db8::1]:8443/two', 'snippet': 'Kept second'},
+        ]
+        bad_results = [{'title': 'Malformed', 'link': link} for link in invalid]
+        for organic, expected in (([valid[0], *bad_results, valid[1]], valid), (bad_results, [])):
+            with self.subTest(has_valid_results=bool(expected)):
+                self.web._search_request_timestamps.clear()
+                opener = mock.Mock()
+                opener.open.return_value = self.response({'organic': organic})
+                result = self.search(opener)
+                self.assertEqual(result['status'], 'ok' if expected else 'no_results')
+                self.assertNotIn('error', result)
+                self.assertEqual(result['results'], [
+                    {'title': item['title'], 'url': item['link'], 'snippet': item['snippet']}
+                    for item in expected
+                ])
+                opener.open.assert_called_once()
+
     def test_toggle_restores_saved_scrape_provider_and_retains_key(self) -> None:
         self.assertEqual(self.web._search_provider(), 'serper')
         panel = velox.Panels.__new__(velox.Panels)
@@ -32907,12 +33040,13 @@ class DeadlinePolicyTests(_AsyncRuntimeFixture):
         self.storage.write_config(cfg)
         return copy.deepcopy(profile)
 
-    def test_all_nine_bundled_endpoints_and_custom_default_to_fifteen_minutes(self) -> None:
-        profiles = velox.default_endpoint_profiles() + [velox.endpoint_profile_template()]
-        self.assertEqual(len(profiles), 10)
-        for profile in profiles:
-            self.assertEqual(profile['timeout_seconds'], 900, profile['label'])
-            self.assertEqual(profile['error_recovery_attempts'], 10)
+    def test_all_bundled_endpoints_and_custom_default_to_fifteen_minutes(self) -> None:
+        profiles = velox.default_endpoint_profiles()
+        self.assertTrue(profiles)
+        for profile in profiles + [velox.endpoint_profile_template()]:
+            with self.subTest(profile=profile['label']):
+                self.assertEqual(profile['timeout_seconds'], 900)
+                self.assertEqual(profile['error_recovery_attempts'], 10)
         for value in (velox.ENDPOINT_TIMEOUT_SECONDS_DEFAULT, velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
                       velox.IMAGE_ANALYSIS_ENDPOINT_TIMEOUT_SECONDS_DEFAULT):
             self.assertEqual(value, 900)
@@ -45878,12 +46012,12 @@ class ChatSubagentEndpointRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRun
 
 class UnifiedReleaseVersionTests(unittest.TestCase):
     def test_current_application_and_compatibility_versions(self) -> None:
-        self.assertEqual(velox.CURRENT_VERSION, 323)
+        self.assertEqual(velox.CURRENT_VERSION, 324)
         self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION, 316)
-        self.assertEqual(velox.APP_VERSION, 'velox.v323')
-        self.assertEqual(velox.SOURCE_REVISION, '323')
-        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V323]')
-        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/323')
+        self.assertEqual(velox.APP_VERSION, 'velox.v324')
+        self.assertEqual(velox.SOURCE_REVISION, '324')
+        self.assertEqual(velox.WINDOW_TITLE_SUFFIX, '[V324]')
+        self.assertEqual(velox.CONNECTOR_USER_AGENT, 'Velox/324')
         self.assertEqual(velox.DATA_FILE_VERSION, 'v316')
         header = Path(velox.__file__).read_text(encoding='utf-8').splitlines()[:3]
         self.assertIn('# Every commit must bump CURRENT_VERSION (for example, 316 -> 317), no exceptions.', header)
@@ -48644,6 +48778,316 @@ class Release316PresentationTests(_StorageFixture):
             self.assertEqual(after, before)
         finally:
             path.write_bytes(original)
+
+
+class EmojiRenderingRegressionTests(unittest.TestCase):
+    """Exercise glyph selection, metrics and submitted RGBA without a display."""
+
+    def font(self, *, weight: str = "regular", antialias: bool = True) -> velox.FontAtlas:
+        renderer = velox.Renderer(SimpleNamespace(renderer=object(), config={"ui": {"font_antialias": antialias}}))
+        font = velox.FontAtlas(renderer, "", 16, font_weight=weight)
+        renderer.set_font(font)
+        font.char_w = 8
+        font.line_h = 20
+        font.atlas_w = font.atlas_h = 256
+        font.texture = object()
+        font.glyphs = {chr(cp): velox.Glyph(chr(cp), cp, 0, 8, 16, 8) for cp in range(32, 127)}
+        font.glyphs["😀"] = velox.Glyph("😀", 0, 32, 20, 20, 20, is_color=True)
+        font.glyphs["❤"] = velox.Glyph("❤", 20, 32, 18, 18, 18, is_color=True)
+        font.glyphs["☑"] = velox.Glyph("☑", 38, 32, 16, 16, 16)
+        return font
+
+    def test_emoji_font_selection_covers_supplementary_symbols_and_flags(self) -> None:
+        for ch in "😀🥰🫶👍🇨🇦🀄🃏⌚⏰⚙✅⭐©®™〰〽㊗㊙":
+            with self.subTest(ch=ch):
+                self.assertTrue(velox.is_emoji_char(ch))
+                self.assertIn(ch, velox.COMMON_CHAT_GLYPH_CHARS)
+        for ch in ("A", ":", ")", "", "\ufe0f", "\u200d"):
+            self.assertFalse(velox.is_emoji_char(ch))
+
+    def test_color_emoji_remain_blended_when_text_antialias_is_off(self) -> None:
+        font = self.font(antialias=False)
+        font.ttf_font, font.emoji_ttf_font = "text-face", "emoji-face"
+        calls = []
+        surface = object()
+        def blended(face, data, size, color):
+            calls.append(("blended", face, data, size))
+            return surface
+        def solid(face, data, size, color):
+            calls.append(("solid", face, data, size))
+            return surface
+        fake = SimpleNamespace(TTF_RenderText_Blended=blended, TTF_RenderText_Solid=solid,
+                               TTF_FontHasGlyph=lambda face, cp: True)
+        with mock.patch.object(velox, "sdl", fake):
+            self.assertIs(font._render_glyph_surface("😀", None), surface)
+            self.assertIs(font._render_glyph_surface("A", None), surface)
+        self.assertEqual(calls, [("blended", "emoji-face", "😀".encode(), 4),
+                                 ("solid", "text-face", b"A", 1)])
+        self.assertEqual(font._glyph_source_fonts["😀"], "emoji-face")
+
+    def test_missing_emoji_font_glyph_uses_actual_primary_fallback(self) -> None:
+        font = self.font()
+        font.ttf_font, font.emoji_ttf_font = "text-face", "emoji-face"
+        calls = []
+        def render(face, data, length, color):
+            calls.append(face)
+            return object()
+        fake = SimpleNamespace(TTF_RenderText_Blended=render,
+                               TTF_FontHasGlyph=lambda face, cp: face == "text-face")
+        with mock.patch.object(velox, "sdl", fake):
+            self.assertIsNotNone(font._render_glyph_surface("😀", None))
+        self.assertEqual(calls, ["text-face"])
+        self.assertEqual(font._glyph_source_fonts["😀"], "text-face")
+        self.assertNotIn("😀", font._color_glyphs)
+
+    def test_unavailable_glyph_never_accepts_the_fonts_missing_box(self) -> None:
+        font = self.font()
+        font.ttf_font, font.emoji_ttf_font = "text-face", "emoji-face"
+        render = mock.Mock(return_value=object())
+        fake = SimpleNamespace(TTF_RenderText_Blended=render, TTF_FontHasGlyph=lambda face, cp: False)
+        with mock.patch.object(velox, "sdl", fake):
+            self.assertIsNone(font._render_glyph_surface("😀", None))
+        render.assert_not_called()
+
+    def test_color_classification_releases_native_query_surface(self) -> None:
+        font = self.font()
+        owned = object()
+        destroy = mock.Mock()
+        image_kind = 2
+        def query(face, codepoint, result):
+            self.assertEqual(codepoint, 0x1F600)
+            ctypes.cast(result, ctypes.POINTER(ctypes.c_int))[0] = image_kind
+            return owned
+        fake = SimpleNamespace(TTF_GetGlyphImage=query, TTF_IMAGE_COLOR=2, SDL_DestroySurface=destroy)
+        with mock.patch.object(velox, "sdl", fake):
+            self.assertTrue(font._ttf_glyph_is_color("font", "😀"))
+            image_kind = 1
+            self.assertFalse(font._ttf_glyph_is_color("font", "😀"))
+        self.assertEqual(destroy.call_args_list, [mock.call(owned), mock.call(owned)])
+
+    def test_emoji_advance_uses_the_rendered_face_and_preserves_utf8_byte_count(self) -> None:
+        font = self.font()
+        font.ttf_font, font.emoji_ttf_font = "text-face", "emoji-face"
+        font._glyph_source_fonts["😀"] = "emoji-face"
+        seen = []
+        def size(face, data, length, width, height):
+            seen.append((face, data, length))
+            ctypes.cast(width, ctypes.POINTER(ctypes.c_int))[0] = 20 if face == "emoji-face" else 8
+            return True
+        with mock.patch.object(velox, "sdl", SimpleNamespace(TTF_GetStringSize=size)):
+            self.assertEqual(font._measure_glyph_advance("😀", 20), 20)
+            self.assertEqual(font._measure_glyph_advance("A", 8), 8)
+        self.assertEqual(seen, [("emoji-face", "😀".encode(), 4), ("text-face", b"A", 1)])
+
+    def test_fixed_bitmap_strikes_fit_ui_height_and_scale_their_advance(self) -> None:
+        font = self.font()
+        font.ttf_font, font.emoji_ttf_font = "text-face", "emoji-face"
+        font._glyph_source_fonts["😀"] = "emoji-face"
+        original = SimpleNamespace(w=136, h=128, blend=None)
+        freed = []
+        scaled_calls = []
+        def scaled_blit(source, src_rect, target, dst_rect, scale_mode):
+            scaled_calls.append((source, target.w, target.h, source.blend, scale_mode))
+            return True
+        def size(face, data, length, width, height):
+            self.assertEqual(face, "emoji-face")
+            ctypes.cast(width, ctypes.POINTER(ctypes.c_int))[0] = 136
+            return True
+        fake = SimpleNamespace(
+            TTF_GetFontHeight=lambda face: 27 if face == "text-face" else 128,
+            TTF_GetStringSize=size,
+            SDL_CreateSurface=lambda w, h, fmt: SimpleNamespace(w=w, h=h),
+            SDL_SetSurfaceBlendMode=lambda surf, mode: setattr(surf, "blend", mode),
+            SDL_BlitSurfaceScaled=scaled_blit, SDL_SCALEMODE_LINEAR=1,
+            SDL_BLENDMODE_NONE=0, SDL_DestroySurface=freed.append,
+        )
+        with mock.patch.object(velox, "sdl", fake), \
+             mock.patch.object(font, "_surface_size", side_effect=lambda surf: (surf.w, surf.h)):
+            fitted = font._fit_emoji_surface("😀", original)
+            self.assertEqual((fitted.w, fitted.h), (29, 27))
+            self.assertEqual(font._measure_glyph_advance("😀", fitted.w), 29)
+            del fake.TTF_GetStringSize
+            # A binding without any advance API returns the fallback in native
+            # strike pixels; the 29-pixel fitted width must not shrink twice.
+            self.assertEqual(font._measure_glyph_advance("😀", fitted.w), 29)
+        self.assertEqual(scaled_calls, [(original, 29, 27, 0, 1)])
+        self.assertEqual(freed, [original])
+        self.assertAlmostEqual(font._glyph_scales["😀"], 27 / 128)
+
+    def test_failed_bitmap_scaling_drops_oversize_glyph_and_releases_both_surfaces(self) -> None:
+        font = self.font()
+        font.ttf_font, font.emoji_ttf_font = "text-face", "emoji-face"
+        font._glyph_source_fonts["😀"] = "emoji-face"
+        original, target = object(), object()
+        freed = []
+        fake = SimpleNamespace(
+            TTF_GetFontHeight=lambda face: 20,
+            SDL_CreateSurface=lambda *args: target,
+            SDL_SetSurfaceBlendMode=lambda *args: True,
+            SDL_BlitSurfaceScaled=lambda *args: False,
+            SDL_DestroySurface=freed.append,
+        )
+        with mock.patch.object(velox, "sdl", fake), mock.patch.object(font, "_surface_size", return_value=(136, 128)):
+            self.assertIsNone(font._fit_emoji_surface("😀", original))
+        self.assertEqual(freed, [original, target])
+        self.assertNotIn("😀", font._glyph_scales)
+
+    def test_normal_size_fallback_emoji_does_not_allocate_or_resample(self) -> None:
+        font = self.font()
+        font.ttf_font, font.emoji_ttf_font = "text-face", "emoji-face"
+        font._glyph_source_fonts["😀"] = "emoji-face"
+        surface = object()
+        create = mock.Mock()
+        fake = SimpleNamespace(TTF_GetFontHeight=lambda face: 27, SDL_CreateSurface=create)
+        with mock.patch.object(velox, "sdl", fake), mock.patch.object(font, "_surface_size", return_value=(25, 25)):
+            self.assertIs(font._fit_emoji_surface("😀", surface), surface)
+        create.assert_not_called()
+
+    def test_quad_path_preserves_emoji_colors_alpha_and_single_pass(self) -> None:
+        tint = velox.Color(24, 100, 200, 173)
+        for weight in ("regular", "light", "heavy"):
+            with self.subTest(weight=weight):
+                font = self.font(weight=weight)
+                quads = font.layout_text_to_quads("A😀☑", 10, 20, tint)
+                emoji = [q for q in quads if q.char == "😀"]
+                self.assertEqual(len(emoji), 1)
+                self.assertEqual(dataclasses.astuple(emoji[0].color), (255, 255, 255, 173))
+                self.assertEqual(emoji[0].x, 18)
+                monochrome = next(q for q in quads if q.char == "☑")
+                self.assertEqual((monochrome.color.r, monochrome.color.g, monochrome.color.b), (24, 100, 200))
+                self.assertEqual(monochrome.x, 38)
+
+    def test_batched_and_cached_geometry_keep_intrinsic_emoji_colors(self) -> None:
+        class Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_float), ("y", ctypes.c_float)]
+        class Color(ctypes.Structure):
+            _fields_ = [("r", ctypes.c_float), ("g", ctypes.c_float), ("b", ctypes.c_float), ("a", ctypes.c_float)]
+        class Vertex(ctypes.Structure):
+            _fields_ = [("position", Point), ("color", Color), ("tex_coord", Point)]
+        calls = []
+        def render(renderer, texture, vertices, count, indices, index_count):
+            calls.append([(vertices[i].position.x, vertices[i].color.r,
+                           vertices[i].color.g, vertices[i].color.b, vertices[i].color.a)
+                          for i in range(0, count, 4)])
+        fake = SimpleNamespace(SDL_Vertex=Vertex, SDL_RenderGeometry=render)
+        for weight in ("regular", "light", "heavy"):
+            font = self.font(weight=weight)
+            renderer = font.renderer
+            renderer.text_geometry_cache_min_characters = 1
+            tint = velox.Color(32, 64, 96, 180)
+            with mock.patch.object(velox, "sdl", fake):
+                for _ in range(3):
+                    renderer._render_text_runs_geometry([("A😀", 0, 0, tint, None, None)])
+            self.assertEqual(renderer.last_text_geometry_cache_hits, 1)
+            self.assertEqual(calls[-1], calls[-2])
+            emoji = calls[-1][-1]
+            self.assertEqual(emoji[:4], (8, 1, 1, 1))
+            self.assertAlmostEqual(emoji[4], 180 / 255)
+            self.assertEqual(len(calls[-1]), 3 if weight == "heavy" else 2)
+
+    def test_software_backend_bypasses_alpha_corrupting_texture_targets_once_detected(self) -> None:
+        font = self.font()
+        renderer = font.renderer
+        get_name = mock.Mock(return_value=b"software")
+        create = mock.Mock()
+        fake = SimpleNamespace(SDL_GetRendererName=get_name, SDL_CreateTexture=create)
+        white = velox.Color(255, 255, 255)
+        with mock.patch.object(velox, "sdl", fake), \
+             mock.patch.object(renderer, "_render_text_runs_geometry") as render:
+            for _ in range(3):
+                renderer._render_cached_text("A😀", 10, 20, white)
+                renderer._render_cached_text("white text", 10, 40, white)
+        self.assertEqual(render.call_count, 6)
+        self.assertEqual(render.call_args_list[0], mock.call([("A😀", 10, 20, white, None, None)]))
+        self.assertEqual(render.call_args_list[1], mock.call([("white text", 10, 40, white, None, None)]))
+        get_name.assert_called_once_with(renderer.host.renderer)
+        create.assert_not_called()
+        self.assertFalse(renderer.textures)
+        self.assertFalse(renderer._text_texture_admission_counts)
+
+    def test_gpu_renderer_keeps_normal_target_texture_cache_eligibility(self) -> None:
+        font = self.font()
+        renderer = font.renderer
+        get_name = mock.Mock(return_value=b"direct3d11")
+        fake = SimpleNamespace(SDL_GetRendererName=get_name)
+        with mock.patch.object(velox, "sdl", fake), \
+             mock.patch.object(renderer, "_render_text_runs_geometry") as direct, \
+             mock.patch.object(renderer, "_render_glyphs") as glyphs:
+            renderer._render_cached_text("A😀", 10, 20, velox.Palette.text)
+            renderer._render_cached_text("white text", 10, 40, velox.Palette.white)
+        self.assertTrue(renderer._text_texture_cache_supported)
+        get_name.assert_called_once_with(renderer.host.renderer)
+        # This deliberately incomplete fake falls through the existing native
+        # capability guard; it must not take the software-only bypass above.
+        direct.assert_not_called()
+        self.assertEqual(glyphs.call_count, 2)
+
+    def test_atlas_copy_preserves_straight_rgba_including_partial_alpha(self) -> None:
+        class Rect(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int), ("w", ctypes.c_int), ("h", ctypes.c_int)]
+        font = self.font()
+        font.ttf_font = "text-face"
+        font._color_glyphs = {"😀"}
+        surface = SimpleNamespace(pixel=(255, 170, 20, 128), blend=1)
+        copied = []
+        def blit(src, source_rect, dst, destination_rect):
+            r, g, b, a = src.pixel
+            copied.append(src.pixel if src.blend == 0 else (r * a // 255, g * a // 255, b * a // 255, a))
+            return True
+        fake = SimpleNamespace(
+            SDL_Color=lambda *rgba: rgba, SDL_Rect=Rect, SDL_BLENDMODE_NONE=0, SDL_BLENDMODE_BLEND=1,
+            SDL_CreateSurface=lambda *args: object(), SDL_FillSurfaceRect=lambda *args: True,
+            SDL_SetSurfaceBlendMode=lambda surf, mode: setattr(surf, "blend", mode),
+            SDL_BlitSurface=blit, SDL_CreateTextureFromSurface=lambda *args: object(),
+            SDL_SetTextureBlendMode=lambda *args: True, SDL_DestroySurface=lambda *args: None,
+        )
+        with mock.patch.object(velox, "sdl", fake), \
+             mock.patch.object(font, "_glyph_charset", return_value=["😀"]), \
+             mock.patch.object(font, "_render_glyph_surface", return_value=surface), \
+             mock.patch.object(font, "_surface_size", return_value=(20, 20)):
+            font._build_atlas_from_ttf()
+        self.assertEqual(copied, [(255, 170, 20, 128)])
+        self.assertTrue(font.glyphs["😀"].is_color)
+
+    def test_variation_selectors_joiners_and_tags_have_no_boxes_or_advance(self) -> None:
+        font = self.font()
+        controls = "\ufe0e\ufe0f\u200b\u200c\u200d\u2060\ufeff\U000e0067\U000e007f\U000e0100"
+        text = "😀" + controls + "A"
+        self.assertEqual(font.measure_text(text), 28)
+        self.assertEqual(font._prefix_widths(text), (0,) + (20,) * (1 + len(controls)) + (28,))
+        self.assertEqual("".join(q.char for q in font.layout_text_to_quads(text, 0, 0, velox.Palette.text)), "😀A")
+
+    def test_monospace_clipping_uses_wide_emoji_and_zero_width_metrics(self) -> None:
+        font = self.font()
+        font.monospace = True
+        text = "😀\ufe0f" * 100 + "A"
+        start, end, pixels = font.visible_text_span(text, 0, 1800, 1840)
+        self.assertLess(start, end)
+        self.assertEqual(pixels, font.measure_text(text[:start]))
+        self.assertLessEqual(pixels, 1800)
+        self.assertGreaterEqual(font.measure_text(text[:end]), 1840)
+        quads = font.layout_text_to_quads_visible(text, 0, 0, velox.Palette.text, 1800, 1840)
+        self.assertTrue(any(q.x <= 1820 < q.x + q.w for q in quads))
+
+    def test_ascii_emoticons_and_shortcodes_are_preserved_literally(self) -> None:
+        font = self.font()
+        text = ":) :-) ;-) :D :P <3 :joy: :sweat_smile:"
+        engine = velox.MarkdownLayoutEngine(font)
+        spans = engine.parse_inline(text)
+        self.assertEqual("".join(str(span.get("text", "")) for span in spans), text)
+        self.assertEqual(font.measure_text(text), len(text) * 8)
+        self.assertEqual("".join(q.char for q in font.layout_text_to_quads(text, 0, 0, velox.Palette.text)), text.replace(" ", ""))
+
+    def test_composer_wrap_keeps_zero_width_selectors_on_their_visible_row(self) -> None:
+        font = self.font()
+        widgets = object.__new__(velox.Widgets)
+        widgets.font = font
+        widgets._wrap_cache = {}
+        text = "😀\ufe0f" * 3
+        rows = widgets._wrap_display_rows(text, 20)
+        self.assertEqual([row.text for row in rows], ["😀\ufe0f"] * 3)
+        self.assertEqual([row.width for row in rows], [20, 20, 20])
+        self.assertEqual("".join(row.text for row in rows), text)
 
 
 def main() -> None:
