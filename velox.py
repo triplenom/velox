@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 325
+CURRENT_VERSION = 326
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -684,8 +684,8 @@ CONFIG_FEATURE_DEFAULTS: dict[str, bool] = {
     "file_tools_enabled": True,
     "system_tools_enabled": True,
     "web_tools_enabled": True,
-    "agent_tools_enabled": True,
-    "chat_history_enabled": True,
+    "agent_tools_enabled": False,
+    "chat_history_enabled": False,
     "force_pdf_images": False,
     "default_show_reasoning_content": True,
 }
@@ -4240,17 +4240,19 @@ WEB_USER_AGENT_STRINGS = {
 ENDPOINT_PROVIDER_VLLM = "vllm"
 ENDPOINT_PROVIDER_LLAMA_CPP = "llama_cpp"
 ENDPOINT_PROVIDER_OPENAI = "openai"
+ENDPOINT_PROVIDER_ANTHROPIC = "anthropic"
 ENDPOINT_PROVIDER_NOVITA = "novita"
 ENDPOINT_PROVIDER_BASETEN = "baseten"
 ENDPOINT_PROVIDER_GENERIC = "generic"
 ENDPOINT_PROVIDERS = (
     ENDPOINT_PROVIDER_VLLM, ENDPOINT_PROVIDER_LLAMA_CPP, ENDPOINT_PROVIDER_OPENAI,
-    ENDPOINT_PROVIDER_NOVITA, ENDPOINT_PROVIDER_BASETEN, ENDPOINT_PROVIDER_GENERIC,
+    ENDPOINT_PROVIDER_NOVITA, ENDPOINT_PROVIDER_BASETEN, ENDPOINT_PROVIDER_ANTHROPIC, ENDPOINT_PROVIDER_GENERIC,
 )
 ENDPOINT_PROVIDER_LABELS = {
     ENDPOINT_PROVIDER_VLLM: "vLLM",
     ENDPOINT_PROVIDER_LLAMA_CPP: "llama.cpp",
     ENDPOINT_PROVIDER_OPENAI: "OpenAI",
+    ENDPOINT_PROVIDER_ANTHROPIC: "Anthropic",
     ENDPOINT_PROVIDER_NOVITA: "Novita",
     ENDPOINT_PROVIDER_BASETEN: "Baseten",
     ENDPOINT_PROVIDER_GENERIC: "Other OpenAI-compatible",
@@ -4281,13 +4283,19 @@ ENDPOINT_MODEL_TYPE_MUSE_GLIMMER = "muse_glimmer"
 
 ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS = "chat_completions"
 ENDPOINT_API_TRANSPORT_RESPONSES = "responses"
+ENDPOINT_API_TRANSPORT_MESSAGES = "messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
+ENDPOINT_MODEL_TYPE_OPUS_5_5 = "opus_5_5"
+DEFAULT_OPUS_5_5_ENDPOINT_PROFILE_ID = "endpoint-opus-5-5-anthropic"
 ENDPOINT_API_TRANSPORTS = (
     ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS,
     ENDPOINT_API_TRANSPORT_RESPONSES,
+    ENDPOINT_API_TRANSPORT_MESSAGES,
 )
 ENDPOINT_API_TRANSPORT_LABELS = {
     ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS: "Chat Completions",
     ENDPOINT_API_TRANSPORT_RESPONSES: "Responses",
+    ENDPOINT_API_TRANSPORT_MESSAGES: "Anthropic Messages",
 }
 ENDPOINT_GPT_6_MODEL_TYPES = frozenset({
     ENDPOINT_MODEL_TYPE_GPT_6_LUNA, ENDPOINT_MODEL_TYPE_GPT_6_SOL, ENDPOINT_MODEL_TYPE_GPT_6_ASTRA,
@@ -4306,6 +4314,7 @@ ENDPOINT_GPT_5_6_MODEL_TYPES = frozenset({
 
 ENDPOINT_MODEL_TYPES = (
     ENDPOINT_MODEL_TYPE_CUSTOM,
+    ENDPOINT_MODEL_TYPE_OPUS_5_5,
     ENDPOINT_MODEL_TYPE_QWEN_3_6,
     ENDPOINT_MODEL_TYPE_QWEN_3_8,
     ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
@@ -4326,7 +4335,8 @@ ENDPOINT_MODEL_TYPES = (
     ENDPOINT_MODEL_TYPE_MUSE_GLIMMER,
 )
 ENDPOINT_MODEL_TYPE_LABELS = {
-    ENDPOINT_MODEL_TYPE_CUSTOM: "Custom / other OpenAI-compatible model",
+    ENDPOINT_MODEL_TYPE_CUSTOM: "Custom / other model",
+    ENDPOINT_MODEL_TYPE_OPUS_5_5: "Anthropic Opus 5.5",
     ENDPOINT_MODEL_TYPE_QWEN_3_6: "Qwen 3.6",
     ENDPOINT_MODEL_TYPE_QWEN_3_8: "Qwen 3.8 27B",
     ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT: "Qwen 3.8 Flash Next",
@@ -4391,7 +4401,13 @@ TOKEN_COST_SUM_FIELDS = (
 
 
 def endpoint_default_token_prices(model_type: str, provider: str) -> dict[str, float | None]:
+    # Local inference uses hosted list prices for comparison, not hardware cost.
+    # https://novita.ai/models/model-detail/qwen-qwen3.8-flash (2026-11-07)
+    if provider in {ENDPOINT_PROVIDER_VLLM, ENDPOINT_PROVIDER_LLAMA_CPP} and model_type == ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT:
+        return dict(zip(ENDPOINT_PRICE_FIELDS, (0.15, 0.016, 0.47)))
     rates = {
+        # https://platform.claude.com/docs/en/models/opus-5-5/overview
+        (ENDPOINT_PROVIDER_ANTHROPIC, ENDPOINT_MODEL_TYPE_OPUS_5_5): (4.0, 0.20, 20.0),
         (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_LUNA): (0.10, 0.01, 0.50),
         (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_SOL): (2.0, 0.10, 10.0),
         (ENDPOINT_PROVIDER_OPENAI, ENDPOINT_MODEL_TYPE_GPT_6_ASTRA): (10.0, 1.0, 50.0),
@@ -4426,9 +4442,12 @@ def endpoint_cost_pricing_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
         rates[key] = rate if rate is not None and math.isfinite(rate) and rate >= 0 else None
     label = ENDPOINT_MODEL_TYPE_LABELS.get(family, model) if family != ENDPOINT_MODEL_TYPE_CUSTOM else model
     tier = "default"
+    cache_write_multiplier = 1.25
     try:
         extra = parse_endpoint_extra_body(str(profile.get("extra_body_json") or ""))
         tier = str(extra.get("service_tier") or "default")
+        if isinstance(extra.get("cache_control"), dict) and extra["cache_control"].get("ttl") == "1h":
+            cache_write_multiplier = 2.0
     except (TypeError, ValueError):
         pass
     return {
@@ -4438,6 +4457,7 @@ def endpoint_cost_pricing_snapshot(profile: dict[str, Any]) -> dict[str, Any]:
         "endpoint_type": provider + ":" + (model if family == ENDPOINT_MODEL_TYPE_CUSTOM else family),
         "type_label": ENDPOINT_PROVIDER_LABELS.get(provider, provider) + " / " + label,
         "service_tier": tier,
+        **({"anthropic_cache_write_multiplier": cache_write_multiplier} if provider == ENDPOINT_PROVIDER_ANTHROPIC else {}),
         "gpt6_rules": provider == ENDPOINT_PROVIDER_OPENAI and family in ENDPOINT_GPT_6_MODEL_TYPES,
     }
 
@@ -4469,7 +4489,8 @@ def estimate_token_cost(
             amounts.append(0.0)
         else:
             amounts.append(count * float(rate) * multiplier / 1_000_000.0)
-    premium = (writes * float(pricing.get(ENDPOINT_PRICE_FIELDS[0]) or 0.0) * input_multiplier * 0.25 / 1_000_000.0 if gpt6 else 0.0)
+    write_premium = 0.25 if gpt6 else max(0.0, float(pricing.get("anthropic_cache_write_multiplier") or 1.0) - 1.0)
+    premium = writes * float(pricing.get(ENDPOINT_PRICE_FIELDS[0]) or 0.0) * input_multiplier * write_premium / 1_000_000.0
     return {
         "input_usd": amounts[0], "cached_input_usd": amounts[1], "output_usd": amounts[2],
         "cache_write_premium_usd": premium, "total_usd": sum(amounts) + premium,
@@ -4724,6 +4745,7 @@ ENDPOINT_EXTRA_BODY_RESERVED_FIELDS = frozenset({
     "model", "messages", "stream", "max_tokens", "max_completion_tokens",
     "authorization", "api_key", "headers", "url", "stop", "reasoning_effort",
     "thinking", "chat_template_kwargs", "preserve_thinking", "clear_thinking",
+    "system", "output_config", "stop_sequences",
     # Velox owns the selected model-facing tool transport. Endpoint profiles
     # cannot inject their own tools/functions/MCP fields or override the validated
     # native Chat Completions schema and response mode assembled by the runtime.
@@ -4743,6 +4765,8 @@ def normalize_endpoint_model_type(value: Any) -> str:
 
 
 def endpoint_api_transport_default(model_type: Any) -> str:
+    if normalize_endpoint_model_type(model_type) == ENDPOINT_MODEL_TYPE_OPUS_5_5:
+        return ENDPOINT_API_TRANSPORT_MESSAGES
     return (
         ENDPOINT_API_TRANSPORT_RESPONSES
         if normalize_endpoint_model_type(model_type) in ENDPOINT_GPT_MODEL_TYPES
@@ -4759,6 +4783,8 @@ def normalize_endpoint_api_transport(value: Any, model_type: Any = ENDPOINT_MODE
         "completions": ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS,
         "response": ENDPOINT_API_TRANSPORT_RESPONSES,
         "responses_api": ENDPOINT_API_TRANSPORT_RESPONSES,
+        "anthropic": ENDPOINT_API_TRANSPORT_MESSAGES,
+        "anthropic_messages": ENDPOINT_API_TRANSPORT_MESSAGES,
     }
     raw = aliases.get(raw, raw)
     return raw if raw in ENDPOINT_API_TRANSPORTS else endpoint_api_transport_default(model_type)
@@ -4774,6 +4800,8 @@ def endpoint_provider_default_from_url(url: Any) -> str:
         host = (urllib.parse.urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
     except Exception:
         host = ""
+    if host == "anthropic.com" or host.endswith(".anthropic.com"):
+        return ENDPOINT_PROVIDER_ANTHROPIC
     if host == "novita.ai" or host.endswith(".novita.ai"):
         return ENDPOINT_PROVIDER_NOVITA
     if host == "baseten.co" or host.endswith(".baseten.co"):
@@ -4831,6 +4859,7 @@ def endpoint_max_concurrent_requests(profile: dict[str, Any] | None) -> int:
 
 
 ENDPOINT_REASONING_LEVEL_OPTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    ENDPOINT_MODEL_TYPE_OPUS_5_5: (("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "XHigh"), ("max", "Max")),
     ENDPOINT_MODEL_TYPE_QWEN_3_6: (("on", "On"), ("off", "Off")),
     ENDPOINT_MODEL_TYPE_QWEN_3_8: (("xhigh", "XHigh"), ("medium", "Medium"), ("low", "Low")),
     ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT: (("xhigh", "XHigh"), ("medium", "Medium"), ("low", "Low")),
@@ -4879,6 +4908,7 @@ ENDPOINT_REASONING_LEVEL_OPTIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 ENDPOINT_REASONING_LEVEL_DEFAULTS = {
+    ENDPOINT_MODEL_TYPE_OPUS_5_5: "medium",
     ENDPOINT_MODEL_TYPE_QWEN_3_6: "off",
     ENDPOINT_MODEL_TYPE_QWEN_3_8: "xhigh",
     ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT: "xhigh",
@@ -4894,7 +4924,7 @@ ENDPOINT_REASONING_LEVEL_DEFAULTS = {
     ENDPOINT_MODEL_TYPE_GPT_5_6_SOL: "xhigh",
     ENDPOINT_MODEL_TYPE_GPT_5_6_LUNA: "xhigh",
     ENDPOINT_MODEL_TYPE_GPT_6_LUNA: "xhigh",
-    ENDPOINT_MODEL_TYPE_GPT_6_SOL: "high",
+    ENDPOINT_MODEL_TYPE_GPT_6_SOL: "medium",
     ENDPOINT_MODEL_TYPE_GPT_6_ASTRA: "medium",
     ENDPOINT_MODEL_TYPE_MUSE_GLIMMER: "high",
     ENDPOINT_MODEL_TYPE_CUSTOM: "",
@@ -4929,6 +4959,12 @@ def endpoint_effective_reasoning_level(profile: dict[str, Any] | None, override:
     if override is None or not str(override).strip():
         return configured
     raw = str(override).strip().lower()
+    if model_type == ENDPOINT_MODEL_TYPE_OPUS_5_5:
+        # Compaction/utility callers request minimal effort generically. Opus 5.5
+        # always thinks: low is the supported inexpensive equivalent, never off.
+        if raw in {"none", "minimal", "off"}:
+            return "low"
+        return configured if raw == "on" else normalize_endpoint_reasoning_level(model_type, raw)
     if model_type == ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017:
         # Baseten V4.1 supports none/high/max, not the older V4 low level.
         # https://docs.baseten.co/inference/model-apis/reasoning
@@ -4997,7 +5033,14 @@ def endpoint_model_type_defaults(model_type: Any) -> dict[str, Any]:
         "extra_body_json": "",
         "system_prompt_addon": "",
     }
-    if key == ENDPOINT_MODEL_TYPE_QWEN_3_6:
+    if key == ENDPOINT_MODEL_TYPE_OPUS_5_5:
+        common.update({
+            "model": "claude-opus-5-5",
+            "context_window_tokens": 1_000_000, "max_output_tokens": 128_000,
+            "vision": "enabled", "preserve_thinking": True,
+            "reasoning_effort": "medium",
+        })
+    elif key == ENDPOINT_MODEL_TYPE_QWEN_3_6:
         common.update({
             "model": "Qwen/Qwen3.6-27B",
             "context_window_tokens": 98304,
@@ -5490,8 +5533,14 @@ def default_endpoint_profile(
 
 
 def default_endpoint_profiles() -> list[dict[str, Any]]:
-    """Return the ten current out-of-box endpoint profiles."""
+    """Return current out-of-box endpoint profiles; never overwrite saved choices."""
     return [
+        default_endpoint_profile(
+            DEFAULT_OPUS_5_5_ENDPOINT_PROFILE_ID, "Anthropic Opus 5.5",
+            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="https://api.anthropic.com/v1/messages",
+            model_type=ENDPOINT_MODEL_TYPE_OPUS_5_5, provider=ENDPOINT_PROVIDER_ANTHROPIC,
+        ),
         default_endpoint_profile(
             DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID,
             "DSV41F 1017 (Baseten)",
@@ -5511,22 +5560,22 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID,
-            "Qwen 3.8 27B (vLLM)",
+            "Qwen 3.8 Flash Next (vLLM)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="http://127.0.0.1:8090/v1/chat/completions",
-            model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8,
+            model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
         ),
         default_endpoint_profile(
             DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID,
-            "Qwen 3.8 27B (llama.cpp)",
+            "Qwen 3.8 Flash Next (llama.cpp)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="http://localhost:8080/v1/chat/completions",
-            model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8,
+            model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
             provider=ENDPOINT_PROVIDER_LLAMA_CPP,
         ),
         default_endpoint_profile(
             DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID,
-            "Qwen 3.8 Flash Next (vLLM)",
+            "Qwen 3.8 Flash Next (vLLM, model alias)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="http://127.0.0.1:8090/v1/chat/completions",
             model="model",
@@ -5534,7 +5583,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID,
-            "Qwen 3.8 Flash (Novita)",
+            "Qwen 3.8 Flash Next (Novita)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.novita.ai/openai/v1/chat/completions",
             model="qwen/qwen3.8-flash",
@@ -12193,9 +12242,9 @@ def default_chat(
             "file_tools_enabled": True,
             "system_tools_enabled": True,
             "web_tools_enabled": True,
-            "agent_tools_enabled": True,
-            "chat_history_enabled": True,
-            "checklists_enabled": True,
+            "agent_tools_enabled": False,
+            "chat_history_enabled": False,
+            "checklists_enabled": False,
             "show_reasoning_content": True,
         },
     }
@@ -15196,9 +15245,9 @@ class ChatStore:
             "file_tools_enabled": bool(features.get("file_tools_enabled", True)),
             "system_tools_enabled": bool(features.get("system_tools_enabled", True)),
             "web_tools_enabled": bool(features.get("web_tools_enabled", True)),
-            "agent_tools_enabled": bool(features.get("agent_tools_enabled", True)),
-            "chat_history_enabled": bool(features.get("chat_history_enabled", True)),
-            "checklists_enabled": True,
+            "agent_tools_enabled": bool(features.get("agent_tools_enabled", False)),
+            "chat_history_enabled": bool(features.get("chat_history_enabled", False)),
+            "checklists_enabled": False,
             "show_reasoning_content": bool(features.get("default_show_reasoning_content", True)),
         }
 
@@ -26221,6 +26270,172 @@ def _request_response_cancel(response: Any) -> bool:
     return False
 
 
+def anthropic_usage_snapshot(usage: dict[str, Any]) -> dict[str, Any]:
+    """Anthropic input_tokens excludes cache reads/writes; Velox totals include them."""
+    out = copy.deepcopy(usage)
+    if "input_tokens" in usage:
+        reads = _cache_token_value(usage.get("cache_read_input_tokens")) or 0
+        writes = _cache_token_value(usage.get("cache_creation_input_tokens")) or 0
+        out["prompt_tokens"] = int(usage["input_tokens"]) + reads + writes
+        out["prompt_tokens_details"] = {"cached_tokens": reads}
+    if "output_tokens" in usage:
+        out["completion_tokens"] = int(usage["output_tokens"])
+    return out
+
+
+def anthropic_message_to_completion(raw: dict[str, Any]) -> dict[str, Any]:
+    """Translate a complete Messages reply at the protocol boundary, not in runtimes."""
+    if raw.get("type") != "message" or not isinstance(raw.get("content"), list):
+        raise ValueError("Anthropic response did not contain a message content array")
+    message: dict[str, Any] = {"role": "assistant", "content": ""}
+    thoughts, details, calls = [], [], []
+    for index, block in enumerate(raw["content"]):
+        if not isinstance(block, dict):
+            raise ValueError("Anthropic content block must be an object")
+        kind = block.get("type")
+        if kind == "text":
+            message["content"] += str(block.get("text") or "")
+        elif kind in {"thinking", "redacted_thinking"}:
+            if kind == "thinking":
+                thoughts.append(str(block.get("thinking") or ""))
+            details.append({"type": "anthropic.thinking", "index": index, "block": copy.deepcopy(block)})
+        elif kind == "tool_use":
+            if not isinstance(block.get("input"), dict) or not block.get("id") or not block.get("name"):
+                raise ValueError("Invalid Anthropic tool_use block")
+            calls.append({"id": block["id"], "type": "function", "function": {
+                "name": block["name"], "arguments": json.dumps(block["input"], ensure_ascii=False, separators=(",", ":")),
+            }})
+    if thoughts:
+        message["reasoning_content"] = "\n\n".join(thoughts)
+    if details:
+        message["reasoning_details"] = details
+    if calls:
+        message["tool_calls"] = calls
+    stop = str(raw.get("stop_reason") or "")
+    finish = {"end_turn": "stop", "stop_sequence": "stop", "tool_use": "tool_calls",
+              "max_tokens": "length", "model_context_window_exceeded": "length",
+              "refusal": "stop", "pause_turn": "stop"}.get(stop, stop)
+    if not stop:
+        raise ValueError("Anthropic message has no stop_reason")
+    return {"id": raw.get("id"), "model": raw.get("model"),
+            "usage": anthropic_usage_snapshot(raw.get("usage") or {}),
+            "choices": [{"message": message, "finish_reason": finish, "stop_reason": stop}]}
+
+
+class AnthropicMessagesStreamState:
+    """Adapt SSE events to shared chunks, preserving signed blocks and literal JSON.
+
+    Only complete blocks can become executable tool calls. message_stop is required
+    even after message_delta: a dropped connection must never execute partial calls.
+    """
+    def __init__(self) -> None:
+        self.blocks: dict[int, dict[str, Any]] = {}
+        self.parts: dict[int, list[str]] = {}
+        self.signatures: dict[int, list[str]] = {}
+        self.open_blocks: set[int] = set()
+        self.started = False
+        self.complete = False
+        self.stop_reason = ""
+        self.usage: dict[str, Any] = {}
+
+    def accept(self, event: Any) -> dict[str, Any] | None:
+        if not isinstance(event, dict):
+            raise ValueError("Anthropic stream event must be an object")
+        kind = event.get("type")
+        if kind == "message":
+            result = anthropic_message_to_completion(event)
+            self.complete = True
+            return result
+        if kind == "error" or event.get("error"):
+            return event  # Shared error diagnostics redact credentials and classify retries.
+        if kind == "ping":
+            return None  # Keepalives are not model progress.
+        if kind not in {"message_start", "message_delta", "message_stop",
+                        "content_block_start", "content_block_delta", "content_block_stop"}:
+            return None  # Forward-compatible SSE extension.
+        if self.complete:
+            raise ValueError("Anthropic event after message_stop")
+        delta: dict[str, Any] = {}
+        result: dict[str, Any] = {"choices": [{"delta": delta}]}
+        if kind == "message_start":
+            if self.started:
+                raise ValueError("Duplicate Anthropic message_start")
+            message = event.get("message") or {}
+            self.started = True
+            self.usage.update(message.get("usage") or {})
+            result["usage"] = anthropic_usage_snapshot(self.usage)
+            return result
+        if not self.started:
+            raise ValueError("Anthropic stream missing message_start")
+        if kind.startswith("content_block_"):
+            index = event.get("index")
+            if type(index) is not int or index < 0:
+                raise ValueError("Invalid Anthropic content block index")
+            if kind == "content_block_start":
+                if index in self.blocks:
+                    raise ValueError("Duplicate Anthropic content block index")
+                block = copy.deepcopy(event.get("content_block"))
+                if not isinstance(block, dict):
+                    raise ValueError("Anthropic content block must be an object")
+                self.blocks[index] = block
+                self.open_blocks.add(index)
+                field = {"text": "text", "thinking": "thinking"}.get(block.get("type"))
+                self.parts[index] = [str(block.get(field) or "")] if field else []
+                self.signatures[index] = [str(block.get("signature") or "")]
+                if field:
+                    delta["content" if field == "text" else "reasoning_content"] = block.get(field) or ""
+            else:
+                if index not in self.open_blocks:
+                    raise ValueError("Anthropic delta/stop for unopened content block")
+                block = self.blocks[index]
+                if kind == "content_block_delta":
+                    patch = event.get("delta") or {}
+                    patch_kind = patch.get("type")
+                    expected = {"text_delta": "text", "thinking_delta": "thinking",
+                                "input_json_delta": "tool_use", "signature_delta": "thinking"}.get(patch_kind)
+                    if expected and block.get("type") != expected:
+                        raise ValueError("Anthropic delta does not match content block type")
+                    if patch_kind == "signature_delta":
+                        self.signatures[index].append(str(patch.get("signature") or ""))
+                    elif patch_kind in {"text_delta", "thinking_delta", "input_json_delta"}:
+                        field = {"text_delta": "text", "thinking_delta": "thinking", "input_json_delta": "partial_json"}[patch_kind]
+                        piece = str(patch.get(field) or "")
+                        self.parts[index].append(piece)
+                        if patch_kind != "input_json_delta":
+                            delta["content" if patch_kind == "text_delta" else "reasoning_content"] = piece
+                        else:
+                            # Tool construction is progress even before complete JSON is available.
+                            result["_anthropic_tool_progress"] = bool(piece)
+                else:
+                    self.open_blocks.remove(index)
+                    text = "".join(self.parts.pop(index))
+                    if block.get("type") == "thinking":
+                        block.update(thinking=text, signature="".join(self.signatures[index]))
+                    elif block.get("type") == "text":
+                        block["text"] = text
+                    elif block.get("type") == "tool_use" and text:
+                        block["input"] = json.loads(text)
+                    if block.get("type") in {"thinking", "redacted_thinking"}:
+                        delta["reasoning_details"] = [{"type": "anthropic.thinking", "index": index, "block": copy.deepcopy(block)}]
+                    elif block.get("type") == "tool_use":
+                        converted = anthropic_message_to_completion({"type": "message", "content": [block], "stop_reason": "tool_use"})
+                        call = converted["choices"][0]["message"]["tool_calls"][0]
+                        delta["tool_calls"] = [dict(call, index=index)]
+                    self.signatures.pop(index, None)
+        elif kind == "message_delta":
+            patch = event.get("delta") or {}
+            self.stop_reason = str(patch.get("stop_reason") or self.stop_reason)
+            self.usage.update(event.get("usage") or {})
+            result["usage"] = anthropic_usage_snapshot(self.usage)
+        elif kind == "message_stop":
+            if self.open_blocks or not self.stop_reason:
+                raise ValueError("Incomplete Anthropic message at message_stop")
+            self.complete = True
+            converted = anthropic_message_to_completion({"type": "message", "content": [], "stop_reason": self.stop_reason})
+            result["choices"][0].update({k: v for k, v in converted["choices"][0].items() if k != "message"})
+        return result
+
+
 class LLMClient:
     def __init__(self, storage: Storage):
         self.storage = storage
@@ -26551,7 +26766,7 @@ class LLMClient:
             "max_completion_tokens" if "max_completion_tokens" in payload else "max_tokens"
         )
         output_limit_value = payload.get(output_limit_field)
-        auth_present = bool(headers.get("Authorization"))
+        auth_present = bool(headers.get("Authorization") or headers.get("x-api-key"))
         lines = [
             "LLM endpoint request failed.",
             f"Endpoint profile: {str(endpoint.get('profile_label') or endpoint.get('label') or 'Unnamed')} ({str(endpoint.get('profile_id') or endpoint.get('id') or 'unknown')})",
@@ -26575,7 +26790,7 @@ class LLMClient:
             f"Request summary: {message_count} {request_item_label}; {request_bytes} JSON bytes; {output_limit_field}={output_limit_value}",
             f"Payload fields: {', '.join(sorted(str(key) for key in payload))}",
             (
-                f"Authorization: configured (Bearer credential; {int(endpoint.get('_api_key_length') or len(api_key))} characters; value redacted)"
+                f"Authorization: configured ({'x-api-key' if headers.get('x-api-key') else 'Bearer credential'}; {int(endpoint.get('_api_key_length') or len(api_key))} characters; value redacted)"
                 if auth_present else "Authorization: not configured"
             ),
             f"Request headers: Content-Type={headers.get('Content-Type', '')}; Accept={headers.get('Accept', '')}; User-Agent={headers.get('User-Agent', '')}",
@@ -27262,10 +27477,164 @@ class LLMClient:
         endpoint["_api_transport"] = ENDPOINT_API_TRANSPORT_RESPONSES
         return endpoint, url, body, headers, timeout, payload
 
+    @staticmethod
+    def _messages_url(base_url: str) -> str:
+        raw = _strip_matching_outer_quotes(base_url)
+        if not raw:
+            return ""
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+            raise ValueError("Endpoint URL contains a control character or line break")
+        parts = urllib.parse.urlsplit(raw)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            raise ValueError("Endpoint URL must be an absolute http:// or https:// URL")
+        path = parts.path.rstrip("/")
+        if not path:
+            path = "/v1/messages"
+        elif not path.endswith("/messages"):
+            for suffix in ("/chat/completions", "/responses"):
+                if path.endswith(suffix):
+                    path = path[:-len(suffix)]
+                    break
+            path += "/messages"
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
+
+    @staticmethod
+    def _messages_content(content: Any) -> list[dict[str, Any]]:
+        if content in (None, ""):
+            return []
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        if not isinstance(content, list):
+            raise ValueError("Messages content must be text or an array of blocks")
+        blocks = []
+        for part in content:
+            if not isinstance(part, dict):
+                raise ValueError("Messages content block must be an object")
+            kind = part.get("type")
+            if kind in {"text", "input_text"}:
+                if part.get("text"):
+                    blocks.append({"type": "text", "text": str(part["text"])})
+            elif kind == "image_url":
+                value = part.get("image_url")
+                url = str(value.get("url") or "") if isinstance(value, dict) else str(value or "")
+                match = re.fullmatch(r"data:(image/(?:jpeg|png|gif|webp));base64,(.+)", url, re.DOTALL)
+                if match:
+                    source = {"type": "base64", "media_type": match[1], "data": match[2]}
+                elif urllib.parse.urlsplit(url).scheme in {"http", "https"}:
+                    source = {"type": "url", "url": url}
+                else:
+                    raise ValueError("Unsupported Anthropic image URL or media type")
+                blocks.append({"type": "image", "source": source})
+            elif kind in {"image", "document"}:
+                blocks.append(copy.deepcopy(part))
+            else:
+                raise ValueError(f"Unsupported Anthropic input block: {kind}")
+        return blocks
+
+    def _messages_payload_and_headers(
+        self, request: LLMRequest, *, stream: bool,
+    ) -> tuple[dict[str, Any], str, bytes, dict[str, str], int, dict[str, Any]]:
+        request.prepared_capacity.clear()
+        endpoint = dict(self.resolve_endpoint(request.endpoint_profile_id))
+        configured_url = _strip_matching_outer_quotes(endpoint.get("base_url"))
+        url = self._messages_url(configured_url)
+        model = _strip_matching_outer_quotes(endpoint.get("model"))
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in model):
+            raise ValueError("Model ID contains a control character or line break")
+        source = prepend_endpoint_system_prompt_addon(request.messages, endpoint)
+        source = self._normalize_messages_for_chat_template(source, include_reasoning_fields=True)
+        system, messages = [], []
+        for msg in source:
+            role = msg["role"]
+            if role == "system":
+                system.extend(self._messages_content(msg["content"]))
+                continue
+            if role == "tool":
+                role = "user"
+                blocks = [{"type": "tool_result", "tool_use_id": msg["tool_call_id"],
+                           "content": self._messages_content(msg["content"])}]
+            else:
+                blocks = []
+                if role == "assistant":
+                    for packet in msg.get("reasoning_details") or []:
+                        if packet.get("type") == "anthropic.thinking":
+                            block = packet.get("block")
+                            if not isinstance(block, dict) or block.get("type") not in {"thinking", "redacted_thinking"}:
+                                raise ValueError("Invalid Anthropic thinking replay block")
+                            blocks.append(copy.deepcopy(block))
+                blocks.extend(self._messages_content(msg["content"]))
+                if role == "assistant":
+                    for call in canonicalize_provider_tool_calls(msg.get("tool_calls") or []):
+                        function = call["function"]
+                        arguments = function.get("arguments") or "{}"
+                        arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+                        if not isinstance(arguments, dict):
+                            raise ValueError("Anthropic tool input must be a JSON object")
+                        blocks.append({"type": "tool_use", "id": call["id"], "name": function["name"], "input": arguments})
+            if not blocks:
+                continue
+            if messages and messages[-1]["role"] == role:
+                messages[-1]["content"].extend(blocks)
+            else:
+                messages.append({"role": role, "content": blocks})
+        image_count = message_image_input_count(source)
+        if image_count > endpoint_max_image_inputs(endpoint):
+            raise ValueError(f"Endpoint allows at most {endpoint_max_image_inputs(endpoint)} image input(s) per prompt, but this request contains {image_count}.")
+        tools = []
+        for entry in request.native_tools or []:
+            function = entry.get("function") or {}
+            if entry.get("type") != "function" or not function.get("name"):
+                raise ValueError("Anthropic client tools must be function definitions")
+            tools.append({"name": function["name"], "description": str(function.get("description") or ""),
+                          "input_schema": copy.deepcopy(function.get("parameters") or {"type": "object", "properties": {}})})
+        requested = request.max_output_tokens if request.max_output_tokens is not None else endpoint.get("max_output_tokens")
+        accounting_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        maximum, capacity = bounded_request_output_tokens(endpoint, messages=accounting_messages,
+            native_tools=tools, requested_output_tokens=requested)
+        payload = parse_endpoint_extra_body(endpoint.get("extra_body_json"))
+        payload.update(model=model, messages=messages, max_tokens=maximum, stream=bool(stream))
+        if system:
+            payload["system"] = system
+        if tools:
+            payload.update(tools=tools, tool_choice={"type": "auto"})
+        effort = endpoint_effective_reasoning_level(endpoint, request.reasoning_effort_override)
+        if effort:
+            if effort not in {"low", "medium", "high", "xhigh", "max"}:
+                raise ValueError("Anthropic adaptive thinking requires low/medium/high/xhigh/max effort")
+            payload.update(thinking={"type": "adaptive"}, output_config={"effort": effort})
+        if endpoint.get("stop_sequences"):
+            payload["stop_sequences"] = list(endpoint["stop_sequences"])
+        # Opus 5.5's adaptive thinking does not accept sampling overrides.
+        if normalize_endpoint_model_type(endpoint.get("model_type")) != ENDPOINT_MODEL_TYPE_OPUS_5_5:
+            for key in ("temperature", "top_p", "top_k"):
+                if endpoint.get(key) is not None:
+                    payload[key] = endpoint[key]
+        api_key = normalize_endpoint_api_key(endpoint.get("api_key"))
+        headers = {"Content-Type": "application/json",
+                   "Accept": "text/event-stream, application/json" if stream else "application/json",
+                   "Accept-Encoding": "identity", "User-Agent": endpoint_user_agent(endpoint),
+                   "anthropic-version": ANTHROPIC_API_VERSION}
+        if api_key:
+            headers["x-api-key"] = api_key
+        timeout = bounded_positive_int(endpoint.get("timeout_seconds"), ENDPOINT_TIMEOUT_SECONDS_DEFAULT, minimum=1, maximum=None)
+        capacity = dict(capacity, requested_output_tokens=bounded_positive_int(requested, 32768, maximum=None),
+                        effective_output_tokens=maximum)
+        request.prepared_capacity.update(capacity)
+        endpoint.update(_request_capacity=capacity, _requested_max_output_tokens=capacity["requested_output_tokens"],
+                        _effective_max_output_tokens=maximum, _configured_base_url=configured_url, _request_url=url,
+                        _provider=endpoint_provider(endpoint), _model_type=endpoint.get("model_type"),
+                        _api_key_length=len(api_key), _effective_user_agent=headers["User-Agent"],
+                        _api_transport=ENDPOINT_API_TRANSPORT_MESSAGES)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return endpoint, url, body, headers, timeout, payload
+
+
     def _payload_and_headers(
         self, request: LLMRequest, *, stream: bool,
     ) -> tuple[dict[str, Any], str, bytes, dict[str, str], int, dict[str, Any]]:
         endpoint = self.resolve_endpoint(request.endpoint_profile_id)
+        if endpoint_api_transport(endpoint) == ENDPOINT_API_TRANSPORT_MESSAGES:
+            return self._messages_payload_and_headers(request, stream=stream)
         if self._uses_openai_responses(endpoint):
             return self._responses_payload_and_headers(request, stream=stream)
         return self._chat_payload_and_headers(request, stream=stream)
@@ -27921,12 +28290,13 @@ class LLMClient:
             emitted_reasoning = AppendOnlyTextAccumulator()
             scalar_reasoning = AppendOnlyTextAccumulator()
             structured_reasoning = StructuredReasoningAccumulator()
+            messages_state = AnthropicMessagesStreamState() if endpoint_api_transport(endpoint) == ENDPOINT_API_TRANSPORT_MESSAGES else None
             reasoning_channel = ""
             provider_message_fields: set[str] = set()
 
             def diagnostics() -> dict[str, Any]:
                 return {
-                    "transport": "chat_completions", "stream": True,
+                    "transport": endpoint_api_transport(endpoint), "stream": True,
                     "provider_message_fields": sorted(provider_message_fields),
                     "reasoning_text_chars": emitted_reasoning.total_chars,
                     "scalar_reasoning_chars": scalar_reasoning.total_chars,
@@ -28021,12 +28391,18 @@ class LLMClient:
             def process_object(obj: Any, raw_bytes: bytes) -> None:
                 nonlocal usage, reasoning_open, saw_valid_payload
                 nonlocal finish_reason, stop_reason, reasoning_channel
+                if messages_state is not None:
+                    obj = messages_state.accept(obj)
+                    if obj is None:
+                        return
                 if not isinstance(obj, dict):
                     raise protocol_error("HTTP response JSON was not an object", raw_bytes)
                 provider_error = self._payload_error_value(obj)
                 if provider_error is not None:
                     raise protocol_error("Provider returned an error object", raw_bytes)
                 saw_valid_payload = True
+                if obj.get("_anthropic_tool_progress"):
+                    put(LLMChunk(meaningful_progress=True, model_output_observed=True))
                 publish_prompt_progress(obj)
                 if isinstance(obj.get("usage"), dict):
                     usage = update_llm_usage_snapshot(usage or {}, obj.get("usage"))
@@ -28178,7 +28554,7 @@ class LLMClient:
                                 ) from parse_exc
                             for obj in payloads:
                                 process_object(obj, frame_bytes)
-                    if not saw_valid_payload or (saw_sse_frame and not saw_done_frame and not finish_reason):
+                    if (messages_state is not None and saw_sse_frame and not messages_state.complete) or not saw_valid_payload or (saw_sse_frame and not saw_done_frame and not finish_reason):
                         raise LLMEndpointError(
                             "Endpoint connection closed before a complete provider response",
                             endpoint_profile_id=request.endpoint_profile_id, reason="connection_closed",
@@ -28771,6 +29147,8 @@ class LLMClient:
                     response_body_bytes=payload_bytes,
                     final_url=response_url,
                 )
+            if endpoint_api_transport(endpoint) == ENDPOINT_API_TRANSPORT_MESSAGES:
+                raw = anthropic_message_to_completion(raw)
             choices = raw.get("choices")
             if not isinstance(choices, list) or not choices:
                 raise self._endpoint_error(
@@ -64870,10 +65248,12 @@ class Widgets:
         visible = min(max(1, len(options)), 9) if options else 1
         menu_pad = 6
         menu_h = row_h * visible + menu_pad * 2
-        menu_w = max(rect.w, 80)
+        # The trigger may be narrow, but endpoint/provider suffixes must stay readable.
+        menu_w = max(rect.w, 80, max((self._text_width(str(option)) for option in options), default=0) + 36)
         host = getattr(self.renderer, "host", None)
         screen_w = int(getattr(host, "width", rect.x + rect.w + 24) or (rect.x + rect.w + 24))
         screen_h = int(getattr(host, "height", rect.y + rect.h + menu_h + 24) or (rect.y + rect.h + menu_h + 24))
+        menu_w = min(menu_w, max(1, screen_w - 16))
         space_below = screen_h - (rect.y + rect.h + 6)
         space_above = rect.y - 6
         open_up = bool(space_below < menu_h and space_above > space_below)
@@ -71501,7 +71881,11 @@ class Panels:
             auth_configured = bool(normalize_endpoint_api_key(profile.get("api_key")))
         except Exception:
             auth_configured = False
-        if auth_configured:
+        if endpoint_api_transport(profile) == ENDPOINT_API_TRANSPORT_MESSAGES:
+            headers["anthropic-version"] = ANTHROPIC_API_VERSION
+            if auth_configured:
+                headers["x-api-key"] = "[REDACTED]"
+        elif auth_configured:
             headers["Authorization"] = "Bearer [REDACTED]"
         return self._http_headers_preview_text(headers)
 
@@ -72185,7 +72569,7 @@ class Panels:
                         [ENDPOINT_PROVIDER_LABELS[value] for value in ENDPOINT_PROVIDERS],
                         tooltip=(
                             "Select the actual endpoint implementation. vLLM and llama.cpp receive local-provider "
-                            "payload behavior and default to two active Tasks; OpenAI, Novita, and Baseten default to four. "
+                            "payload behavior and default to two active Tasks; OpenAI, Anthropic, Novita, and Baseten default to four. "
                             + (VLLM_CACHE_REPORTING_HINT if prior_provider == ENDPOINT_PROVIDER_VLLM else "")
                         ),
                     )
@@ -72240,9 +72624,9 @@ class Panels:
                         ENDPOINT_API_TRANSPORT_LABELS[current_transport],
                         [ENDPOINT_API_TRANSPORT_LABELS[value] for value in ENDPOINT_API_TRANSPORTS],
                         tooltip=(
-                            "Chat Completions is the default for ordinary and compatible endpoints. Responses "
-                            "supports stateless output-item replay and reasoning-oriented GPT workflows. The "
-                            "server must implement the selected OpenAI-compatible API."
+                            "Choose the API implemented by the server: OpenAI-compatible Chat Completions, "
+                            "OpenAI Responses with stateless output-item replay, or native Anthropic Messages "
+                            "with signed thinking and tool-use blocks."
                         ),
                     )
                     draft["api_transport"] = next(
@@ -72252,12 +72636,16 @@ class Panels:
                 y += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
 
                 endpoint_transport = endpoint_api_transport(draft)
-                transport_path = "/responses" if endpoint_transport == ENDPOINT_API_TRANSPORT_RESPONSES else "/chat/completions"
+                transport_path = {
+                    ENDPOINT_API_TRANSPORT_RESPONSES: "/responses",
+                    ENDPOINT_API_TRANSPORT_MESSAGES: "/messages",
+                    ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS: "/chat/completions",
+                }[endpoint_transport]
                 text_row(
                     "modal.endpoint.base_url", "Endpoint URL", "base_url", f"https://provider.example/v1{transport_path}",
                     tooltip=(
-                        "Accepts an OpenAI-compatible API root, /v1 base, a complete /chat/completions URL, "
-                        "or a complete /responses URL. Velox normalizes it to the selected API."
+                        "Accepts an API root, /v1 base, or complete /chat/completions, /responses, or "
+                        "/messages URL. Velox normalizes it to the selected API."
                     ),
                 )
                 text_row(

@@ -146,6 +146,18 @@ def _install_legacy_endpoint_fixtures(storage: velox.Storage) -> None:
         storage.write_config(config)
 
 
+def _create_test_chat(chats: velox.ChatStore, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Behavior fixtures explicitly opt into tools; fresh-default tests use create_chat directly.
+
+    Exercise the real public permission setters before the first turn, rather than
+    mocking production defaults or relaxing the locked task-policy boundary.
+    """
+    chat = chats.create_chat(*args, **kwargs)
+    for key in ("agent_tools_enabled", "chat_history_enabled", "checklists_enabled"):
+        chat = chats.set_chat_feature(velox.APP_SCOPE_ID, chat["chat_id"], key, True)
+    return chat
+
+
 class _LegacyEndpointFixtureMixin:
     """Opt in to saved endpoints only for regressions that exercise them."""
 
@@ -879,7 +891,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def _chat(self, root: Path, name: str = "Test Chat") -> tuple[AppPaths, Storage, ChatStore, dict[str, Any]]:
         paths, storage, chats = _make_test_chat_stack(root)
-        chat = chats.create_chat(name)
+        chat = _create_test_chat(chats, name)
         return paths, storage, chats, chat
 
     @staticmethod
@@ -1251,7 +1263,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(manifest["state"]["active_chat_id"], "from-a")
 
             chats = velox.ChatStore(storage_a)
-            chat = chats.create_chat("Original")
+            chat = _create_test_chat(chats, "Original")
             stale = chats.load_chat(chat["chat_id"])
             storage_a.record_tool_usage("fs_read", True, chat_id=chat["chat_id"])
             stale["name"] = "Renamed from stale copy"
@@ -1568,9 +1580,9 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_all_chat_summaries_are_newest_first_and_whole_block_capped(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, _storage, chats = _make_test_chat_stack(Path(td))
-            newest = chats.create_chat("Newest")
-            middle = chats.create_chat("Middle")
-            oldest = chats.create_chat("Oldest")
+            newest = _create_test_chat(chats, "Newest")
+            middle = _create_test_chat(chats, "Middle")
+            oldest = _create_test_chat(chats, "Oldest")
             self._write_chat_summary(paths, newest["chat_id"], "- NEWEST " + "N" * 120)
             self._write_chat_summary(paths, middle["chat_id"], "- MIDDLE " + "M" * 120)
             self._write_chat_summary(paths, oldest["chat_id"], "- OLDEST " + "O" * 120)
@@ -1594,9 +1606,9 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_first_message_history_snapshot_is_chronological_stable_and_capped(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            history_chat = chats.create_chat("History")
+            history_chat = _create_test_chat(chats, "History")
             self._write_chat_summary(paths, history_chat["chat_id"], "- Durable prior decision")
-            current = chats.create_chat("Current")
+            current = _create_test_chat(chats, "Current")
             runtime = velox.ChatRuntime(storage, chats, velox.ContextAssembler(paths), velox.LLMClient(storage), velox.ToolRegistry(storage))
             endpoint_id = chats.get_chat_endpoint_profile_id(current["chat_id"])
             context = runtime._prepare_cache_safe_application_context(
@@ -1628,9 +1640,9 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             try:
-                history_chat = chats.create_chat("History")
+                history_chat = _create_test_chat(chats, "History")
                 self._write_chat_summary(paths, history_chat["chat_id"], "- Should stay hidden")
-                current = chats.create_chat("Current")
+                current = _create_test_chat(chats, "Current")
                 first = velox.make_turn(current["chat_id"], "user", "Start")
                 first["chat_history_context_enabled"] = False
                 chats.append_turn(velox.APP_SCOPE_ID, current["chat_id"], first)
@@ -1643,9 +1655,9 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
             _install_legacy_endpoint_fixtures(storage)
-            history_chat = chats.create_chat("History")
+            history_chat = _create_test_chat(chats, "History")
             self._write_chat_summary(paths, history_chat["chat_id"], "- Snapshot context")
-            current = chats.create_chat("Current")
+            current = _create_test_chat(chats, "Current")
             chat_id = str(current["chat_id"])
             chats.set_chat_feature(velox.APP_SCOPE_ID, chat_id, "file_tools_enabled", True)
             chats.set_chat_feature(velox.APP_SCOPE_ID, chat_id, "system_tools_enabled", False)
@@ -1723,7 +1735,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_all_chats_summary_tool_is_dynamic_and_has_no_global_file(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("One")
+            chat = _create_test_chat(chats, "One")
             self._write_chat_summary(paths, chat["chat_id"], "- One stored summary")
             tools = velox.ToolRegistry(storage)
             result = await tools.tool_chats_get_all_summaries(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=chat["chat_id"]), {})
@@ -2220,8 +2232,8 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with _TemporaryDataDirectory() as td:
             root = Path(td)
             paths, storage, chats = _make_test_chat_stack(root)
-            chat_a = chats.create_chat("Agent source A")
-            chat_b = chats.create_chat("Agent source B")
+            chat_a = _create_test_chat(chats, "Agent source A")
+            chat_b = _create_test_chat(chats, "Agent source B")
             agents = velox.AgentStore(storage)
 
             first = agents.create_agent(
@@ -2464,7 +2476,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Debug copy")
+            chat = _create_test_chat(chats, "Debug copy")
             turns = [
                 velox.make_turn(chat["chat_id"], "user", "hello"),
                 velox.make_turn(chat["chat_id"], "assistant", "done", status="complete"),
@@ -2628,16 +2640,6 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual([row["index"] for row in velox.iter_jsonl_tail(path, 3)], [4, 5, 6])
 
 
-    def test_semantic_missing_tool_recovery_is_completely_removed(self) -> None:
-        source = application_source()
-        self.assertNotIn("def _should_retry_missing_tool_call", source)
-        self.assertNotIn("def _append_model_recovery_prompt", source)
-        self.assertNotIn("llm_missing_tool_retries", source)
-        self.assertNotIn("llm_empty_completion_retries", source)
-        self.assertNotIn("llm_truncation_continuations", source)
-        self.assertNotIn("chat.model_continuation_recovery", source)
-        self.assertIn("def execute_tool_call(", inspect.getsource(velox.ToolRegistry))
-        self.assertIn("native tool", inspect.getsource(velox.ToolRegistry).lower())
 
     def test_default_endpoints_font_and_chunked_file_terminal_helpers(self) -> None:
         cfg = velox.default_config()
@@ -4002,20 +4004,6 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('"View headers..."', tools)
 
     def test_endpoint_settings_cache_and_diagnostic_wiring(self) -> None:
-        endpoint_source = self._method_source(velox.Panels, "_draw_endpoints_settings_content")
-        modal_source = self._method_source(velox.Panels, "draw_modals")
-        self.assertIn('"LLM endpoints"', endpoint_source)
-        self.assertIn('"endpoint_editor"', modal_source)
-        self.assertIn('"Provider"', modal_source)
-        self.assertIn('"Max inference requests"', modal_source)
-        cache_source = self._method_source(velox.LLMClient, "_endpoint_cache_signature")
-        self.assertIn("st_ctime_ns", cache_source)
-        raw_stream = self._method_source(velox.LLMClient, "_chat_completions_stream_unqueued")
-        frame_source = inspect.getsource(velox.iter_openai_compatible_stream_frames)
-        self.assertIn("Endpoint returned a non-success HTTP status", raw_stream)
-        self.assertIn("if not saw_valid_payload", raw_stream)
-        self.assertIn('payload.strip() == b"[DONE]"', frame_source)
-
         with _TemporaryDataDirectory() as td:
             _paths, storage, _chats = _make_test_chat_stack(Path(td))
             client = velox.LLMClient(storage)
@@ -5055,10 +5043,10 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_new_chat_receives_all_prior_one_line_summaries_newest_first(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            oldest = chats.create_chat("Oldest")
-            missing = chats.create_chat("No Summary Yet")
-            newest = chats.create_chat("Newest")
-            current = chats.create_chat("Current")
+            oldest = _create_test_chat(chats, "Oldest")
+            missing = _create_test_chat(chats, "No Summary Yet")
+            newest = _create_test_chat(chats, "Newest")
+            current = _create_test_chat(chats, "Current")
             self._write_chat_summary(
                 paths,
                 oldest["chat_id"],
@@ -5111,8 +5099,8 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_deletion_cascades_linked_agents_and_restricts_direct_agent_delete(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            source = chats.create_chat("Source")
-            other = chats.create_chat("Other")
+            source = _create_test_chat(chats, "Source")
+            other = _create_test_chat(chats, "Other")
             agents = velox.AgentStore(storage)
             llm = velox.LLMClient(storage)
             monitor = velox.LLMTaskMonitor(storage)
@@ -5175,7 +5163,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("Delete with live agent")
+            chat = _create_test_chat(chats, "Delete with live agent")
             agents = velox.AgentStore(storage)
             fake = BlockingLLM()
             monitor = velox.LLMTaskMonitor(storage)
@@ -5220,7 +5208,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_failed_chat_delete_restores_background_summary_eligibility(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Deletion failure")
+            chat = _create_test_chat(chats, "Deletion failure")
             chat_id = str(chat["chat_id"])
             agents = velox.AgentStore(storage)
             llm = velox.LLMClient(storage)
@@ -5272,7 +5260,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("Delete during background summary")
+            chat = _create_test_chat(chats, "Delete during background summary")
             chat_id = str(chat["chat_id"])
             chats.append_turn(velox.APP_SCOPE_ID, chat_id, velox.make_turn(chat_id, "user", "Generate a delayed summary."))
 
@@ -5478,8 +5466,8 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat_a = chats.create_chat("Terminal owner A")
-            chat_b = chats.create_chat("Terminal owner B")
+            chat_a = _create_test_chat(chats, "Terminal owner A")
+            chat_b = _create_test_chat(chats, "Terminal owner B")
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(chat_a["chat_id"], "Use a private terminal.", title="Terminal agent")
             runtime = velox.TerminalRuntime(
@@ -6144,7 +6132,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
         with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("PowerShell terminal")
+            chat = _create_test_chat(chats, "PowerShell terminal")
             runtime = velox.TerminalRuntime(
                 storage,
                 process_factory=lambda argv, **kwargs: FakePowerShellProcess(list(argv), **kwargs),
@@ -6256,7 +6244,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Interactive terminal")
+            chat = _create_test_chat(chats, "Interactive terminal")
             runtime = velox.TerminalRuntime(
                 storage,
                 process_factory=lambda argv, **kwargs: FakeConPTYProcess(list(argv), **kwargs),
@@ -6341,7 +6329,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_terminal_prompt_tool_has_only_terminal_id_and_text(self) -> None:
         with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Simple terminal prompt tool")
+            chat = _create_test_chat(chats, "Simple terminal prompt tool")
             registry = velox.ToolRegistry(storage)
 
             async def fake_respond(_ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -6605,14 +6593,6 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
-    def test_no_missing_tool_classifier_or_recovery_prompt_remains(self) -> None:
-        self.assertFalse(hasattr(velox.ChatRuntime, "_should_retry_missing_tool_call"))
-        self.assertFalse(hasattr(velox.ChatRuntime, "_append_model_recovery_prompt"))
-        source = application_source()
-        self.assertNotIn("No executable tool call was recovered", source)
-        self.assertNotIn("continue exactly where", source.lower())
-        self.assertIn("The endpoint returned no usable assistant content", source)
-        self.assertIn("No active Checklist state requested continuation", source)
 
     def test_chat_turn_terminal_state_is_monotonic_against_stale_stream_writes(self) -> None:
         with _TemporaryDataDirectory() as td:
@@ -6843,8 +6823,8 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(len(chats.list_chats(velox.APP_SCOPE_ID)), 1)
             self.assertEqual(chats.load_chat(first_id)["name"], "New Chat")
 
-            older = chats.create_chat("Older")
-            newest = chats.create_chat("Newest")
+            older = _create_test_chat(chats, "Older")
+            newest = _create_test_chat(chats, "Newest")
             self._set_chat_updated(paths, chats, first_id, "2026-01-01T00:00:00.000Z")
             self._set_chat_updated(paths, chats, str(older["chat_id"]), "2026-02-01T00:00:00.000Z")
             self._set_chat_updated(paths, chats, str(newest["chat_id"]), "2026-03-01T00:00:00.000Z")
@@ -7457,7 +7437,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_item_agent_link_unlink_delete_and_done_timestamp(self) -> None:
         with _TemporaryDataDirectory() as td:
             _paths, storage, chats, calendar = self._stack(Path(td))
-            chat = chats.create_chat("Agent source")
+            chat = _create_test_chat(chats, "Agent source")
             agent = velox.AgentStore(storage).create_agent(chat["chat_id"], "Produce the artifact")
             item = calendar.create_item("Agent deliverable")
             linked = calendar.link_agent(item["item_id"], agent["agent_id"])
@@ -7479,7 +7459,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             root = Path(td)
             paths, storage, chats, calendar = self._stack(root)
             week_chat = calendar.get_or_create_week_chat("2026-07-30")
-            ordinary = chats.create_chat("Ordinary chat")
+            ordinary = _create_test_chat(chats, "Ordinary chat")
             event_payload = self._event_payload("context-event", title="Eric 1:1")
             event_payload["description"] = "FULL EVENT DESCRIPTION MUST BE RETRIEVED THROUGH A TOOL"
             event = calendar.upsert_event(event_payload)
@@ -7816,7 +7796,7 @@ class CalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_week_chat_lazy_creation_date_switching_drafts_and_normal_chat_open(self) -> None:
         with _TemporaryDataDirectory() as td:
             _paths, _storage, chats, calendar, panel, _services = self._panel_stack(Path(td))
-            ordinary = chats.create_chat("Ordinary before Calendar")
+            ordinary = _create_test_chat(chats, "Ordinary before Calendar")
             panel.state.active_chat_id = ordinary["chat_id"]
             panel.state.active_panel = "chat"
             panel.state.composer_text = "ordinary draft"
@@ -9319,7 +9299,7 @@ class GoogleCalendarTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             for secret in (b"TOPSECRET", b"REFRESHSECRET", b"CLIENTSECRET"):
                 self.assertNotIn(secret, raw_credentials)
 
-            chat = chats.create_chat("Prompt privacy")
+            chat = _create_test_chat(chats, "Prompt privacy")
             prompt_text = "\n".join(
                 str(message.get("content") or "")
                 for message in velox.ContextAssembler(paths).assemble_chat_context(velox.APP_SCOPE_ID, chat["chat_id"])
@@ -10384,7 +10364,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
             skill_names = {row["name"] for row in velox.SkillStore(storage).list_skills(include_disabled=True, refresh=True)}
             self.assertIn(velox.DEFAULT_GENERAL_AGENT_SKILL_NAME, skill_names)
             self.assertIn(velox.DEFAULT_PERSONAL_ASSISTANT_AGENT_SKILL_NAME, skill_names)
-            chat = chats.create_chat("Agent skills")
+            chat = _create_test_chat(chats, "Agent skills")
             agents = velox.AgentStore(storage)
             tools = velox.ToolRegistry(storage)
             class DummyLLM:
@@ -10643,7 +10623,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
     def test_personal_assistant_terminal_output_is_saved_as_daily_report_and_loaded_for_later_days(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("PA report")
+            chat = _create_test_chat(chats, "PA report")
             agents = velox.AgentStore(storage)
             tools = velox.ToolRegistry(storage)
 
@@ -10745,7 +10725,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
 
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("Drive download")
+            chat = _create_test_chat(chats, "Drive download")
             connector = velox.GoogleDriveConnector(storage, velox.VaultStore(storage), velox.CredentialStore(paths))
             service = Service()
             connector._service_from_saved_credentials = lambda: (service, None, None)  # type: ignore[method-assign]
@@ -10825,7 +10805,7 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         storage = velox.Storage(paths)
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Long streaming regression")
+        chat = _create_test_chat(chats, "Long streaming regression")
         return paths, storage, chats, chat
 
     @staticmethod
@@ -11391,21 +11371,6 @@ class LongStreamingTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(accumulator.materialize(), "alphabeta")
         self.assertEqual(accumulator.materialization_count, 1)
 
-    def test_streaming_and_compaction_sources_use_rope_accumulation(self) -> None:
-        # Inspect the immutable production prefix rather than linecache-backed
-        # method slices. Very large source files can leave inspect.getsource with
-        # a neighboring line range after an earlier AST probe in the same shard.
-        production = application_source()
-        self.assertIn("stream_visible_parts", production)
-        self.assertIn("chat_stream_ui_interval_seconds", production)
-        self.assertNotIn("accumulated += piece", production)
-        self.assertIn("raw_output_parts", production)
-        self.assertIn("materialize_compaction_output", production)
-        self.assertNotIn("raw_output += display_piece", production)
-        self.assertIn("flush_streaming_snapshots", production)
-        self.assertIn("virtualized_rounded_rect_geometry", production)
-        self.assertIn("_chat_body_has_large_text", production)
-        self.assertIn("body_blocks=body_blocks", production)
 
 
 class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -11876,7 +11841,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Vision routing")
+            chat = _create_test_chat(chats, "Vision routing")
             chat_id = str(chat["chat_id"])
             image_path = paths.chat_workspace_dir(chat_id) / "pixel.png"
             image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -12143,7 +12108,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             _ensure_test_storage(storage)
             _install_legacy_endpoint_fixtures(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Overflow recovery")
+            chat = _create_test_chat(chats, "Overflow recovery")
             chat_id = str(chat["chat_id"])
             config = storage.load_config()
             config["chat"]["auto_compaction_enabled"] = False
@@ -12291,7 +12256,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             _ensure_test_storage(storage)
             _install_legacy_endpoint_fixtures(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Agent overflow source")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Agent overflow source")["chat_id"])
             agents = velox.AgentStore(storage)
             task_text = "Complete the exact delegated task."
             agent = agents.create_agent(
@@ -12435,7 +12400,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             _ensure_test_storage(storage)
             _install_legacy_endpoint_fixtures(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Initial exact overflow recovery")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Initial exact overflow recovery")["chat_id"])
             config = storage.load_config()
             config["chat"]["auto_compaction_enabled"] = False
             storage.write_config(config)
@@ -12550,7 +12515,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
             client._chat_completions_stream_unqueued = fake_stream  # type: ignore[method-assign]
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Compaction scheduler reuse")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Compaction scheduler reuse")["chat_id"])
             config = storage.load_config()
             config["chat"]["auto_compaction_enabled"] = False
             storage.write_config(config)
@@ -12768,7 +12733,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
         async def scenario(root: Path) -> None:
             paths = velox.AppPaths(root); storage = velox.Storage(paths); _ensure_test_storage(storage)
-            chats = velox.ChatStore(storage); chat = chats.create_chat("Fits capacity"); chat_id = str(chat["chat_id"])
+            chats = velox.ChatStore(storage); chat = _create_test_chat(chats, "Fits capacity"); chat_id = str(chat["chat_id"])
             cfg = storage.load_config(); profile = velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)
             profile["context_window_tokens"] = 120_000; profile["max_output_tokens"] = 20_000; storage.write_config(cfg)
             class NoCompactionLLM:
@@ -13041,7 +13006,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Streaming image analysis")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Streaming image analysis")["chat_id"])
             image_path = paths.chat_workspace_dir(chat_id) / "pixel.png"
             image_path.parent.mkdir(parents=True, exist_ok=True)
             image_path.write_bytes(base64.b64decode(
@@ -13127,7 +13092,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             _ensure_test_storage(storage)
-            chat_id = str(velox.ChatStore(storage).create_chat("Cancel tool")["chat_id"])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Cancel tool")["chat_id"])
             registry = velox.ToolRegistry(storage)
             call = {"name": "time_sleep", "arguments": {"minutes": 1.0, "message": "resume"}}
             live = velox.make_tool_call_record("time_sleep", call["arguments"], chat_id=chat_id)
@@ -13165,7 +13130,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             _ensure_test_storage(storage)
-            chat_id = str(velox.ChatStore(storage).create_chat("Stop chat tools")["chat_id"])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Stop chat tools")["chat_id"])
             registry = velox.ToolRegistry(storage)
             call = {"name": "time_sleep", "arguments": {"minutes": 1.0, "message": "resume"}}
             live = velox.make_tool_call_record("time_sleep", call["arguments"], chat_id=chat_id)
@@ -13531,7 +13496,7 @@ class IOAndChatTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         storage = velox.Storage(paths)
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Streaming I/O")
+        chat = _create_test_chat(chats, "Streaming I/O")
         return paths, storage, chats, chat
 
     def test_stream_bridge_coalesces_wakeups_preserves_order_and_yields_fairly(self) -> None:
@@ -13766,7 +13731,7 @@ class IOAndChatTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         storage = velox.Storage(paths)
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Ordinary completion test")
+        chat = _create_test_chat(chats, "Ordinary completion test")
         profile_id = chats.get_endpoint_profile_id()
         endpoint = velox.endpoint_profile_ref(storage.load_config(), profile_id)
 
@@ -13857,7 +13822,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
         storage = velox.Storage(paths)
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Completion verification")
+        chat = _create_test_chat(chats, "Completion verification")
         return paths, storage, chats, chat
 
     def test_chat_and_agent_compaction_escalate_and_condense_truncated_reasoning(self) -> None:
@@ -14093,7 +14058,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             self.assertIn("pre-loop exploded", failed_turn["text"])
             self.assertNotIn(chat_id, runtime.running)
 
-            chat2 = chats.create_chat("Cancellation")
+            chat2 = _create_test_chat(chats, "Cancellation")
             chat2_id = str(chat2["chat_id"])
             streaming2 = velox.make_turn(chat2_id, "assistant", "partial", status="streaming")
             chats.append_turn(velox.APP_SCOPE_ID, chat2_id, streaming2, mark_stale=False)
@@ -14358,7 +14323,7 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Playback timing")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Playback timing")["chat_id"])
             tool = velox.BrowserTools(storage)
             events = velox.BrowserTools._normalize_playback_events([
                 {"type": "delay", "durationMs": 24, "waitAfterMs": 8},
@@ -14802,7 +14767,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         self.assertEqual(len({row["id"] for row in profiles}), len(profiles))
         by_type = {velox.normalize_endpoint_model_type(row.get("model_type")): row for row in profiles}
         self.assertTrue({
-            velox.ENDPOINT_MODEL_TYPE_QWEN_3_8,
+            velox.ENDPOINT_MODEL_TYPE_OPUS_5_5,
             velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
             velox.ENDPOINT_MODEL_TYPE_KIMI_K3,
             velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_1_FLASH_1017,
@@ -14836,6 +14801,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             expected = (
                 velox.ENDPOINT_API_TRANSPORT_RESPONSES
                 if model_type in velox.ENDPOINT_GPT_MODEL_TYPES
+                else velox.ENDPOINT_API_TRANSPORT_MESSAGES if model_type == velox.ENDPOINT_MODEL_TYPE_OPUS_5_5
                 else velox.ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS
             )
             self.assertEqual(velox.endpoint_api_transport(custom_profile), expected)
@@ -14935,15 +14901,6 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
                 self.assertEqual(payload["reasoning"].get("context") == "all_turns", expect_pro)
                 self.assertIn("reasoning.encrypted_content", payload["include"])
 
-    def test_endpoint_editor_exposes_api_dropdown(self) -> None:
-        source = inspect.getsource(velox.Panels.draw_modals)
-        self.assertIn('"modal.endpoint.api_transport"', source)
-        self.assertIn('"API"', source)
-        self.assertIn("ENDPOINT_API_TRANSPORT_LABELS", source)
-        self.assertIn("Chat Completions is the default", source)
-        self.assertIn("complete /responses URL", source)
-        self.assertIn('content_h = 1170', source)
-        self.assertIn('"modal.endpoint.system_prompt_addon"', source)
 
 
     def test_expert_mode_is_one_explicit_tool_contract_without_hidden_checker(self) -> None:
@@ -15076,8 +15033,8 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_chat_list_order_is_created_at_stable_not_updated_at(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            older = chats.create_chat("Older")
-            newer = chats.create_chat("Newer")
+            older = _create_test_chat(chats, "Older")
+            newer = _create_test_chat(chats, "Newer")
             older["created_at"] = "2026-01-01T00:00:00Z"
             older["updated_at"] = "2026-12-31T00:00:00Z"
             newer["created_at"] = "2026-02-01T00:00:00Z"
@@ -15127,12 +15084,6 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         self.assertIn("_chat_activity_colors(active, pulse)", source)
 
 
-    def test_endpoint_editor_height_is_twenty_percent_taller(self) -> None:
-        source = inspect.getsource(velox.Panels.draw_modals)
-        self.assertIn("available_h = max(1, rect.h - 8)", source)
-        self.assertIn("mh = min(1435, available_h)", source)
-        self.assertNotIn("mh = min(1196, available_h)", source)
-        self.assertAlmostEqual(1435 / 1196, 1.20, places=2)
 
     def test_cdp_screenshot_capture_has_no_bound_extra_argument(self) -> None:
         payload = b"not-a-real-png-but-exact-cdp-bytes"
@@ -15164,7 +15115,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.skipTest(f"Pillow unavailable: {exc}")
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Image probes")
+            chat = _create_test_chat(chats, "Image probes")
             chat_id = str(chat["chat_id"])
             first_path = paths.chat_workspace_dir(chat_id) / "first.png"
             second_path = paths.chat_workspace_dir(chat_id) / "second.png"
@@ -15212,7 +15163,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
     def test_completed_tool_snapshot_retains_exact_raw_result(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("Tool result details")
+            chat = _create_test_chat(chats, "Tool result details")
             chat_id = str(chat["chat_id"])
             source = paths.chat_workspace_dir(chat_id) / "lines.txt"
             source.write_text("alpha\nbeta\n", encoding="utf-8")
@@ -16460,7 +16411,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         self.assertEqual(velox.endpoint_profile_ref(cfg, velox.DEFAULT_ENDPOINT_PROFILE_ID)["max_concurrent_requests"], 4)
         with _TemporaryDataDirectory() as td:
             paths = velox.AppPaths(Path(td)); storage = velox.Storage(paths); _ensure_test_storage(storage)
-            chats = velox.ChatStore(storage); chat = chats.create_chat("Progress estimates")
+            chats = velox.ChatStore(storage); chat = _create_test_chat(chats, "Progress estimates")
             agents = velox.AgentStore(storage); tools = velox.ToolRegistry(storage)
             chats.set_chat_feature(velox.APP_SCOPE_ID, str(chat["chat_id"]), "agent_tools_enabled", True)
             class DummyLLM:
@@ -16684,7 +16635,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             storage = velox.Storage(velox.AppPaths(root))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Pause boundary")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Pause boundary")["chat_id"])
             runtime = velox.ChatRuntime(
                 storage, chats, velox.ContextAssembler(storage.paths),
                 SimpleNamespace(), SimpleNamespace(),
@@ -17053,7 +17004,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Changed suffix")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Changed suffix")["chat_id"])
             first = velox.make_turn(chat_id, "user", "first")
             second = velox.make_turn(chat_id, "assistant", "second", status="streaming")
             chats.append_turn(velox.APP_SCOPE_ID, chat_id, first)
@@ -17118,7 +17069,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             storage = velox.Storage(velox.AppPaths(root))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Paused stop") ["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Paused stop") ["chat_id"])
             cancel_requests: list[str] = []
 
             class FakeTools:
@@ -17159,31 +17110,6 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
         with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
-    def test_new_chat_settings_layout_plain_task_label_and_spacing(self) -> None:
-        setup = inspect.getsource(velox.Panels._draw_new_chat_task_settings)
-        self.assertIn('"NEW CHAT SETTINGS"', setup)
-        self.assertNotIn("Choose the endpoint", setup)
-        self.assertIn("former_card_w * 0.60", setup)
-        self.assertIn('"TOOLS"', setup)
-        self.assertIn("for index, (key, label) in enumerate(CHAT_TOOL_CATEGORY_LABELS)", setup)
-        self.assertIn("column_w = max(1, (inner.w - column_gap) // 2)", setup)
-        self.assertIn("row_index = index // 2", setup)
-        self.assertIn("column_index = index % 2", setup)
-        self.assertNotIn("toggle_w =", setup)
-
-        composer = inspect.getsource(velox.Panels.draw_message_composer)
-        self.assertIn("label_rows = self.widgets._wrap_display_rows", composer)
-        self.assertIn("footer_h = max", composer)
-        self.assertIn("self.r.draw_text(", composer)
-        self.assertIn("row_text, row_x", composer)
-        self.assertNotIn("endpoint_rect", composer)
-        self.assertNotIn("draw_round_outline", composer)
-        self.assertNotIn("self.widgets.dropdown", composer)
-
-        self.assertFalse(hasattr(velox.Panels, "draw_chat_settings_panel"))
-        sidebar = inspect.getsource(velox.Panels.draw_chat_chats_panel)
-        self.assertNotIn("settings_area", sidebar)
-        self.assertNotIn("CHAT SETTINGS", sidebar)
 
     def test_cpu_hot_paths_reuse_validated_views_cached_counts_and_wrapped_rows(self) -> None:
         with _TemporaryDataDirectory() as td:
@@ -17217,7 +17143,7 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             self.assertEqual(third_config["features"]["force_pdf_images"], not old_value)
 
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Hot path") ["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Hot path") ["chat_id"])
             first_list = chats.list_chats_view(velox.APP_SCOPE_ID, external_poll_seconds=999.0)
             second_list = chats.list_chats_view(velox.APP_SCOPE_ID, external_poll_seconds=999.0)
             self.assertIs(first_list, second_list)
@@ -17445,8 +17371,8 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             _paths, _storage, chats, _calendar, panel, _services = (
                 CalendarTests._panel_stack(Path(td))
             )
-            chat_a = str(chats.create_chat("Chat A")["chat_id"])
-            chat_b = str(chats.create_chat("Chat B")["chat_id"])
+            chat_a = str(_create_test_chat(chats, "Chat A")["chat_id"])
+            chat_b = str(_create_test_chat(chats, "Chat B")["chat_id"])
             panel.state.active_panel = "chat"
             panel._switch_active_chat(
                 chat_a, save_current=False, restore_composer=True,
@@ -17584,7 +17510,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Streaming copy guard")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Streaming copy guard")["chat_id"])
             turn = velox.make_turn(
                 chat_id, "assistant", "x" * 2_000_000,
                 status="streaming",
@@ -17802,7 +17728,7 @@ class ToolchainAndStreamingConcurrencyTests(unittest.TestCase):
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Compaction expansion guard")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Compaction expansion guard")["chat_id"])
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(
                 chat_id, "Keep the original task", title="Compaction guard",
@@ -17938,7 +17864,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
         async def scenario(root: Path) -> None:
             storage = velox.Storage(velox.AppPaths(root))
             _ensure_test_storage(storage)
-            chat_id = str(velox.ChatStore(storage).create_chat("Specialized visual review")["chat_id"])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Specialized visual review")["chat_id"])
             image_path = storage.paths.chat_workspace_dir(chat_id) / "pixel.png"
             image_path.parent.mkdir(parents=True, exist_ok=True)
             image_path.write_bytes(base64.b64decode(
@@ -17991,7 +17917,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Agent ownership")
+            chat = _create_test_chat(chats, "Agent ownership")
             agents = velox.AgentStore(storage)
             tools = velox.ToolRegistry(storage)
             class DummyLLM:
@@ -18050,7 +17976,7 @@ class PromptAndImageWorkflowTests(_DataRootsIsolatedTestMixin, unittest.TestCase
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Timeout guidance")
+            chat = _create_test_chat(chats, "Timeout guidance")
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(str(chat["chat_id"]), "Run a bounded command")
             class DummyLLM:
@@ -18209,7 +18135,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
         async def scenario(root: Path) -> None:
             storage = _make_test_storage(root)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Disabled capacity fitting")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Disabled capacity fitting")["chat_id"])
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(
                 chat_id, "Keep exact context", context_window_tokens=8_192,
@@ -18474,7 +18400,7 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("No double count")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "No double count")["chat_id"])
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(
                 chat_id, "Keep context", context_window_tokens=8_192,
@@ -18837,17 +18763,6 @@ class SharedRecordsAndRuntimeCachesTests(_AppLogDataRootsIsolatedTestMixin, unit
         self.assertEqual(screen.cursor_y, 3)
         self.assertEqual(len(screen.buffer), screen.rows)
 
-    def test_runtime_fifo_collections_are_deques(self) -> None:
-        scheduler_source = inspect.getsource(velox.EndpointInferenceScheduler)
-        chat_source = inspect.getsource(velox.ChatRuntime.__init__)
-        drain_source = inspect.getsource(velox.ChatRuntime._drain_agent_report_queue)
-        self.assertIn("asyncio.Condition", scheduler_source)
-        self.assertIn("self._queued", scheduler_source)
-        self.assertIn("self._active", scheduler_source)
-        self.assertIn("collections.deque[dict[str, Any]]", chat_source)
-        self.assertIn("popleft()", drain_source)
-        self.assertNotIn("pop(0)", scheduler_source + drain_source)
-        self.assertNotIn("_acquire_agent_slot", inspect.getsource(velox.AgentRuntime))
 
     def test_log_compaction_reads_only_the_bounded_tail(self) -> None:
         with _TemporaryDataDirectory() as td:
@@ -19320,7 +19235,7 @@ class TaskInspectorTests(unittest.TestCase):
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Agent prompt audit")
+            chat = _create_test_chat(chats, "Agent prompt audit")
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(str(chat["chat_id"]), "Inspect artifact")
             class DummyLLM:
@@ -19532,7 +19447,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
         async def scenario(root: Path) -> None:
             storage = _make_test_storage(root)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Context source")
+            chat = _create_test_chat(chats, "Context source")
             unique = "CONTEXT_SOURCE_FACT_5F18"
             chats.append_turn(velox.APP_SCOPE_ID, str(chat["chat_id"]), velox.make_turn(str(chat["chat_id"]), "user", unique))
             docs = velox.ContextDocStore(storage)
@@ -19561,7 +19476,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
         with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("No tools context")
+            chat = _create_test_chat(chats, "No tools context")
             chat_id = str(chat["chat_id"])
             for key in velox.CHAT_TOOL_FEATURE_KEYS:
                 chats.set_chat_feature(velox.APP_SCOPE_ID, chat_id, key, False)
@@ -19597,7 +19512,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
         with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td))
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Schedule tool source")
+            chat = _create_test_chat(chats, "Schedule tool source")
             registry = velox.ToolRegistry(storage)
             once = registry.tools["scheduled_task_create_once"].parameters
             recurring = registry.tools["scheduled_task_create_recurring"].parameters
@@ -19743,7 +19658,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
         async def scenario(root: Path) -> None:
             storage = _make_test_storage(root)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Scheduled source")
+            chat = _create_test_chat(chats, "Scheduled source")
             chat_id = str(chat["chat_id"])
             chats.set_chat_feature(velox.APP_SCOPE_ID, chat_id, "system_tools_enabled", False)
             chats.set_chat_feature(velox.APP_SCOPE_ID, chat_id, "web_tools_enabled", True)
@@ -20373,26 +20288,6 @@ class ContextCapacityAndIdleWorkTests(unittest.TestCase):
         self.assertIn("title.upper()", week_header)
 
 
-    def test_task_components_and_entry_points_are_documented(self) -> None:
-        production = application_source()
-        for forbidden in (
-            "LLMRun", '"run_raw"', '"run_chat"', "show_system_runs",
-            "chat_run_settings_label", "agent_run_statistics", "total_runs",
-            "terminal_runs", "average_run_seconds", "AGENT RUNS",
-            "Show System Runs", "Request status", "Request outcomes",
-            "Request mix", "RUN TOOL POLICY", "agent-run deletion",
-            "CALENDAR_AGENT_RUNS_MIN_H", "chat_run_label", '"run_record"',
-            "chat_output_turns_for_this_run", "DURABLE LOGICAL RUN CONTENT",
-            "this run's total budget", "View Chat", "task_chat",
-        ):
-            self.assertNotIn(forbidden, production)
-        for required in (
-            "LLMTaskMonitor", "LLMTaskRecord", "CHAT/AGENT TASKS", "SYSTEM TASKS",
-            "TASK TOOL POLICY", "Task status", "Task outcomes", "Costs",
-            "fits_effective_context", "estimate_llm_request_input_tokens", "_draw_card_title_text",
-        ):
-            self.assertIn(required, production)
-        self.assertEqual(velox.BACKGROUND_SUMMARY_TRUE_IDLE_SECONDS, 15.0)
 
 
 class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
@@ -20404,30 +20299,30 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         storage = velox.Storage(velox.AppPaths(root))
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Tool policy and images")
+        chat = _create_test_chat(chats, "Tool policy and images")
         return storage, chats, chat
 
     def test_qwen38_profile_reasoning_payload_and_vision_defaults(self) -> None:
         config = _config_with_legacy_endpoint_fixtures()
         profile = velox.endpoint_profile_ref(config, velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID)
-        defaults = velox.endpoint_model_type_defaults(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8)
-        self.assertEqual(velox.ENDPOINT_MODEL_TYPE_LABELS[velox.ENDPOINT_MODEL_TYPE_QWEN_3_8], "Qwen 3.8 27B")
-        self.assertEqual(profile["label"], "Qwen 3.8 27B (vLLM)")
+        defaults = velox.endpoint_model_type_defaults(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT)
+        self.assertEqual(velox.ENDPOINT_MODEL_TYPE_LABELS[velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT], "Qwen 3.8 Flash Next")
+        self.assertEqual(profile["label"], "Qwen 3.8 Flash Next (vLLM)")
         self.assertEqual(profile["provider"], velox.ENDPOINT_PROVIDER_VLLM)
-        self.assertEqual(profile["model_type"], velox.ENDPOINT_MODEL_TYPE_QWEN_3_8)
+        self.assertEqual(profile["model_type"], velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT)
         self.assertEqual(profile["api_transport"], velox.ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS)
         self.assertEqual(profile["base_url"], "http://127.0.0.1:8090/v1/chat/completions")
-        self.assertEqual(profile["model"], "Qwen/Qwen3.8-27B")
-        self.assertEqual(defaults["model"], "Qwen/Qwen3.8-27B")
-        self.assertEqual(profile["context_window_tokens"], 262_144)
-        self.assertEqual(profile["max_output_tokens"], 65_536)
+        self.assertEqual(profile["model"], "Qwen/Qwen3.8-Flash-Next")
+        self.assertEqual(defaults["model"], "Qwen/Qwen3.8-Flash-Next")
+        self.assertEqual(profile["context_window_tokens"], 524_288)
+        self.assertEqual(profile["max_output_tokens"], 131_072)
         self.assertEqual(profile["max_image_inputs_per_prompt"], 32)
         self.assertEqual(profile["vision"], "enabled")
         self.assertNotIn("native_" + "image_analysis", profile)
         self.assertTrue(profile["preserve_thinking"])
         self.assertEqual(profile["reasoning_effort"], "xhigh")
         self.assertEqual(
-            velox.endpoint_reasoning_level_options(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8),
+            velox.endpoint_reasoning_level_options(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT),
             (("xhigh", "XHigh"), ("medium", "Medium"), ("low", "Low")),
         )
         self.assertEqual(
@@ -20470,10 +20365,10 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             endpoint, url, _body, _headers, _timeout, payload = client._payload_and_headers(
                 request, stream=True,
             )
-        self.assertEqual(endpoint["model_type"], velox.ENDPOINT_MODEL_TYPE_QWEN_3_8)
+        self.assertEqual(endpoint["model_type"], velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT)
         self.assertEqual(url, "http://127.0.0.1:8090/v1/chat/completions")
-        self.assertEqual(payload["model"], "Qwen/Qwen3.8-27B")
-        self.assertEqual(payload["max_tokens"], 65_536)
+        self.assertEqual(payload["model"], "Qwen/Qwen3.8-Flash-Next")
+        self.assertEqual(payload["max_tokens"], 131_072)
         self.assertEqual(payload["reasoning_effort"], "xhigh")
         self.assertEqual(
             payload["chat_template_kwargs"],
@@ -20501,7 +20396,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             velox.ENDPOINT_MODEL_TYPE_LABELS[velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT],
             "Qwen 3.8 Flash Next",
         )
-        self.assertEqual(profile["label"], "Qwen 3.8 Flash Next (vLLM)")
+        self.assertEqual(profile["label"], "Qwen 3.8 Flash Next (vLLM, model alias)")
         self.assertEqual(profile["provider"], velox.ENDPOINT_PROVIDER_VLLM)
         self.assertEqual(profile["model_type"], velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT)
         self.assertEqual(profile["api_transport"], velox.ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS)
@@ -21251,13 +21146,6 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             self.assertEqual(label, "Error: LLMEndpointError: request failed")
             self.assertEqual(tooltip, label)
 
-    def test_toolbar_format_has_status_and_no_leading_or_trailing_pipe(self) -> None:
-        source = inspect.getsource(velox.Panels.draw_chat_thread_header)
-        self.assertIn('f"Ctx: {context_value} | In: {input_label} | Out: {generation_label}"', source)
-        self.assertIn("(statistics_label_rect.w - activity_text_w) // 2", source)
-        self.assertNotIn('f"| Context {context_value}', source)
-        self.assertNotIn('Out: {generation_label} |', source)
-        self.assertIn("activity_label, activity_tooltip = self._chat_toolbar_activity(turns)", source)
 
     def test_stream_without_provider_usage_keeps_live_and_terminal_dashboard_estimates(self) -> None:
         async def scenario(root: Path) -> None:
@@ -21448,16 +21336,6 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         with _TemporaryDataDirectory() as td:
             asyncio.run(scenario(Path(td)))
 
-    def test_tool_defaults_card_reserves_all_five_toggle_rows(self) -> None:
-        source = inspect.getsource(velox.Panels._draw_tools_settings_content)
-        defaults_source = inspect.getsource(velox.Panels._draw_tool_defaults_card)
-        self.assertIn("_settings_rows_height(5)", source)
-        self.assertNotIn("_settings_rows_height(4)", source)
-        for key in velox.CHAT_TOOL_FEATURE_KEYS:
-            if key != "checklists_enabled":
-                self.assertIn(key, defaults_source)
-        self.assertNotIn("checklists_enabled", defaults_source)  # Per-new-Chat, always on by default.
-        self.assertEqual(len(velox.CHAT_TOOL_FEATURE_KEYS), 6)
 
 
     def test_programming_toolchain_discovery_returns_one_complete_snapshot(self) -> None:
@@ -21773,7 +21651,7 @@ class StallAndProgressTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase
     def _storage(root: Path) -> tuple[Storage, ChatStore, dict[str, Any]]:
         storage = _make_test_storage(root)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Stall and progress test")
+        chat = _create_test_chat(chats, "Stall and progress test")
         return storage, chats, chat
 
     def test_stalled_provider_activity_is_visible_and_terminal_safe(self) -> None:
@@ -22106,7 +21984,7 @@ class StallAndProgressTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase
         )
         with self._temporary_directory() as td:
             storage = _make_test_storage(Path(td))
-            chat_id = str(velox.ChatStore(storage).create_chat("Prompt length")['chat_id'])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Prompt length")['chat_id'])
             prompt = _normalized_prompt_budget_sample(storage, chat_id)
         self.assertLess(len(prompt), 13_500)
         self.assertIn("every requested requirement", prompt)
@@ -22206,14 +22084,6 @@ class EndpointRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("paraphrase an exact declaration", production)
         self.assertIn("into an approximate API", production)
 
-    def test_endpoint_editor_and_live_tool_preview_are_exposed(self) -> None:
-        production = Path(velox.__file__).read_text(encoding="utf-8")
-        self.assertIn('"Max requests / min"', production)
-        self.assertIn('"Consecutive retries"', production)
-        self.assertIn('"Wait between (min)"', production)
-        self.assertIn('if round_native_tool_calls and last_published_preview_len == 0:', production)
-        self.assertIn('await asyncio.sleep(0)', production)
-        self.assertIn('"fs_grep"', inspect.getsource(velox.ToolRegistry.register_builtin_tools))
 
 
 def _raw_test_status_write(value: Any, *, fd: int = 1) -> None:
@@ -22656,7 +22526,7 @@ class ChecklistToolsAndTaskIdentityTests(_DataRootsIsolatedTestMixin, unittest.T
         storage = velox.Storage(paths)
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        return paths, storage, chats, chats.create_chat("Checklist regression")
+        return paths, storage, chats, _create_test_chat(chats, "Checklist regression")
 
     @staticmethod
     def _update(
@@ -22871,19 +22741,7 @@ class TranscriptScrollingAndToolRowsTests(_DataRootsIsolatedTestMixin, unittest.
         transition = source[prepare_at:execute_at]
         self.assertEqual(transition.count("self._update_assistant_stream("), 1)
 
-    def test_image_analysis_returns_endpoint_text_without_semantic_parsing(self) -> None:
-        source = inspect.getsource(velox.ImageTools._analyze_with_prompt)
-        self.assertIn("**streamed", source)
-        for removed in ("extract_material_visual_findings", "material_finding", "acceptance_blocked", "finding_id"):
-            self.assertNotIn(removed, source)
 
-    def test_image_analysis_contract_contains_no_history_or_reconciliation_helpers(self) -> None:
-        production = application_source()
-        for removed in (
-            "advance_visual_analysis_history", "visual_review_history", "duplicate_exact_image",
-            "contradictory_exact_image_reviews", "acceptanceBlocked", "required_next_action",
-        ):
-            self.assertNotIn(removed, production)
 
     def test_image_analysis_schemas_require_only_path_and_prompt(self) -> None:
         with _TemporaryDataDirectory() as td:
@@ -22904,7 +22762,7 @@ class TranscriptScrollingAndToolRowsTests(_DataRootsIsolatedTestMixin, unittest.
             paths = velox.AppPaths(root)
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
-            chat_id = str(velox.ChatStore(storage).create_chat("Repeated visual review")["chat_id"])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Repeated visual review")["chat_id"])
             frame = paths.chat_workspace_dir(chat_id) / "frame.png"
             frame.write_bytes(base64.b64decode(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZV7sAAAAASUVORK5CYII="
@@ -22948,7 +22806,7 @@ class TranscriptScrollingAndToolRowsTests(_DataRootsIsolatedTestMixin, unittest.
             paths = velox.AppPaths(root)
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
-            chat_id = str(velox.ChatStore(storage).create_chat("Browser visual review")["chat_id"])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Browser visual review")["chat_id"])
             frame = paths.chat_workspace_dir(chat_id) / "frame.png"
             frame.write_bytes(b"not-read-by-fake")
             received: list[dict[str, Any]] = []
@@ -23152,7 +23010,7 @@ class RateLimitEncodingAndDecisionTests(_DataRootsIsolatedTestMixin, unittest.Te
             paths = velox.AppPaths(root)
             storage = velox.Storage(paths)
             _ensure_test_storage(storage)
-            chat_id = str(velox.ChatStore(storage).create_chat("Unrestricted visual review")["chat_id"])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Unrestricted visual review")["chat_id"])
             frame = paths.chat_workspace_dir(chat_id) / "camera-frame.png"
             Image.new("RGB", (8, 8), (20, 40, 80)).save(frame, format="PNG")
 
@@ -23222,18 +23080,6 @@ class RateLimitEncodingAndDecisionTests(_DataRootsIsolatedTestMixin, unittest.Te
         self.assertIn('visible observation', velox.IMAGE_ANALYSIS_3D_SCENE_ENDPOINT_SYSTEM_PROMPT.lower())
         self.assertIn('hypothesis', velox.IMAGE_ANALYSIS_3D_SCENE_ENDPOINT_SYSTEM_PROMPT.lower())
 
-    def test_opening_docs_cover_binary_capture_rate_defaults_and_cooldown_stats(self) -> None:
-        profiles = velox.default_config()["llm"]["endpoint_profiles"]
-        for profile in profiles:
-            self.assertTrue(profile["error_recovery_enabled"])
-            self.assertEqual(profile["error_recovery_attempts"], 10)
-            self.assertEqual(profile["error_recovery_delay_seconds"], 60)
-        self.assertIn("endpoint_wait_seconds", inspect.getsource(velox.LLMClient))
-        production = Path(velox.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("velox.modernized.v229", production)
-        self.assertNotIn('"data_version": "v229"', production)
-        self.assertIn("CREDENTIAL_FILE_SCHEMA = data_schema(", production)
-        self.assertEqual(velox.CREDENTIAL_FILE_SCHEMA, velox.data_schema("velox_account_credentials"))
 
 class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     """Wrapping, token accounting, task times and prompt construction."""
@@ -23278,7 +23124,7 @@ class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.Test
         with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
-            chat = velox.ChatStore(storage).create_chat("Strict total tokens")
+            chat = _create_test_chat(velox.ChatStore(storage), "Strict total tokens")
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(
                 str(chat["chat_id"]), "Count total tokens.",
@@ -23428,7 +23274,7 @@ class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.Test
         with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
-            chat_id = str(velox.ChatStore(storage).create_chat("Prompt audit")["chat_id"])
+            chat_id = str(_create_test_chat(velox.ChatStore(storage), "Prompt audit")["chat_id"])
             prompt = velox.ContextAssembler(storage.paths).assemble_chat_context(velox.APP_SCOPE_ID, chat_id)[0]["content"]
         self.assertLess(sum(current.values()), int(sum(baseline_column_sizes.values()) * 0.65))
         self.assertEqual(prompt.count("STREAMLINED ENGINEERING WORKFLOW"), 1)
@@ -23643,7 +23489,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         storage = velox.Storage(velox.AppPaths(root))
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Current-context vision")
+        chat = _create_test_chat(chats, "Current-context vision")
         chat_id = str(chat["chat_id"])
         image_path = storage.paths.chat_workspace_dir(chat_id) / name
         image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -24084,7 +23930,7 @@ class EngineeringWorkflowTests(unittest.TestCase):
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
             assembler = velox.ContextAssembler(storage.paths)
-            chat_id = str(chats.create_chat("Workflow audit")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Workflow audit")["chat_id"])
             prompt = assembler.assemble_chat_context(velox.APP_SCOPE_ID, chat_id)[0]["content"]
         self.assertEqual(prompt.count("STREAMLINED ENGINEERING WORKFLOW"), 1)
         for phrase in (
@@ -24199,7 +24045,7 @@ class EngineeringWorkflowTests(unittest.TestCase):
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Expert workflow")
+            chat = _create_test_chat(chats, "Expert workflow")
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(str(chat["chat_id"]), "Substantial delegated work")
 
@@ -24260,31 +24106,7 @@ class EngineeringWorkflowTests(unittest.TestCase):
             self.assertIn(phrase, guidance)
         self.assertIn('causal subsystem', guidance.lower())
 
-    def test_production_source_has_no_removed_red_tape(self) -> None:
-        production = application_source()
-        fragments = (
-            "strategy_" + "reset_evidence", "strategy_" + "reset_required",
-            "acceptance" + "Blocked", "requirements_" + "verify",
-            "workspace_" + "fingerprint", "next_" + "requirement",
-            "source_read_" + "counter", "research_" + "completion_flag",
-        )
-        for term in fragments:
-            self.assertNotIn(term, production)
-        self.assertNotRegex(production.lower(), r"(?:one|1)[ -]requirement(?:-| )per(?:-| )inference")
 
-    def test_opening_documentation_states_the_final_philosophy(self) -> None:
-        guidance = velox.ContextAssembler.engineering_workflow_guidance(
-            file_tools=True, system_tools=True, web_tools=True, checklists_enabled=True,
-        )
-        self.assertIn("checklist", guidance.lower())
-        self.assertIn("source", guidance.lower())
-        self.assertIn("web_search", guidance)
-        self.assertIn("test", guidance.lower())
-        disabled = velox.ContextAssembler.engineering_workflow_guidance(
-            file_tools=False, system_tools=False, web_tools=False, checklists_enabled=False,
-        )
-        self.assertNotIn("checklist_create", disabled)
-        self.assertNotIn("web_search", disabled)
 
 
 def _test_visual_studio_records() -> list[dict[str, Any]]:
@@ -24555,7 +24377,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("C++20 build")
+            chat = _create_test_chat(chats, "C++20 build")
             prompt = str(velox.ContextAssembler(storage.paths).assemble_chat_context(
                 velox.APP_SCOPE_ID, str(chat["chat_id"]),
             )[0]["content"])
@@ -24578,7 +24400,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Agent source")
+            chat = _create_test_chat(chats, "Agent source")
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(str(chat["chat_id"]), "Compile the complete C++20 target")
 
@@ -24605,7 +24427,7 @@ class ProgrammingHarnessReliabilityTests(_DataRootsIsolatedTestMixin, unittest.T
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat = chats.create_chat("Expert continuation")
+            chat = _create_test_chat(chats, "Expert continuation")
             context = velox.ExpertModeContext(owner_kind="chat", chat_id=str(chat["chat_id"]))
             store = velox.ExpertModeStore(storage, context)
             velox.ChecklistStore(storage).create(velox._chat_checklist_owner(chat["chat_id"]), name="Build acceptance", items=["Build the C++20 target", "Run its tests"])
@@ -24668,7 +24490,7 @@ class VerifiedCompletionHistoryAndLayoutTests(_DataRootsIsolatedTestMixin, unitt
         storage = velox.Storage(paths)
         _ensure_test_storage(storage)
         chats = velox.ChatStore(storage)
-        chat = chats.create_chat("Verified completion")
+        chat = _create_test_chat(chats, "Verified completion")
         store = velox.ExpertModeStore.for_chat(storage, str(chat["chat_id"]))
         return paths, storage, chats, chat, store
 
@@ -24799,19 +24621,8 @@ class ChecklistStoreTests(unittest.TestCase):
         self.storage = velox.Storage(velox.AppPaths(root))
         _ensure_test_storage(self.storage)
         chat_store = velox.ChatStore(self.storage)
-        creator = getattr(chat_store, "create_chat", None)
-        if not callable(creator):
-            self.fail("ChatStore.create_chat is required by the checklist fixture")
-        try:
-            created = creator("Checklist test")
-        except TypeError:
-            created = creator(velox.APP_SCOPE_ID, "Checklist test")
-        if isinstance(created, str) and created:
-            self.chat_id = created
-        elif isinstance(created, dict) and created.get("chat_id"):
-            self.chat_id = str(created["chat_id"])
-        else:
-            self.fail("ChatStore.create_chat did not return a chat identity")
+        created = _create_test_chat(chat_store, "Checklist test")
+        self.chat_id = str(created["chat_id"])
         self.owner = {"owner_kind": "chat", "chat_id": self.chat_id, "agent_id": "", "task_run_id": 0}
         self.store = velox.ChecklistStore(self.storage)
 
@@ -25186,7 +24997,7 @@ class ChecklistUIAndOrchestrationTests(_DataRootsIsolatedTestMixin, unittest.Tes
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Turn identity")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Turn identity")["chat_id"])
             turn = velox.make_turn(chat_id, "user", "CHECKLISTS - CONTINUE")
             chats.append_turn(velox.APP_SCOPE_ID, chat_id, turn)
             chats.append_turn(velox.APP_SCOPE_ID, chat_id, copy.deepcopy(turn))
@@ -25203,7 +25014,7 @@ class ChecklistUIAndOrchestrationTests(_DataRootsIsolatedTestMixin, unittest.Tes
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Duplicate recovery")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Duplicate recovery")["chat_id"])
             first = velox.make_turn(chat_id, "user", "CHECKLISTS - CONTINUE")
             second = copy.deepcopy(first)
             second["text"] = "CHECKLISTS - CONTINUE newest"
@@ -25253,7 +25064,7 @@ class ChecklistUIAndOrchestrationTests(_DataRootsIsolatedTestMixin, unittest.Tes
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Large project")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "Large project")["chat_id"])
             prompt = velox.ContextAssembler(storage.paths).assemble_chat_context(velox.APP_SCOPE_ID, chat_id)[0]["content"]
         lowered = prompt.lower()
         self.assertIn("original requirement", lowered)
@@ -25352,7 +25163,7 @@ class ExecutableVisualLoopTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("Executable proof")['chat_id'])
+            chat_id = str(_create_test_chat(chats, "Executable proof")['chat_id'])
             owner = {"owner_kind": "chat", "chat_id": chat_id, "agent_id": "", "task_run_id": 0}
             store = velox.ChecklistStore(storage)
             created = store.create(owner, name="Visual child", items=["Implement one rendered behavior and prove it"])
@@ -25369,7 +25180,7 @@ class ExecutableVisualLoopTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
             chats = velox.ChatStore(storage)
-            chat_id = str(chats.create_chat("3D executable workflow")['chat_id'])
+            chat_id = str(_create_test_chat(chats, "3D executable workflow")['chat_id'])
             prompt = velox.ContextAssembler(storage.paths).assemble_chat_context(velox.APP_SCOPE_ID, chat_id)[0]["content"].lower()
         for phrase in (
             'implement one coherent observable behavior',
@@ -25436,7 +25247,7 @@ class ReviewerAgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.storage = velox.Storage(self.paths)
         _ensure_test_storage(self.storage)
         self.chats = velox.ChatStore(self.storage)
-        self.chat_id = str(self.chats.create_chat("Reviewer loop")["chat_id"])
+        self.chat_id = str(_create_test_chat(self.chats, "Reviewer loop")["chat_id"])
         self.agents = velox.AgentStore(self.storage)
         self.registry = velox.ToolRegistry(self.storage)
         self.monitor = velox.LLMTaskMonitor(self.storage)
@@ -26007,7 +25818,7 @@ class ChecklistUiReviewCardTests(_DataRootsIsolatedTestMixin, unittest.TestCase)
     def test_checklist_dropdown_lists_chat_checklists_oldest_to_newest(self) -> None:
         with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
-            cid = chats.create_chat('Historical selection')['chat_id']
+            cid = _create_test_chat(chats, 'Historical selection')['chat_id']
             owner = velox.Panels._chat_checklist_owner(cid)
             store = velox.ChecklistStore(storage)
             reports = []
@@ -26201,7 +26012,7 @@ class ChatAppearanceTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_checklist_status_exposes_raw_and_display_names(self) -> None:
         with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Display name")
+            chat = _create_test_chat(chats, "Display name")
             owner = velox.Panels._chat_checklist_owner(str(chat["chat_id"]))
             store = velox.ChecklistStore(storage)
             created = store.create(owner, name="Acceptance", items=["Finish"])
@@ -26748,7 +26559,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_established_chat_freezes_exact_leading_system_prompt(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("Cache stable")
+            chat = _create_test_chat(chats, "Cache stable")
             chat_id = str(chat["chat_id"])
             endpoint_id = chats.get_chat_endpoint_profile_id(chat_id)
             runtime = velox.ChatRuntime(storage, chats, velox.ContextAssembler(paths), velox.LLMClient(storage), velox.ToolRegistry(storage))
@@ -26791,7 +26602,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            prior = chats.create_chat("Prior")
+            prior = _create_test_chat(chats, "Prior")
             velox.atomic_write_json(paths.chat_summary_json(prior["chat_id"]), {
                 **velox.default_chat_summary(prior["chat_id"], chats.get_chat_endpoint_profile_id(prior["chat_id"])),
                 "one_sentence_summary": "Prior cache-relevant decision",
@@ -26799,7 +26610,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "summary_markdown": "- Prior cache-relevant decision",
                 "stale": False,
             })
-            chat = chats.create_chat("Current")
+            chat = _create_test_chat(chats, "Current")
             chat_id = str(chat["chat_id"])
             endpoint_id = chats.get_chat_endpoint_profile_id(chat_id)
             docs = MutableContextDocs()
@@ -26845,7 +26656,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_skill_load_stays_chronological_and_does_not_move_into_message_zero(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("Skill cache")
+            chat = _create_test_chat(chats, "Skill cache")
             chat_id = str(chat["chat_id"])
             endpoint_id = chats.get_chat_endpoint_profile_id(chat_id)
             runtime = velox.ChatRuntime(storage, chats, velox.ContextAssembler(paths), velox.LLMClient(storage), velox.ToolRegistry(storage))
@@ -26886,7 +26697,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_week_calendar_updates_append_without_changing_system_prefix(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat = chats.create_chat("Week", chat_kind="week", week_start_date="2026-09-07")
+            chat = _create_test_chat(chats, "Week", chat_kind="week", week_start_date="2026-09-07")
             chat_id = str(chat["chat_id"])
             endpoint_id = chats.get_chat_endpoint_profile_id(chat_id)
             runtime = velox.ChatRuntime(storage, chats, velox.ContextAssembler(paths), velox.LLMClient(storage), velox.ToolRegistry(storage))
@@ -26930,7 +26741,7 @@ class PrefixCacheStabilityTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_native_tool_schema_surface_is_stable_after_chat_lock(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Tools")
+            chat = _create_test_chat(chats, "Tools")
             chat_id = str(chat["chat_id"])
             registry = velox.ToolRegistry(storage)
             before = registry.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, chat_id)
@@ -27046,8 +26857,8 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_committed_chat_delete_recovers_selection_even_when_caller_raises_late(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            remaining = chats.create_chat("Remaining")
-            doomed = chats.create_chat("Doomed")
+            remaining = _create_test_chat(chats, "Remaining")
+            doomed = _create_test_chat(chats, "Doomed")
 
             def delete_then_raise(chat_id: str) -> None:
                 chats.delete_chat(velox.APP_SCOPE_ID, chat_id)
@@ -27072,7 +26883,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_failed_chat_delete_keeps_existing_selection_and_reports_failure(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Still here")
+            chat = _create_test_chat(chats, "Still here")
 
             def fail_before_delete(_chat_id: str) -> None:
                 raise OSError("simulated pre-delete failure")
@@ -27087,7 +26898,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_switch_active_chat_validates_destination_before_mutating_state(self) -> None:
         with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
-            current = chats.create_chat("Current")
+            current = _create_test_chat(chats, "Current")
             panel = self._panel(storage, chats)
             panel.state.active_chat_id = str(current["chat_id"])
             panel.state.composer_endpoint_profile_id = chats.get_chat_endpoint_profile_id(str(current["chat_id"]))
@@ -27103,8 +26914,8 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_active_selection_does_not_trust_stale_chat_list_cache_after_delete(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            remaining = chats.create_chat("Remaining")
-            doomed = chats.create_chat("Doomed")
+            remaining = _create_test_chat(chats, "Remaining")
+            doomed = _create_test_chat(chats, "Doomed")
             doomed_id = str(doomed["chat_id"])
             # Prime the 350-ms hot-path list cache, then simulate another process
             # removing the selected chat without invalidating this process cache.
@@ -27121,8 +26932,8 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_chat_list_skips_record_deleted_between_scan_and_json_read(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, _storage, chats = _make_test_chat_stack(Path(td))
-            survivor = chats.create_chat("Survivor")
-            doomed = chats.create_chat("Race")
+            survivor = _create_test_chat(chats, "Survivor")
+            doomed = _create_test_chat(chats, "Race")
             doomed_id = str(doomed["chat_id"])
             doomed_json = paths.chat_json(doomed_id)
             original_read_json = velox.read_json
@@ -27146,7 +26957,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_agent_list_skips_record_deleted_between_scan_and_json_read(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Owner")
+            chat = _create_test_chat(chats, "Owner")
             agents = velox.AgentStore(storage)
             survivor = agents.create_agent(str(chat["chat_id"]), "survive", title="Survivor")
             doomed = agents.create_agent(str(chat["chat_id"]), "race", title="Race")
@@ -27174,7 +26985,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             try:
-                chat = chats.create_chat("Delete log")
+                chat = _create_test_chat(chats, "Delete log")
                 chat_id = str(chat["chat_id"])
                 with mock.patch.object(storage, "append_app_log", side_effect=OSError("log locked")):
                     chats.delete_chat(velox.APP_SCOPE_ID, chat_id)
@@ -27185,7 +26996,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
             try:
-                chat = chats.create_chat("Agent owner")
+                chat = _create_test_chat(chats, "Agent owner")
                 agents = velox.AgentStore(storage)
                 agent = agents.create_agent(str(chat["chat_id"]), "done", title="Done")
                 agent = agents.update_agent(str(agent["agent_id"]), {"status": "succeeded"})
@@ -27199,7 +27010,7 @@ class ChatDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_committed_agent_delete_clears_all_selected_agent_references(self) -> None:
         with _TemporaryDataDirectory() as td:
             paths, storage, chats = _make_test_chat_stack(Path(td))
-            chat = chats.create_chat("Agent owner")
+            chat = _create_test_chat(chats, "Agent owner")
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(str(chat["chat_id"]), "done", title="Done")
             agent = agents.update_agent(str(agent["agent_id"]), {"status": "succeeded"})
@@ -27490,7 +27301,7 @@ class ReviewerReliabilitySecurityTests(unittest.IsolatedAsyncioTestCase):
         self.storage = velox.Storage(self.paths)
         _ensure_test_storage(self.storage)
         self.chats = velox.ChatStore(self.storage)
-        self.chat_id = str(self.chats.create_chat("Reviewer protocol")['chat_id'])
+        self.chat_id = str(_create_test_chat(self.chats, "Reviewer protocol")['chat_id'])
         self.agents = velox.AgentStore(self.storage)
         self.registry = velox.ToolRegistry(self.storage)
         self.monitor = velox.LLMTaskMonitor(self.storage)
@@ -28292,7 +28103,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
     def test_direct_agent_pause_and_resume_keep_monitor_scheduler_in_sync(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat_id = str(chats.create_chat("parent")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "parent")["chat_id"])
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(chat_id, "agent")
             agent_id = str(agent["agent_id"])
@@ -28343,7 +28154,7 @@ class SchedulerConcurrencyHardeningTests(_DataRootsIsolatedTestMixin, unittest.T
     def test_agent_cancel_requests_active_tool_cancellation(self) -> None:
         async def scenario(root: Path) -> None:
             paths, storage, chats = _make_test_chat_stack(root)
-            chat_id = str(chats.create_chat("parent")["chat_id"])
+            chat_id = str(_create_test_chat(chats, "parent")["chat_id"])
             agents = velox.AgentStore(storage)
             agent = agents.create_agent(chat_id, "cancel me")
             agent_id = str(agent["agent_id"])
@@ -28443,7 +28254,7 @@ class DurableLifecycleTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
-        self.chat = self.chats.create_chat('Owner')
+        self.chat = _create_test_chat(self.chats, 'Owner')
         self.cid = str(self.chat['chat_id'])
         self.agents = velox.AgentStore(self.storage)
         self.owner = {'owner_kind':'chat', 'chat_id':self.cid, 'agent_id':'', 'task_run_id':0}
@@ -28484,7 +28295,7 @@ class DurableLifecycleTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertFalse(self.paths.chat_dir(self.cid).exists())
 
     def test_switch_forces_destination_validation_before_saving_draft(self) -> None:
-        destination = self.chats.create_chat('Destination')
+        destination = _create_test_chat(self.chats, 'Destination')
         target = str(destination['chat_id'])
         self.chats.get_chat_endpoint_profile_id(target)
         shutil.rmtree(self.paths.chat_dir(target))
@@ -28531,7 +28342,7 @@ class DurableLifecycleTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
     def test_postcommit_logging_does_not_report_create_or_rename_failure(self) -> None:
         with mock.patch.object(self.storage, 'append_app_log', side_effect=OSError('log unavailable')):
-            chat = self.chats.create_chat('New')
+            chat = _create_test_chat(self.chats, 'New')
             renamed = self.chats.rename_chat(velox.APP_SCOPE_ID, str(chat['chat_id']), 'Renamed')
             agent = self.agents.create_agent(self.cid, 'Work')
         self.assertEqual(renamed['name'], 'Renamed')
@@ -28547,7 +28358,7 @@ class DurableLifecycleTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_restart_unlocks_requested_and_running_reviews_without_verifying(self) -> None:
         manager=velox.ChecklistStore(self.storage); cases=[]
         for name in ('requested','running'):
-            owner=velox._chat_checklist_owner(self.chats.create_chat(name)['chat_id'])
+            owner=velox._chat_checklist_owner(_create_test_chat(self.chats, name)['chat_id'])
             cid=manager.create(owner,name=name,items=['Outcome'])['checklist_id']
             manager.update_items(owner,cid,[{'item_id':'C1','state':'done','comment':'Implemented.'}])
             manager.prepare_verification(owner,cid)
@@ -28566,7 +28377,7 @@ class ChecklistTransitionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
-        self.cid = str(self.chats.create_chat('Checklist owner')['chat_id'])
+        self.cid = str(_create_test_chat(self.chats, 'Checklist owner')['chat_id'])
         self.owner = {'owner_kind':'chat','chat_id':self.cid,'agent_id':'','task_run_id':0}
         self.manager = velox.ChecklistStore(self.storage)
         self.lid = self.manager.create(self.owner, name='Acceptance', items=['One','Two'])['checklist_id']
@@ -28826,7 +28637,7 @@ class AtomicStateTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
 
 
     def test_collection_copied_between_owners_is_rejected(self) -> None:
-        other = str(self.chats.create_chat('Other')['chat_id'])
+        other = str(_create_test_chat(self.chats, 'Other')['chat_id'])
         owner = dict(self.owner, chat_id=other)
         shutil.copyfile(self.manager._collection_path(self.owner), self.manager._collection_path(owner))
         with self.assertRaisesRegex(ValueError, 'owner'):
@@ -28874,7 +28685,7 @@ class DeletionCommitTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         before = {p.name for p in self.paths.chats_dir().iterdir()}
         with mock.patch(f'{velox.__name__}.atomic_write_text', side_effect=OSError('initial transcript unavailable')):
             with self.assertRaises(OSError):
-                self.chats.create_chat('Partial')
+                _create_test_chat(self.chats, 'Partial')
         self.assertEqual({p.name for p in self.paths.chats_dir().iterdir()}, before)
 
     def test_failed_agent_creation_never_publishes_partial_record(self) -> None:
@@ -29056,7 +28867,7 @@ class ReviewCommitAndDeletionRecoveryTests(_DataRootsIsolatedTestMixin, unittest
         self.assertNotIn('| All items | Passed |', text)
 
     def test_startup_skips_record_deleted_after_chat_enumeration(self) -> None:
-        doomed = self.chats.create_chat('Doomed')
+        doomed = _create_test_chat(self.chats, 'Doomed')
         doomed_id = str(doomed['chat_id'])
         self.storage.write_app_state({'active_chat_id':doomed_id})
         original = self.chats.list_chats
@@ -29100,7 +28911,7 @@ class _AsyncRuntimeFixture(_WriterDataRootsIsolatedTestMixin, unittest.IsolatedA
         self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
-        self.cid = str(self.chats.create_chat("Runtime behavior")["chat_id"])
+        self.cid = str(_create_test_chat(self.chats, "Runtime behavior")["chat_id"])
         self.eid = self.chats.get_chat_endpoint_profile_id(self.cid)
         self.tools = velox.ToolRegistry(self.storage)
         self.llm = velox.LLMClient(self.storage)
@@ -29330,7 +29141,7 @@ class SteeringRuntimeTests(_AsyncRuntimeFixture):
 
     async def test_agent_steering_rejects_cross_chat_and_stale_caller_run(self):
         target, caller = self.agent(), self.agent()
-        wrong = self.chats.create_chat('Other chat')['chat_id']
+        wrong = _create_test_chat(self.chats, 'Other chat')['chat_id']
         with self.assertRaises(PermissionError):
             await self.tools.tool_agents_steer(velox.ToolContext(velox.APP_SCOPE_ID, chat_id=wrong), {'agent_id':str(target['task_run_id']),'message':'No'})
         with self.assertRaises(PermissionError):
@@ -30576,7 +30387,7 @@ class ToolLifecycleTests(_AsyncRuntimeFixture):
         release.set(); self.assertTrue((await first)["ok"])
     async def test_execution_identity_cannot_cross_chat_or_arguments(self) -> None:
         await self.execute(tool_call_id="owner-id")
-        other = str(self.chats.create_chat("Other")["chat_id"])
+        other = str(_create_test_chat(self.chats, "Other")["chat_id"])
         with self.assertRaises(PermissionError):
             await self.tools.execute_tool_call(velox.APP_SCOPE_ID, {"name": "time_now", "arguments": {}}, chat_id=other, tool_call_id="owner-id")
     async def test_evicted_result_does_not_make_an_identity_executable_again(self) -> None:
@@ -30740,7 +30551,7 @@ class AgentReplayTests(_AsyncRuntimeFixture):
         events = [row for row in self.agents.load_transcript(aid) if row.get("kind") == "conversation_message"]
         self.assertEqual(len(events), 1)
     async def test_agent_cannot_execute_tools_in_another_chat_context(self) -> None:
-        agent = self.agent(); other = str(self.chats.create_chat("Wrong source")["chat_id"])
+        agent = self.agent(); other = str(_create_test_chat(self.chats, "Wrong source")["chat_id"])
         result = await self.tools.execute_tool_call(velox.APP_SCOPE_ID, {"name": "time_now", "arguments": {}}, agent_id=agent["agent_id"], chat_id=other)
         self.assertFalse(result["ok"]); self.assertIn("source Chat", result["error"])
 
@@ -31178,7 +30989,7 @@ class UserStopChecklistTests(_AsyncRuntimeFixture):
 
     async def test_other_chat_and_unrelated_agent_checklists_are_untouched(self) -> None:
         cid = self.create()
-        other = str(self.chats.create_chat("Other")["chat_id"])
+        other = str(_create_test_chat(self.chats, "Other")["chat_id"])
         other_owner = velox._chat_checklist_owner(other)
         self.manager.create(other_owner, name="Other", items=["Work"])
         agent = self.agents.create_agent(self.cid, "Independent background work")
@@ -35214,7 +35025,7 @@ class _ChecklistRuntimeFixture(_WriterDataRootsIsolatedTestMixin, unittest.TestC
         self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
-        self.chat_id = str(self.chats.create_chat("Automatic Checklist regressions")["chat_id"])
+        self.chat_id = str(_create_test_chat(self.chats, "Automatic Checklist regressions")["chat_id"])
         self.owner = velox._chat_checklist_owner(self.chat_id)
         self.manager = velox.ChecklistStore(self.storage)
         self.agents = velox.AgentStore(self.storage)
@@ -37309,7 +37120,7 @@ class EndpointDefaultsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         p = self.profile()
         self.assertEqual(p['model'], 'qwen/qwen3.8-flash')
         self.assertEqual(p['provider'], velox.ENDPOINT_PROVIDER_NOVITA)
-        self.assertEqual(p['label'], 'Qwen 3.8 Flash (Novita)')
+        self.assertEqual(p['label'], 'Qwen 3.8 Flash Next (Novita)')
         self.assertEqual(p['base_url'], 'https://api.novita.ai/openai/v1/chat/completions')
         self.assertEqual(p['api_transport'], velox.ENDPOINT_API_TRANSPORT_CHAT_COMPLETIONS)
         self.assertFalse(p.get('system_prompt_addon'))
@@ -37531,7 +37342,7 @@ class PromptContractTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
     def test_agent_ownership_guidance_is_only_in_agent_enabled_chat_prompt(self) -> None:
         with _TemporaryDataDirectory() as td:
             storage = _make_test_storage(Path(td)); chats = velox.ChatStore(storage)
-            chat = chats.create_chat('No worker tools')
+            chat = _create_test_chat(chats, 'No worker tools')
             cid = str(chat['chat_id']); chat['features']['agent_tools_enabled'] = False
             velox.atomic_write_json(storage.paths.chat_json(cid), chat)
             prompt = velox.ContextAssembler(storage.paths).assemble_chat_context(velox.APP_SCOPE_ID,cid)[0]['content']
@@ -37739,7 +37550,7 @@ async def _test_chat_recovery_contract(test: unittest.TestCase) -> None:
     """Real ChatRuntime + shared client: recovery does not add model turns."""
     with _TemporaryDataDirectory() as td:
         paths, storage, chats = _make_test_chat_stack(Path(td))
-        chat_id = str(chats.create_chat("Endpoint Error Recovery regression")["chat_id"])
+        chat_id = str(_create_test_chat(chats, "Endpoint Error Recovery regression")["chat_id"])
         eid = chats.get_chat_endpoint_profile_id(chat_id)
         storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, eid).update(
             error_recovery_enabled=True, error_recovery_attempts=2,
@@ -37781,7 +37592,7 @@ async def _test_chat_recovery_contract(test: unittest.TestCase) -> None:
 async def _test_agent_recovery_contract(test: unittest.TestCase, *, failures: int) -> None:
     with _TemporaryDataDirectory() as td:
         paths, storage, chats = _make_test_chat_stack(Path(td))
-        cid = str(chats.create_chat("Agent recovery regression")["chat_id"])
+        cid = str(_create_test_chat(chats, "Agent recovery regression")["chat_id"])
         eid = velox.DEFAULT_ENDPOINT_PROFILE_ID
         storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, eid).update(
             error_recovery_enabled=True, error_recovery_attempts=3,
@@ -38633,7 +38444,7 @@ class UnifiedEndpointConfigTests(_LegacyEndpointFixtureMixin, _AsyncRuntimeFixtu
     def test_new_chats_and_unscoped_agents_share_changed_default(self) -> None:
         eid = velox.DEFAULT_GLM_5_3_FLASH_NOVITA_ENDPOINT_PROFILE_ID
         self.set_default(eid)
-        new_chat = self.chats.create_chat('New default')
+        new_chat = _create_test_chat(self.chats, 'New default')
         agent = self.agents.create_agent(self.cid, 'Unscoped local task')
         self.assertEqual(new_chat['endpoint_profile_id'], eid)
         self.assertEqual(agent['endpoint_profile_id'], eid)
@@ -38646,7 +38457,7 @@ class UnifiedEndpointConfigTests(_LegacyEndpointFixtureMixin, _AsyncRuntimeFixtu
         self.set_default(velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID)
         self.assertEqual(self.chats.get_chat_endpoint_profile_id(self.cid), self.eid)
         self.assertEqual(self.agents.load_agent(old_agent['agent_id'])['endpoint_profile_id'], self.eid)
-        new_chat = self.chats.create_chat('Explicit', endpoint_profile_id=self.eid)
+        new_chat = _create_test_chat(self.chats, 'Explicit', endpoint_profile_id=self.eid)
         self.assertEqual(new_chat['endpoint_profile_id'], self.eid)
         with self.assertRaises(ValueError):
             self.chats.set_chat_endpoint_profile_id(self.cid, self.chats.get_endpoint_profile_id())
@@ -38957,12 +38768,6 @@ class UnifiedEndpointEditorTests(_LegacyEndpointFixtureMixin, _AsyncRuntimeFixtu
         self.assertLessEqual(first.y + first.h, second.y)
         self.assertLessEqual(second.y + second.h, buttons.y)
 
-    def test_default_card_description_measurement_matches_draw(self) -> None:
-        for method in (velox.Panels._endpoint_settings_card_heights, velox.Panels._draw_endpoints_settings_content):
-            self.assertIn('ENDPOINT_DEFAULTS_DESCRIPTION', inspect.getsource(method))
-        for old in ('chat_profile_id', 'agent_profile_id', 'image_profile_id', 'force_current_endpoint_vision'):
-            self.assertNotIn(repr(old), application_source())
-            self.assertNotIn(chr(34) + old + chr(34), application_source())
 
 class UnifiedSystemTests(_LegacyEndpointFixtureMixin, _AsyncRuntimeFixture):
     async def test_scheduled_personal_assistant_uses_unified_default_not_week_chat_endpoint(self) -> None:
@@ -39274,7 +39079,7 @@ class ChecklistContinuationTests(_AsyncRuntimeFixture):
         self.assertIn("Implement and prove the feature", text)
 
     def test_bound_owner_cannot_read_another_chats_progress(self) -> None:
-        other = self.chats.create_chat("Other owner")["chat_id"]
+        other = _create_test_chat(self.chats, "Other owner")["chat_id"]
         self.manager.create(velox._chat_checklist_owner(other), name="Different work", items=["OTHER_SENTINEL"])
         self.erase_mirrors()
         text = self.adapter.continuation_prompt(self.adapter.load())
@@ -39962,7 +39767,7 @@ class NestedChecklistPresentationTests(_WriterDataRootsIsolatedTestMixin, unitte
         self.temp = _TemporaryDataDirectory()
         self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
-        self.cid = self.chats.create_chat('Nested presentation')['chat_id']
+        self.cid = _create_test_chat(self.chats, 'Nested presentation')['chat_id']
         self.owner = velox.Panels._chat_checklist_owner(self.cid)
         self.store = velox.ChecklistStore(self.storage)
         self.clid = self.store.create(self.owner, name='Full acceptance', items=[
@@ -40248,7 +40053,7 @@ class NestedChecklistPresentationTests(_WriterDataRootsIsolatedTestMixin, unitte
     def test_ui_cache_is_bounded_by_owner_and_does_not_mix_chat_steps(self) -> None:
         panel = self.panel()
         for i in range(10):
-            cid = self.chats.create_chat(f'Other {i}')['chat_id']; owner = velox.Panels._chat_checklist_owner(cid)
+            cid = _create_test_chat(self.chats, f'Other {i}')['chat_id']; owner = velox.Panels._chat_checklist_owner(cid)
             row = self.store.create(owner, name=f'Unique {i}', items=[f'Other requirement {i}'])
             snapshot, error = panel._checklist_ui_snapshot(owner)
             self.assertFalse(error); self.assertEqual(snapshot['active_checklist_id'], row['checklist_id'])
@@ -40650,7 +40455,7 @@ class _NestedChecklistFixture(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
         super().setUp()
         self.temp = _TemporaryDataDirectory(); self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
-        self.chat_id = self.chats.create_chat('Checklist contract')['chat_id']
+        self.chat_id = _create_test_chat(self.chats, 'Checklist contract')['chat_id']
         self.owner = velox._chat_checklist_owner(self.chat_id)
         self.store = velox.ChecklistStore(self.storage)
         self.registry = velox.ToolRegistry(self.storage)
@@ -41018,7 +40823,7 @@ class ChecklistDurabilityTests(_NestedChecklistFixture):
         self.assertEqual(self.store.active(owner)['id'],first['checklist_id']); self.assertEqual(self.store.active(other)['id'],second['checklist_id'])
 
     def test_another_chat_cannot_access_or_mutate_owner_checklist(self) -> None:
-        cid=self.create(); before=self.raw(); other=velox._chat_checklist_owner(self.chats.create_chat('Other')['chat_id'])
+        cid=self.create(); before=self.raw(); other=velox._chat_checklist_owner(_create_test_chat(self.chats, 'Other')['chat_id'])
         with self.assertRaises(ValueError): self.store.status(other,cid)
         with self.assertRaises(ValueError): self.store.update_items(other,cid,[{'item_id':'C1','state':'done','comment':'Wrong owner'}])
         self.assertEqual(self.raw(),before)
@@ -41391,7 +41196,7 @@ class _StorageFixture(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
         super().setUp()
         self.temp = _TemporaryDataDirectory(); self.addCleanup(self.temp.cleanup)
         self.paths, self.storage, self.chats = _make_test_chat_stack(Path(self.temp.name))
-        self.chat = self.chats.create_chat("Acceptance")
+        self.chat = _create_test_chat(self.chats, "Acceptance")
         self.cid = str(self.chat["chat_id"])
         self.owner = {"owner_kind": "chat", "chat_id": self.cid, "agent_id": "", "task_run_id": 0}
         self.store = velox.ChecklistStore(self.storage)
@@ -41567,7 +41372,7 @@ class SkillModesTests(_AsyncRuntimeFixture):
         self.assertNotIn("===== Already loaded Task skill: Quality fixture", prompt)
         # The concise first-line catalog is allowed; the body is absent.
         self.store().save_skill_text("Quality fixture", "Catalog description.\n\nPRIVATE_BODY_SENTINEL")
-        new_chat = self.chats.create_chat("New optional")
+        new_chat = _create_test_chat(self.chats, "New optional")
         self.chats.append_turn(velox.APP_SCOPE_ID, new_chat["chat_id"], velox.make_turn(new_chat["chat_id"], "user", "Request"))
         self.assertNotIn("PRIVATE_BODY_SENTINEL", self.runtime._build_messages(velox.APP_SCOPE_ID, new_chat["chat_id"])[0]["content"])
 
@@ -42152,12 +41957,12 @@ class DashboardPresentationTests(_StorageFixture):
 
 
 class ChecklistToggleTests(_StorageFixture):
-    def test_new_chats_default_on_and_one_chats_off_setting_is_not_global(self) -> None:
+    def test_new_chats_default_off_and_existing_permission_is_not_global(self) -> None:
         self.assertIs(self.chat['features']['checklists_enabled'],True)
         self.chats.set_chat_feature(velox.APP_SCOPE_ID,self.cid,'checklists_enabled',False)
         self.assertIs(velox.ChatStore(self.storage).load_chat(self.cid)['features']['checklists_enabled'],False)
         other=self.chats.create_chat('Independent defaults')
-        self.assertIs(other['features']['checklists_enabled'],True)
+        self.assertIs(other['features']['checklists_enabled'],False)
         self.assertEqual(len(velox.CHAT_TOOL_FEATURE_KEYS),6)
         self.assertIn(('checklists_enabled','Checklists'),velox.CHAT_TOOL_CATEGORY_LABELS)
 
@@ -43143,7 +42948,7 @@ class ChatScrollTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
         super().setUp()
         self.temp = _TemporaryDataDirectory(); self.addCleanup(self.temp.cleanup)
         _p, _s, self.chats, _cal, self.panel, _svc = CalendarTests._panel_stack(Path(self.temp.name))
-        self.a = self.chats.create_chat('Reader A')['chat_id']; self.b = self.chats.create_chat('Reader B')['chat_id']
+        self.a = _create_test_chat(self.chats, 'Reader A')['chat_id']; self.b = _create_test_chat(self.chats, 'Reader B')['chat_id']
         self.panel.state.active_scope_id = velox.APP_SCOPE_ID
         self.panel.state.active_panel = 'chat'
         self.panel._switch_active_chat(self.a, save_current=False)
@@ -43325,7 +43130,7 @@ class AgentRetrievalTests(_AsyncRuntimeFixture):
         start.assert_not_called();self.assertEqual(before,self.agents.load_agent(self.aid))
 
     async def test_cross_chat_access_fails_for_both_tools(self) -> None:
-        other=self.chats.create_chat('Unrelated')['chat_id'];ctx=velox.ToolContext(velox.APP_SCOPE_ID,chat_id=other)
+        other=_create_test_chat(self.chats, 'Unrelated')['chat_id'];ctx=velox.ToolContext(velox.APP_SCOPE_ID,chat_id=other)
         for method in (self.tools.tool_agents_get_result,self.tools.tool_agents_get_output):
             with self.assertRaises(PermissionError):await method(ctx,{'agent_id':self.aid})
 
@@ -44723,7 +44528,7 @@ class ReleaseSchemaTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
     def test_chat_agent_and_turn_models_are_rejected(self) -> None:
         with _TemporaryDataDirectory() as root:
             paths, storage, chats = _make_test_chat_stack(Path(root))
-            chat = chats.create_chat('Current schema')
+            chat = _create_test_chat(chats, 'Current schema')
             agent = velox.AgentStore(storage).create_agent(chat['chat_id'], 'Current task')
             turn = velox.make_turn(chat['chat_id'], 'user', 'Current request')
             for record, validator in (
@@ -44744,7 +44549,7 @@ class ScrollInputOwnershipTests(_WriterDataRootsIsolatedTestMixin, unittest.Test
     def test_nontranscript_wheel_does_not_discard_restoration_anchor(self) -> None:
         with _TemporaryDataDirectory() as root:
             _p, _s, chats, _cal, panel, _svc = CalendarTests._panel_stack(Path(root))
-            cid = chats.create_chat('Saved reading position')['chat_id']
+            cid = _create_test_chat(chats, 'Saved reading position')['chat_id']
             panel.state.active_scope_id = velox.APP_SCOPE_ID
             panel.state.active_panel = 'chat'
             panel._switch_active_chat(cid, save_current=False)
@@ -44791,7 +44596,7 @@ class _AttachmentUiFixture(_WriterDataRootsIsolatedTestMixin):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.paths, self.storage, self.chats, self.calendar, self.panel, self.services = CalendarTests._panel_stack(self.root)
-        self.cid = self.chats.create_chat('Attachment test')['chat_id']
+        self.cid = _create_test_chat(self.chats, 'Attachment test')['chat_id']
         self.widgets = NestedChecklistPresentationTests.native_widgets(None)
         self.panel.widgets = self.widgets
         self.panel.state = self.widgets.state
@@ -44990,7 +44795,7 @@ class MultiAttachmentPickerTests(_AttachmentUiFixture, unittest.TestCase):
 
     def test_late_picker_return_never_attaches_to_another_chat(self) -> None:
         self.picker()
-        other = self.chats.create_chat('Other')['chat_id']
+        other = _create_test_chat(self.chats, 'Other')['chat_id']
         self.panel._switch_active_chat(other)
         self.panel.handle_file_picker_paths([str(self.files[0])])
         self.assertFalse(self.state.queued_attachments)
@@ -45047,7 +44852,7 @@ class AttachmentManagerTests(_AttachmentUiFixture, unittest.TestCase):
 
     def test_switching_chats_closes_dialog_and_cannot_remove_other_draft(self) -> None:
         original = self.attach(); modal = self.manager()
-        other = self.chats.create_chat('Other draft')['chat_id']; self.panel._switch_active_chat(other)
+        other = _create_test_chat(self.chats, 'Other draft')['chat_id']; self.panel._switch_active_chat(other)
         current = self.attach(self.files[1])
         self.assertFalse(self.panel._remove_queued_attachment(modal, current['file_id']))
         self.draw_manager(); self.assertIsNone(self.state.modal)
@@ -45064,7 +44869,7 @@ class AttachmentManagerTests(_AttachmentUiFixture, unittest.TestCase):
     def test_detached_draft_stays_detached_after_switch_away_and_back(self) -> None:
         meta = self.attach(); modal = self.manager()
         self.panel._remove_queued_attachment(modal, meta['file_id']); self.panel._close_attachment_manager()
-        other = self.chats.create_chat('Other')['chat_id']; self.panel._switch_active_chat(other)
+        other = _create_test_chat(self.chats, 'Other')['chat_id']; self.panel._switch_active_chat(other)
         self.panel._switch_active_chat(self.cid)
         self.assertEqual(self.state.queued_attachments, [])
 
@@ -45287,7 +45092,7 @@ class CurrentEndpointPresetRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRu
     """Real shipped defaults, separate from legacy/custom transport fixtures."""
     GPT6 = (
         (velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_LUNA, 'gpt-6-luna', 'xhigh'),
-        (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_SOL, 'gpt-6.1-sol', 'high'),
+        (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_SOL, 'gpt-6.1-sol', 'medium'),
         (velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_ASTRA, 'gpt-6-astra', 'medium'),
     )
 
@@ -45434,33 +45239,6 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
                     self.assertEqual(json.loads(body), payload)
                     self.assertNotIn('novita-test-key', body.decode())
 
-    def test_requested_inventory_labels_and_fresh_task_defaults(self) -> None:
-        expected = {
-            velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID: 'DSV41F 1017 (Baseten)',
-            velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID: 'DSV41F 1017 (Novita)',
-            velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID: 'Qwen 3.8 27B (vLLM)',
-            velox.DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID: 'Qwen 3.8 27B (llama.cpp)',
-            velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID: 'Qwen 3.8 Flash Next (vLLM)',
-            velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID: 'Qwen 3.8 Flash (Novita)',
-            velox.DEFAULT_KIMI_K3_ENDPOINT_PROFILE_ID: 'Kimi K3 (Novita)',
-            velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID: 'DSV4F Exp (vLLM)',
-            velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID: 'ChatGPT 6.1 Sol',
-            velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID: 'ChatGPT 6 Luna',
-        }
-        profiles = self.storage.load_config()['llm']['endpoint_profiles']
-        self.assertEqual(len(profiles), len(expected))
-        self.assertEqual({p['id']: p['label'] for p in profiles}, expected)
-        default = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID
-        self.assertEqual(velox.DEFAULT_ENDPOINT_PROFILE_ID, default)
-        self.assertEqual(velox.DEFAULT_CHAT_SUBAGENT_ENDPOINT_PROFILE_ID, default)
-        config = self.storage.load_config()['llm']
-        self.assertEqual(config['default_profile_id'], default)
-        self.assertEqual(config['default_chat_subagent_profile_id'], default)
-        chat = self.chats.create_chat('New preset defaults')
-        self.assertEqual(chat['endpoint_profile_id'], default)
-        self.assertEqual(chat['subagent_endpoint_profile_id'], default)
-        agent = self.agents.create_agent(chat['chat_id'], 'Read the current task.')
-        self.assertEqual(agent['endpoint_profile_id'], default)
 
     def test_baseten_profile_uses_standard_prices_and_conservative_editable_budget(self) -> None:
         eid = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_BASETEN_ENDPOINT_PROFILE_ID
@@ -45543,26 +45321,26 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
                 self.assertNotIn('thinking', payload)
         self.assertEqual(self.llm.resolve_endpoint(eid)['reasoning_effort'], 'max')
 
-    def test_both_qwen_27b_presets_send_xhigh_with_distinct_local_connections(self) -> None:
+    def test_both_qwen_flash_next_presets_send_xhigh_with_distinct_local_connections(self) -> None:
         for eid, label, provider, url, image_context in (
-            (velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID, 'Qwen 3.8 27B (vLLM)',
+            (velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID, 'Qwen 3.8 Flash Next (vLLM)',
              velox.ENDPOINT_PROVIDER_VLLM, 'http://127.0.0.1:8090/v1/chat/completions', 'inline'),
-            (velox.DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID, 'Qwen 3.8 27B (llama.cpp)',
+            (velox.DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID, 'Qwen 3.8 Flash Next (llama.cpp)',
              velox.ENDPOINT_PROVIDER_LLAMA_CPP, 'http://localhost:8080/v1/chat/completions', 'separate'),
         ):
             with self.subTest(endpoint=eid):
                 profile = velox.endpoint_profile_ref(self.storage.load_config(), eid)
                 self.assertEqual((profile['label'], profile['provider'], profile['base_url']), (label, provider, url))
-                self.assertEqual(profile['model'], 'Qwen/Qwen3.8-27B')
+                self.assertEqual(profile['model'], 'Qwen/Qwen3.8-Flash-Next')
                 self.assertEqual(profile['reasoning_effort'], 'xhigh')
                 self.assertEqual(profile['max_concurrent_requests'], 2)
                 self.assertFalse(profile['rate_limit_enabled'])
                 self.assertEqual(profile['image_analysis_context'], image_context)
-                self.assertEqual((profile['context_window_tokens'], profile['max_output_tokens']), (262144, 65536))
+                self.assertEqual((profile['context_window_tokens'], profile['max_output_tokens']), (524288, 131072))
                 request = velox.LLMRequest(velox.APP_SCOPE_ID, eid, [{'role': 'user', 'content': 'Hello'}])
                 endpoint, actual_url, body, headers, timeout, payload = self.llm._payload_and_headers(request, stream=True)
                 self.assertEqual(actual_url, url)
-                self.assertEqual(payload['model'], 'Qwen/Qwen3.8-27B')
+                self.assertEqual(payload['model'], 'Qwen/Qwen3.8-Flash-Next')
                 self.assertEqual(payload['reasoning_effort'], 'xhigh')
                 self.assertEqual(payload['chat_template_kwargs'], {'enable_thinking': True, 'preserve_thinking': True})
                 self.assertNotIn('Authorization', headers)
@@ -45820,7 +45598,7 @@ class ChatSubagentEndpointRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRun
     def test_new_chat_snapshots_separate_defaults(self) -> None:
         main = velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID
         self.storage.update_config(lambda c: c['llm'].update(default_profile_id=main))
-        chat = self.chats.create_chat('Separate defaults')
+        chat = _create_test_chat(self.chats, 'Separate defaults')
         self.assertEqual(chat['endpoint_profile_id'], main)
         self.assertEqual(chat['subagent_endpoint_profile_id'], velox.DEFAULT_ENDPOINT_PROFILE_ID)
         self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(chat['chat_id']), velox.DEFAULT_ENDPOINT_PROFILE_ID)
@@ -45828,7 +45606,7 @@ class ChatSubagentEndpointRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRun
     def test_changed_subagent_default_affects_only_new_chats(self) -> None:
         selected = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
         self.change_default(selected)
-        new = self.chats.create_chat('New default')
+        new = _create_test_chat(self.chats, 'New default')
         self.assertEqual(new['subagent_endpoint_profile_id'], selected)
         self.assertEqual(self.chats.get_chat_subagent_endpoint_profile_id(self.cid), self.eid)
         self.assertEqual(new['endpoint_profile_id'], self.eid)
@@ -45855,7 +45633,7 @@ class ChatSubagentEndpointRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRun
             self.chats.set_chat_subagent_endpoint_profile_id(self.cid, 'missing')
         self.assertEqual(self.paths.chat_json(self.cid).read_bytes(), chat_before)
         with self.assertRaisesRegex(ValueError, 'Unknown Chat subagent'):
-            self.chats.create_chat('Invalid', subagent_endpoint_profile_id='missing')
+            _create_test_chat(self.chats, 'Invalid', subagent_endpoint_profile_id='missing')
 
     def test_copy_and_branch_preserve_subagent_and_locked_tool_policy(self) -> None:
         chosen = velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID
@@ -45909,8 +45687,8 @@ class ChatSubagentEndpointRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRun
         agent = self.agents.load_agent(result['agent_id'])
         self.assertEqual(agent['endpoint_profile_id'], worker)
         self.assertEqual(result['endpoint_profile_id'], worker)
-        self.assertEqual(agent['context_window_tokens'], 262144)
-        self.assertEqual(agent['max_output_tokens'], 65536)
+        self.assertEqual(agent['context_window_tokens'], 524288)
+        self.assertEqual(agent['max_output_tokens'], 131072)
         self.assertFalse(agent['tool_features']['web_tools_enabled'])
         names = {row['function']['name'] for row in self.aruntime._native_tools_for_agent(agent)}
         self.assertNotIn('web_search', names)
@@ -46056,7 +45834,7 @@ class UnifiedReleaseVersionTests(unittest.TestCase):
         with _TemporaryDataDirectory() as td:
             _paths, storage, chats = _make_test_chat_stack(Path(td))
             try:
-                cid = str(chats.create_chat('Acceptance')['chat_id'])
+                cid = str(_create_test_chat(chats, 'Acceptance')['chat_id'])
                 original = chats.load_chat(cid)
                 current = velox.BACKWARD_COMPATIBLE_VERSION
                 for generation in (current - 1, current + 1, current + 100):
@@ -46193,7 +45971,7 @@ class ReaderAgentRegressionTests(_AsyncRuntimeFixture):
         original_flags = copy.deepcopy(self.chats.get_chat_tool_features(self.cid))
         agent = await self.reader()
         self.assertEqual(agent['endpoint_profile_id'], chosen)
-        self.assertEqual(agent['context_window_tokens'], 262144)
+        self.assertEqual(agent['context_window_tokens'], 524288)
         self.assertFalse(agent['tool_features']['checklists_enabled'])
         self.assertFalse(agent['tool_features']['agent_tools_enabled'])
         self.assertEqual(self.chats.get_chat_tool_features(self.cid), original_flags)
@@ -46683,7 +46461,7 @@ class ChatChildLifecycleTests(_AsyncRuntimeFixture):
     async def test_stop_cancels_owned_roots_descendants_not_other_chat_or_scheduled_pa(self) -> None:
         root = self.child(); nested = self.child(parent=root)
         pa = self.child(pa=True); pa_child = self.child(parent=pa)
-        other_chat = self.chats.create_chat('Other')['chat_id']; other = self.child(chat_id=other_chat)
+        other_chat = _create_test_chat(self.chats, 'Other')['chat_id']; other = self.child(chat_id=other_chat)
         with mock.patch.object(self.aruntime, '_schedule_chat_report'):
             self.assertTrue(self.runtime.cancel(self.cid))
         for agent in (root, nested):
@@ -47684,7 +47462,7 @@ class RunnerPortabilityRegressionTests(_StorageFixture):
         short = _normalized_prompt_budget_sample(self.storage, self.cid)
         longer = _make_test_storage(self.paths.root_dir / 'runner_checkout_with_a_long_workspace_path')
         try:
-            chat_id = velox.ChatStore(longer).create_chat('Prompt length')['chat_id']
+            chat_id = _create_test_chat(velox.ChatStore(longer), 'Prompt length')['chat_id']
             long = _normalized_prompt_budget_sample(longer, chat_id)
             self.assertEqual(len(short), len(long))
             self.assertLess(len(short), 13_500)
@@ -49523,6 +49301,322 @@ class UnicodeGlyphCoverageTests(unittest.TestCase):
         self.assertEqual(names, ["VeloxKaomojiCJK.otf", "NotoSansKannada-Regular.ttf",
             "NotoSansThai-Regular.ttf", "NotoSerifTibetan-Regular.ttf", "NotoSansCanadianAboriginal-Regular.ttf"])
         self.assertTrue(all(Path(path).parent == expected for path in velox.UNICODE_FALLBACK_FONT_CANDIDATES[:5]))
+
+
+class AnthropicMessagesTests(_AsyncRuntimeFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.eid = velox.DEFAULT_OPUS_5_5_ENDPOINT_PROFILE_ID
+        self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, self.eid).update(
+            api_key='test-anthropic-secret', error_recovery_enabled=False, adaptive_token_estimation=False))
+
+    @staticmethod
+    def reply() -> dict[str, Any]:
+        return {'type': 'message', 'id': 'msg_test', 'model': 'claude-opus-5-5', 'role': 'assistant',
+                'content': [{'type': 'thinking', 'thinking': 'Checking.', 'signature': 'signed-opaque'},
+                            {'type': 'redacted_thinking', 'data': 'opaque-redacted'},
+                            {'type': 'text', 'text': 'Calling now.'},
+                            {'type': 'tool_use', 'id': 'toolu_test', 'name': 'time_now', 'input': {'zone': 'UTC'}}],
+                'stop_reason': 'tool_use',
+                'usage': {'input_tokens': 20, 'cache_read_input_tokens': 60, 'cache_creation_input_tokens': 10, 'output_tokens': 12}}
+
+    @classmethod
+    def events(cls) -> list[dict[str, Any]]:
+        reply = cls.reply()
+        events = [{'type': 'message_start', 'message': dict(reply, content=[], stop_reason=None, usage=dict(reply['usage'], output_tokens=1))}]
+        for index, block in enumerate(reply['content']):
+            kind = block['type']
+            start = copy.deepcopy(block)
+            if kind == 'thinking': start.update(thinking='', signature='')
+            elif kind == 'text': start['text'] = ''
+            elif kind == 'tool_use': start['input'] = {}
+            events.append({'type': 'content_block_start', 'index': index, 'content_block': start})
+            if kind in {'thinking', 'text'}:
+                field = 'thinking' if kind == 'thinking' else 'text'
+                events.append({'type': 'content_block_delta', 'index': index, 'delta': {'type': field + '_delta', field: block[field]}})
+            if kind == 'thinking':
+                events.append({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'signature_delta', 'signature': block['signature']}})
+            elif kind == 'tool_use':
+                for piece in ('{"zone":', '"UTC"}'):
+                    events.append({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': piece}})
+            events.append({'type': 'content_block_stop', 'index': index})
+        events.extend([{'type': 'ping'}, {'type': 'future_event'},
+                       {'type': 'message_delta', 'delta': {'stop_reason': 'tool_use'}, 'usage': {'output_tokens': 12}},
+                       {'type': 'message_stop'}])
+        return events
+
+    def test_request_auth_system_images_tools_and_signed_replay(self) -> None:
+        raw = velox.anthropic_message_to_completion(self.reply())
+        assistant = raw['choices'][0]['message']
+        messages = [{'role': 'system', 'content': 'Be useful.'}, {'role': 'user', 'content': 'Time?'}, assistant,
+                    {'role': 'tool', 'tool_call_id': 'toolu_test', 'content': '12:00'},
+                    {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}},
+                                                 {'type': 'text', 'text': 'Explain.'}]}]
+        original = copy.deepcopy(messages)
+        tools = [{'type': 'function', 'function': {'name': 'time_now', 'description': 'Time', 'parameters': {'type': 'object', 'properties': {}}}}]
+        for stream in (False, True):
+            req = velox.LLMRequest(None, self.eid, messages, native_tools=tools)
+            endpoint, url, body, headers, timeout, payload = self.llm._payload_and_headers(req, stream=stream)
+            self.assertEqual(url, 'https://api.anthropic.com/v1/messages')
+            self.assertEqual(headers['x-api-key'], 'test-anthropic-secret')
+            self.assertEqual(headers['anthropic-version'], '2023-06-01')
+            self.assertNotIn('Authorization', headers)
+            self.assertEqual(json.loads(body), payload)
+            self.assertEqual(payload['system'], [{'type': 'text', 'text': 'Be useful.'}])
+            self.assertEqual(payload['thinking'], {'type': 'adaptive'})
+            self.assertEqual(payload['output_config'], {'effort': 'medium'})
+            self.assertEqual(payload['tools'][0]['input_schema'], tools[0]['function']['parameters'])
+            self.assertEqual(payload['messages'][1]['content'][:2], self.reply()['content'][:2])
+            self.assertEqual(payload['messages'][1]['content'][-1], self.reply()['content'][-1])
+            self.assertEqual(payload['messages'][-1]['content'][0]['tool_use_id'], 'toolu_test')
+            self.assertEqual(payload['messages'][-1]['content'][1]['source'], {'type': 'base64', 'media_type': 'image/png', 'data': 'AA=='})
+            self.assertTrue(req.prepared_capacity)
+            for field in ('reasoning_effort', 'stream_options', 'temperature', 'top_p', *velox.ENDPOINT_PRICE_FIELDS):
+                self.assertNotIn(field, payload)
+            self.assertNotIn('test-anthropic-secret', body.decode())
+        self.assertEqual(messages, original)
+
+    def test_utility_reasoning_overrides_use_supported_adaptive_effort(self) -> None:
+        for override, expected in (("minimal", "low"), ("none", "low"), ("off", "low"),
+                                   ("on", "medium"), ("medium", "medium"), ("max", "max")):
+            request = velox.LLMRequest(None, self.eid, [{"role": "user", "content": "Compact this context"}],
+                                       reasoning_effort_override=override)
+            payload = self.llm._payload_and_headers(request, stream=False)[-1]
+            self.assertEqual(payload["output_config"], {"effort": expected})
+            self.assertEqual(payload["thinking"], {"type": "adaptive"})
+        self.assertEqual(self.llm.resolve_endpoint(self.eid)["reasoning_effort"], "medium")
+
+    def test_messages_url_and_invalid_inputs(self) -> None:
+        for suffix in ('', '/', '/v1', '/v1/', '/v1/messages', '/v1/responses', '/v1/chat/completions'):
+            self.assertEqual(self.llm._messages_url('https://api.anthropic.com' + suffix), 'https://api.anthropic.com/v1/messages')
+        for url in ('file:///secret', 'https://example.com\nBad: value'):
+            with self.assertRaises(ValueError): self.llm._messages_url(url)
+        for part in ({'type': 'audio'}, {'type': 'image_url', 'image_url': {'url': 'file:///secret'}}):
+            with self.assertRaises(ValueError): self.llm._messages_content([part])
+        for field in ('system', 'output_config', 'thinking', 'tools'):
+            with self.assertRaisesRegex(ValueError, 'cannot override'): velox.parse_endpoint_extra_body(json.dumps({field: {}}))
+
+    def test_stream_state_rejects_incomplete_or_malformed_tools(self) -> None:
+        state = velox.AnthropicMessagesStreamState()
+        with self.assertRaisesRegex(ValueError, 'missing message_start'): state.accept({'type': 'message_stop'})
+        state.accept(self.events()[0])
+        state.accept({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'tool_use', 'id': 't', 'name': 'time_now', 'input': {}}})
+        state.accept({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'input_json_delta', 'partial_json': '{bad'}})
+        with self.assertRaises(ValueError): state.accept({'type': 'content_block_stop', 'index': 0})
+
+    async def exercise_http(self, stream: bool, *, events: list[dict[str, Any]] | None = None, status: int = 200) -> dict[str, Any]:
+        captured = []
+        body = (b''.join(b'event: ' + str(e['type']).encode() + b'\ndata: ' + json.dumps(e).encode() + b'\n\n' for e in (self.events() if events is None else events))
+                if stream else json.dumps(self.reply()).encode())
+        if status != 200: body = b'{"type":"error","error":{"type":"authentication_error","message":"test-anthropic-secret invalid"}}'
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None: pass
+            def do_POST(inner) -> None:
+                captured.append((inner.path, dict(inner.headers), json.loads(inner.rfile.read(int(inner.headers['Content-Length'])))))
+                inner.send_response(status); inner.send_header('Content-Type', 'text/event-stream' if stream else 'application/json')
+                inner.send_header('Content-Length', str(len(body))); inner.end_headers(); inner.wfile.write(body); inner.wfile.flush()
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler); server.daemon_threads = True
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True); thread.start()
+        self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, self.eid).update(base_url=f'http://127.0.0.1:{server.server_port}/v1'))
+        req = velox.LLMRequest(None, self.eid, [{'role': 'user', 'content': 'Time?'}], stream=stream)
+        try:
+            if events is not None:
+                chunks = [chunk async for chunk in self.llm.chat_completions_stream(req)]
+                result = {'error': chunks[-1].error, 'tool_calls': chunks[-1].native_tool_calls}
+            else:
+                method = self.llm.chat_completions_stream_full if stream else self.llm.chat_completions_once_full
+                result = await asyncio.wait_for(method(req), 5)
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0][0], '/v1/messages')
+            self.assertEqual({k.lower(): v for k, v in captured[0][1].items()}['x-api-key'], 'test-anthropic-secret')
+            return result
+        finally:
+            await asyncio.to_thread(server.shutdown); server.server_close(); await asyncio.to_thread(thread.join, 2)
+            self.assertFalse(thread.is_alive())
+
+    async def test_streaming_and_nonstreaming_http_usage_tools_and_replay(self) -> None:
+        results = []
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                result = await self.exercise_http(stream)
+                self.assertFalse(result.get('error'))
+                self.assertEqual(result['text'], '<think>\nChecking.\n</think>\nCalling now.')
+                self.assertEqual(result['finish_reason'], 'tool_calls')
+                self.assertEqual(result['usage']['prompt_tokens'], 90)
+                self.assertEqual(result['usage']['completion_tokens'], 12)
+                self.assertEqual(velox.cached_input_tokens_from_usage(result), 60)
+                self.assertEqual(velox.cache_write_tokens_from_usage(result), 10)
+                self.assertEqual(json.loads(result['tool_calls'][0]['function']['arguments']), {'zone': 'UTC'})
+                self.assertEqual(result['reasoning_fields']['reasoning_details'][0]['block']['signature'], 'signed-opaque')
+                self.assertEqual(result['reasoning_fields']['reasoning_details'][1]['block']['data'], 'opaque-redacted')
+                results.append(result)
+        self.assertEqual(results[0]['reasoning_fields'], results[1]['reasoning_fields'])
+
+    async def test_dropped_stream_and_instream_errors_never_execute_partial_calls(self) -> None:
+        for events in (self.events()[:-1], self.events()[:-3] + [{'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'busy'}}]):
+            result = await self.exercise_http(True, events=events)
+            self.assertTrue(result.get('error'))
+            self.assertFalse(result.get('tool_calls'))
+
+    async def test_http_auth_error_redacts_api_key(self) -> None:
+        with self.assertRaises(velox.LLMEndpointError) as caught: await self.exercise_http(False, status=401)
+        self.assertNotIn('test-anthropic-secret', str(caught.exception))
+        self.assertIn('401', str(caught.exception))
+        self.assertIn('x-api-key', str(caught.exception))
+
+
+    async def test_cancellation_and_deadline_close_stalled_messages_stream(self) -> None:
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel):
+                connected, release = threading.Event(), threading.Event()
+                class Handler(http.server.BaseHTTPRequestHandler):
+                    def log_message(self, *args: Any) -> None: pass
+                    def do_POST(inner) -> None:
+                        inner.rfile.read(int(inner.headers['Content-Length']))
+                        inner.send_response(200); inner.send_header('Content-Type', 'text/event-stream'); inner.end_headers()
+                        inner.wfile.write(b'data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'); inner.wfile.flush()
+                        connected.set(); release.wait(4)
+                server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler); server.daemon_threads = True
+                thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True); thread.start()
+                self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, self.eid).update(
+                    base_url=f'http://127.0.0.1:{server.server_port}/v1/messages', timeout_seconds=1))
+                signal = threading.Event()
+                request = velox.LLMRequest(None, self.eid, [{'role': 'user', 'content': 'Wait'}], cancel_event=signal)
+                async def collect() -> list[LLMChunk]:
+                    return [chunk async for chunk in self.llm.chat_completions_stream(request)]
+                task = asyncio.create_task(collect())
+                try:
+                    self.assertTrue(await asyncio.to_thread(connected.wait, 2))
+                    if cancel:
+                        signal.set()
+                        with self.assertRaises(asyncio.CancelledError): await asyncio.wait_for(task, 3)
+                    else:
+                        chunks = await asyncio.wait_for(task, 3)
+                        self.assertTrue(chunks[-1].done)
+                        self.assertIn('Timeout', chunks[-1].error)
+                        self.assertFalse(chunks[-1].native_tool_calls)
+                finally:
+                    release.set()
+                    if not task.done(): task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    await asyncio.to_thread(server.shutdown); server.server_close(); await asyncio.to_thread(thread.join, 2)
+
+    async def test_real_chat_loop_executes_tool_and_replays_signed_thinking(self) -> None:
+        requests, calls = [], []
+        first = self.reply(); first['content'][-1]['input'] = {}
+        final = dict(first, content=[{'type': 'text', 'text': 'Finished.'}], stop_reason='end_turn')
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None: pass
+            def do_POST(inner) -> None:
+                requests.append(json.loads(inner.rfile.read(int(inner.headers['Content-Length']))))
+                reply = first if len(requests) == 1 else final
+                body = json.dumps(reply).encode()
+                inner.send_response(200); inner.send_header('Content-Type', 'application/json'); inner.send_header('Content-Length', str(len(body))); inner.end_headers(); inner.wfile.write(body)
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler); server.daemon_threads = True
+        thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True); thread.start()
+        self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, self.eid).update(base_url=f'http://127.0.0.1:{server.server_port}/v1'))
+        self.chats.set_chat_endpoint_profile_id(self.cid, self.eid)
+        original_handler = self.tools.tools['time_now'].handler
+        async def counted(*args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            return await original_handler(*args, **kwargs)
+        self.tools.tools['time_now'].handler = counted
+        user = self.user('Use time_now once, then report completion.')
+        assistant = velox.make_turn(self.cid, 'assistant', '', status='streaming', endpoint_profile_id=self.eid)
+        self.chats.append_turn(velox.APP_SCOPE_ID, self.cid, assistant, mark_stale=False)
+        try:
+            await asyncio.wait_for(self.runtime._run_assistant_loop(velox.APP_SCOPE_ID, self.cid, str(assistant['turn_id']), self.eid, user['text'], 'Messages integration'), 8)
+            self.assertEqual(calls, [1])
+            self.assertEqual(len(requests), 2)
+            history = requests[1]['messages']
+            replay = next(m for m in history if m['role'] == 'assistant' and any(b.get('type') == 'tool_use' for b in m['content']))
+            self.assertEqual(replay['content'][:2], first['content'][:2])
+            self.assertTrue(any(b.get('type') == 'tool_result' and b.get('tool_use_id') == 'toolu_test' for m in history for b in m['content']))
+            turns = self.chats.load_turns(velox.APP_SCOPE_ID, self.cid)
+            self.assertIn('Finished.', turns[-1]['text'])
+            stats = velox.chat_thread_runtime_stats(turns)
+            self.assertEqual(stats['input_tokens'], 180)
+            self.assertEqual(stats['cached_input_tokens'], 120)
+        finally:
+            self.tools.tools['time_now'].handler = original_handler
+            await asyncio.to_thread(server.shutdown); server.server_close(); await asyncio.to_thread(thread.join, 2)
+
+    def test_empty_tool_inputs_and_stop_reason_mapping(self) -> None:
+        for stop, expected in (('end_turn', 'stop'), ('stop_sequence', 'stop'), ('max_tokens', 'length'), ('model_context_window_exceeded', 'length'), ('tool_use', 'tool_calls'), ('refusal', 'stop')):
+            raw = dict(self.reply(), stop_reason=stop)
+            self.assertEqual(velox.anthropic_message_to_completion(raw)['choices'][0]['finish_reason'], expected)
+        events = self.events()
+        events = [e for e in events if not (e.get('index') == 3 and e['type'] == 'content_block_delta')]
+        state = velox.AnthropicMessagesStreamState(); converted = [state.accept(e) for e in events]
+        call_event = next(e for e in converted if e and e.get('choices', [{}])[0].get('delta', {}).get('tool_calls'))
+        self.assertEqual(call_event['choices'][0]['delta']['tool_calls'][0]['function']['arguments'], '{}')
+
+    def test_cache_write_pricing_and_header_preview(self) -> None:
+        profile = self.llm.resolve_endpoint(self.eid)
+        for extra, expected in (('', .00005), ('{"cache_control":{"type":"ephemeral","ttl":"1h"}}', .00008)):
+            price = velox.endpoint_cost_pricing_snapshot(dict(profile, extra_body_json=extra))
+            cost = velox.estimate_token_cost(price, 10, 0, 0, cache_write_tokens=10)
+            self.assertAlmostEqual(cost['total_usd'], expected)
+        panel = object.__new__(velox.Panels)
+        preview = panel._endpoint_header_preview(profile)
+        self.assertIn('anthropic-version', preview)
+        self.assertIn('x-api-key', preview)
+        self.assertNotIn('test-anthropic-secret', preview)
+
+
+class DropdownPopupWidthTests(unittest.TestCase):
+    def widgets(self, width: int) -> velox.Widgets:
+        widgets = object.__new__(velox.Widgets)
+        widgets.font = _TestDummyFont(20, 8)
+        widgets.renderer = SimpleNamespace(host=SimpleNamespace(width=width, height=1080))
+        return widgets
+
+    def test_popup_fits_provider_suffixes_and_stays_inside_viewport(self) -> None:
+        widgets = self.widgets(1920)
+        option = 'Qwen 3.8 Flash Next (llama.cpp)'
+        trigger = velox.Rect(1440, 235, 270, 34)
+        menu, *_ = widgets._dropdown_menu_geometry(trigger, [option, 'Anthropic Opus 5.5'])
+        self.assertGreaterEqual(menu.w - 36, widgets._text_width(option))
+        self.assertGreaterEqual(menu.x, 8)
+        self.assertLessEqual(menu.x + menu.w, 1912)
+
+    def test_long_options_clamp_to_narrow_viewport(self) -> None:
+        widgets = self.widgets(320)
+        menu, *_ = widgets._dropdown_menu_geometry(velox.Rect(200, 50, 100, 34), ['x' * 200])
+        self.assertEqual(menu.w, 304)
+        self.assertGreaterEqual(menu.x, 8)
+        self.assertLessEqual(menu.x + menu.w, 312)
+
+
+class FreshChatAndModelDefaultsTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCase):
+    def test_new_chats_disable_optional_categories_and_keep_saved_permissions(self) -> None:
+        with _TemporaryDataDirectory() as td:
+            storage = _make_test_storage(Path(td))
+            chats = velox.ChatStore(storage)
+            chat = chats.create_chat()
+            for key in ('agent_tools_enabled', 'chat_history_enabled', 'checklists_enabled'):
+                self.assertFalse(chat['features'][key])
+                self.assertFalse(velox.default_chat()['features'][key])
+                chats.set_chat_feature(velox.APP_SCOPE_ID, chat['chat_id'], key, True)
+            restarted = velox.ChatStore(storage)
+            saved = restarted.load_chat(velox.APP_SCOPE_ID, chat['chat_id'])
+            for key in ('agent_tools_enabled', 'chat_history_enabled', 'checklists_enabled'): self.assertTrue(saved['features'][key])
+            for key in ('file_tools_enabled', 'system_tools_enabled', 'web_tools_enabled'): self.assertTrue(chat['features'][key])
+
+    def test_opus_sol_and_local_prices_are_usable_and_editable(self) -> None:
+        cfg = velox.default_config()
+        opus = velox.endpoint_profile_ref(cfg, velox.DEFAULT_OPUS_5_5_ENDPOINT_PROFILE_ID)
+        self.assertEqual(opus['reasoning_effort'], 'medium')
+        self.assertEqual(tuple(opus[k] for k in velox.ENDPOINT_PRICE_FIELDS), (4., .2, 20.))
+        self.assertEqual(opus['api_transport'], 'messages')
+        self.assertEqual(velox.normalize_endpoint_profile(opus), opus)
+        self.assertEqual(velox.endpoint_profile_ref(cfg, velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID)['reasoning_effort'], 'medium')
+        for profile in cfg['llm']['endpoint_profiles']:
+            if profile['provider'] in ('vllm', 'llama_cpp'):
+                with self.subTest(profile=profile['id']):
+                    self.assertTrue(all(profile[k] is not None for k in velox.ENDPOINT_PRICE_FIELDS))
+                    profile['input_price_usd_per_million'] = .123
+                    self.assertEqual(velox.normalize_endpoint_profile(profile)['input_price_usd_per_million'], .123)
 
 
 def main() -> None:

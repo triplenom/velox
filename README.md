@@ -67,15 +67,52 @@ The interface uses the pinned [PySDL3](https://pysdl3.readthedocs.io/en/latest/i
 
 ## First task
 
-Open **Settings** and configure an endpoint's URL, model name and API key where required. Bundled profiles provide starting settings, not a running model server. The default local profile is **DSV4F Exp (vLLM)**; change it if your server/model differs. Hosted profiles require suitable credentials and provider access.
+Open **Settings** and configure an endpoint's URL, model name and API key where required. Bundled profiles provide starting settings, not a running model server. The default chat profile is **DSV41F 1017 (Novita)**; change it if your server/model differs. Hosted profiles require suitable credentials and provider access.
 
-Select the appropriate **Chat Completions** or **Responses** API transport. Model reasoning, vision support, image-analysis context, output/context limits, recovery policy, concurrency and token pricing are profile settings. Image analysis uses the requesting task's current endpoint, which must support the required images.
+Select the appropriate **Chat Completions**, **Responses**, or **Anthropic Messages** API transport. Model reasoning, vision support, image-analysis context, output/context limits, recovery policy, concurrency and token pricing are profile settings. Image analysis uses the requesting task's current endpoint, which must support the required images.
 
-Create a chat, choose its main/subagent endpoints, and **enable the tools** it needs. The six policy labels are **File, System, Web, Agent, Chat and Checklists**. Endpoint/tool choices lock when the first real message is sent. Point coding/file work at a disposable workspace and state any write boundaries explicitly. For example:
+Create a chat, choose its main/subagent endpoints, and **enable the tools** it needs. The six policy labels are **File, System, Web, Agent, Chat and Checklists**. New chats start with **Agent, Chat and Checklists off**; File, System and Web remain on. Saved per-chat choices are not changed. Endpoint/tool choices lock when the first real message is sent. Point coding/file work at a disposable workspace and state any write boundaries explicitly. For example:
 
 > Build a local tool for exploring CSV files. Let me import a file, inspect its columns, filter rows and export the result. Pick a suitable stack, add tests and run them. Work only in the workspace I specify.
 
 Follow progress on the dashboard and open a task to inspect its checklist, agent requests, transcript or tool output. **Pause** holds execution at safe boundaries and preserves unfinished work. **Stop** cancels the active chat run, its active checklist and chat-owned child work; cancelled checklist work requires an explicit user-authorized resume. Ordinary application shutdown preserves resumable work rather than treating it as a user Stop.
+
+### Anthropic and local model presets
+
+**Anthropic Opus 5.5** uses `https://api.anthropic.com/v1/messages`, model
+`claude-opus-5-5`, adaptive thinking and **medium** effort. Add your Anthropic API
+key in the endpoint editor. The native Messages transport uses `x-api-key` and an
+`anthropic-version` header; it supports text/images, client tool calls/results,
+streamed text/thinking, signed thinking replay, cache usage, cancellation and the
+shared timeout/recovery policy. Custom Messages endpoints can use the same API
+selector independently of provider/model family. It does not implement Anthropic's
+separate Batch, Files, managed-agent, or server-tool APIs.
+
+Fresh **ChatGPT 6.1 Sol** presets also use medium effort. The former Qwen 3.8 27B
+vLLM/llama.cpp presets now target **Qwen 3.8 Flash Next**, preserving their profile
+IDs and local URLs. The additional vLLM preset using server model ID `model` is
+labelled **Qwen 3.8 Flash Next (vLLM, model alias)** to distinguish it from the
+canonical Hugging Face model ID. Qwen's highest supported effort is named **`xhigh`**, not
+`max`. The Novita label is **Qwen 3.8 Flash Next (Novita)**; its provider model ID
+remains `qwen/qwen3.8-flash`.
+
+Prices are editable USD per million tokens. Opus 5.5 starts at **$4 input / $0.20
+cache read / $20 output** (5-minute cache writes cost $5, 1-hour writes $8).
+Local Qwen Flash Next profiles use Novita's published API rates of **$0.15 input /
+$0.016 cache read / $0.47 output** for comparison. Local DeepSeek retains its
+published hosted reference rates. These local estimates are **not GPU/electricity
+costs or an actual local API bill**.
+
+Sources checked November 7, 2026:
+[Opus specifications/pricing](https://platform.claude.com/docs/en/models/opus-5-5/overview),
+[Messages API](https://platform.claude.com/docs/en/api/messages/create),
+[streaming](https://platform.claude.com/docs/en/build-with-claude/streaming),
+[Qwen model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), and
+[Novita Qwen API pricing](https://novita.ai/models/model-detail/qwen-qwen3.8-flash).
+
+These are fresh-install/model-preset defaults. Existing endpoint configurations,
+credentials, selected defaults and custom server aliases are not rewritten or
+silently supplemented; add the new profile through Settings in an existing root.
 
 ### Steering active work
 
