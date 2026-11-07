@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 329
+CURRENT_VERSION = 330
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -4697,6 +4697,70 @@ class TokenCostLedger:
                             key=lambda row: (-row["total_usd"], row["label"], row["endpoint_type"]))
             return {**sum_token_costs(ranked), "top_endpoints": ranked[:5], "endpoints": ranked,
                     "endpoint_count": len(ranked), "window_seconds": window_seconds, "error": self.error}
+
+
+    def dashboard_summary(self, live: Iterable[dict[str, Any]] = (), *, now: float | None = None,
+                          window_seconds: int = 86400) -> dict[str, Any]:
+        """Read each ledger day once for current/prior windows and seven trend bins.
+
+        Whole days stay aggregated; only interval boundaries and live days need
+        raw requests. Durable final events override stale in-flight snapshots.
+        """
+        epoch = time.time() if now is None else float(now)
+        if not math.isfinite(epoch) or type(window_seconds) is not int or not 0 < window_seconds <= 365 * 86400:
+            raise ValueError("Invalid dashboard cost window")
+        span = max(7 * 86400, window_seconds)
+        ranges = [(epoch - window_seconds, epoch), (epoch - 2 * window_seconds, epoch - window_seconds)]
+        ranges += [(epoch - span + i * span / 7, epoch - span + (i + 1) * span / 7) for i in range(7)] + [(epoch - 86400, epoch)]
+        live_days: dict[str, dict[str, dict[str, Any]]] = {}
+        for event in live:
+            if self._valid_event(event):
+                live_days.setdefault(self._day(event["epoch"]), {})[event["event_id"]] = event
+        first = datetime.fromtimestamp(min(a for a, b in ranges), timezone.utc).date()
+        last = datetime.fromtimestamp(epoch, timezone.utc).date()
+        grouped: list[list[dict[str, Any]]] = [[] for _ in ranges]
+        days = {(first + timedelta(days=i)).isoformat() for i in range((last-first).days + 1)}
+        with self._query_lock:
+            for day in sorted(days):
+                start = datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp()
+                end = start + 86400
+                overlaps = [i for i, (a, b) in enumerate(ranges) if a < end and b >= start]
+                raw = day in live_days or any(start <= edge < end for a, b in ranges for edge in (a, b))
+                cached = self._read_day(day, raw=raw)
+                if raw:
+                    events = dict(live_days.get(day, {})); events.update(cached["events"] or {})
+                    for i in overlaps:
+                        a, b = ranges[i]
+                        grouped[i].extend(self._group(e for e in events.values() if a < e["epoch"] <= b))
+                    # Do not retain historical request bodies between queries.
+                    cached["events"] = None
+                else:
+                    for i in overlaps:
+                        grouped[i].extend(cached["buckets"])
+            self._day_cache = {day: cache for day, cache in self._day_cache.items() if day in days}
+        endpoints: dict[str, list[dict[str, Any]]] = {}
+        labels = {}
+        for row in grouped[0]:
+            key = row["endpoint_type"]; labels[key] = row["label"]
+            endpoints.setdefault(key, []).append(row)
+        ranked = sorted(({"endpoint_type": key, "label": labels[key], **sum_token_costs(rows)}
+                         for key, rows in endpoints.items()), key=lambda r: (-r["total_usd"], r["label"]))
+        providers: dict[str, list[dict[str, Any]]] = {}
+        for row in ranked:
+            providers.setdefault(row["endpoint_type"].split(":", 1)[0], []).append(row)
+        provider_rows = sorted(({"endpoint_type": key, "label": ENDPOINT_PROVIDER_LABELS.get(key, key.title()),
+                                 **sum_token_costs(rows)} for key, rows in providers.items()),
+                               key=lambda r: (-r["total_usd"], r["label"]))
+        current = sum_token_costs(ranked)
+        previous = sum_token_costs(grouped[1])
+        prior = float(previous.get("total_usd") or 0)
+        trend = [{"start": a, "end": b, **sum_token_costs(grouped[i+2])}
+                 for i, (a, b) in enumerate(ranges[2:9])]
+        return {**current, "endpoints": ranked, "top_endpoints": ranked[:5], "providers": provider_rows,
+                "endpoint_count": len(ranked), "window_seconds": window_seconds, "error": self.error,
+                "previous_total_usd": prior,
+                "change_percent": (current["total_usd"] - prior) / prior * 100 if prior else None,
+                "trend": trend, "trend_seconds": span, "usage_24h": sum_token_costs(grouped[-1])}
 
 
 def endpoint_cost_bar_tooltip(endpoint: dict[str, Any], period: str) -> str:
@@ -49346,10 +49410,30 @@ class LLMTaskMonitor:
         return rows[:max(0, int(limit))]
 
     def cost_statistics(self, window_seconds: int = 86400) -> dict[str, Any]:
+        now = time.time()
         with self._lock:
             live = [copy.deepcopy(event) for key, event in self._cost_events.items()
                     if not self._inference_metric_snapshots.get(key, {}).get("final")]
-        return self.cost_ledger.summary(live, window_seconds=window_seconds)
+            outcomes = collections.Counter(rec.state for rec in self._records.values()
+                if rec.state in self.TERMINAL_STATES
+                and now - 86400 < (_iso_timestamp_epoch(rec.updated_at) or 0) <= now)
+        result = self.cost_ledger.dashboard_summary(live, window_seconds=window_seconds, now=now)
+        # Summary cards always show 24h, independently of the cost-period picker.
+        # Request-time ledger counts avoid counting a long-lived Chat's lifetime
+        # input again merely because it has been active during the last day.
+        usage = result["usage_24h"]
+        total = sum(outcomes.values())
+        result["dashboard_24h"] = {
+            "counts": dict(outcomes), "terminal_tasks": total,
+            "outcome_percentages": {key: outcomes[key] * 100 / total if total else 0
+                                    for key in ("completed", "failed", "cancelled")},
+            "input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"],
+            "total_tokens": usage["input_tokens"] + usage["output_tokens"],
+            "cached_input_tokens": usage["cached_input_tokens"],
+            "cache_total_rounds": usage["requests"],
+            "cache_reported_rounds": max(0, usage["requests"] - usage["unknown_cache_requests"]),
+        }
+        return result
 
     def statistics(self, *, include_costs: bool = True) -> dict[str, Any]:
         # Dashboard totals are lifetime totals for the current strict data root.
@@ -62653,6 +62737,14 @@ class UIState:
         self.selected_agent_id: str | None = None
         self.selected_llm_task_id: str | None = None
         self.dashboard_cost_period = "24 hours"
+        # Session-only controls; deliberately no saved views or persisted presets.
+        self.dashboard_search = ""
+        self.dashboard_status = "All"
+        self.dashboard_type = "All"
+        self.dashboard_endpoint = "All"
+        self.dashboard_priority = "All"
+        self.dashboard_with_cost = False
+        self.dashboard_attention = False
         self.selected_scheduled_task_id: str | None = None
         self.selected_system_task_row_id: str | None = None
         self.scheduled_task_entries_cache: list[dict[str, Any]] = []
@@ -65213,6 +65305,51 @@ class Widgets:
         finally:
             self.renderer.pop_clip()
 
+    def _draw_dashboard_cell_icon(self, rect: Rect, kind: str, color: Color, key: str = "") -> None:
+        """Small vector marks remain crisp and independent of font coverage."""
+        cx, cy = rect.x + rect.w // 2, rect.y + rect.h // 2
+        if kind == "endpoint":
+            name = key.casefold()
+            if "deepseek" in name:
+                tint = Palette.accent
+                self.renderer.draw_round_outline(Rect(rect.x + 1, rect.y + 5, 13, 10), 5, tint)
+                self.renderer.draw_line(rect.x + 12, cy + 2, rect.x + 17, rect.y + 3, tint)
+                self.renderer.draw_line(rect.x + 17, rect.y + 3, rect.x + 17, cy + 4, tint)
+                self.renderer.draw_line(rect.x + 3, cy - 1, rect.x + 9, cy + 5, tint)
+                self.renderer.draw_rect(Rect(rect.x + 4, rect.y + 7, 2, 2), tint)
+            elif any(word in name for word in ("anthropic", "opus", "claude")):
+                tint = Palette.text
+                for x0, y0, x1, y1 in [(2,15,7,3),(7,3,12,15),(4,11,10,11),(14,3,17,15)]:
+                    self.renderer.draw_line(rect.x+x0,rect.y+y0,rect.x+x1,rect.y+y1,tint)
+            elif "openai" in name or "gpt" in name:
+                for i in range(6):
+                    angle = i * math.pi / 3
+                    x, y = cx + round(4 * math.cos(angle)), cy + round(4 * math.sin(angle))
+                    self.renderer.draw_round_outline(Rect(x-4,y-4,8,8),4,Palette.text)
+            else:
+                self.renderer.draw_round_outline(Rect(rect.x+2,rect.y+2,14,14),4,Palette.accent2)
+                self.renderer.draw_line(rect.x+5,cy,rect.x+13,cy,Palette.accent2)
+                self.renderer.draw_line(cx,rect.y+5,cx,rect.y+13,Palette.accent2)
+        elif kind in {"task:running", "task:inferencing"}:
+            self.renderer.draw_line(rect.x + 4, rect.y + 2, rect.x + 4, rect.y + 16, color)
+            self.renderer.draw_line(rect.x + 4, rect.y + 2, rect.x + 15, cy, color)
+            self.renderer.draw_line(rect.x + 4, rect.y + 16, rect.x + 15, cy, color)
+        elif kind in {"task:paused", "task:pausing"}:
+            for dx in (4, 11):
+                self.renderer.draw_rect(Rect(rect.x + dx, rect.y + 3, 3, 12), color)
+        else:
+            self.renderer.draw_round_outline(Rect(rect.x + 2, rect.y + 2, 14, 14), 7, color)
+            if kind == "task:completed":
+                self._draw_shape("check", rect, color)
+            elif kind in {"task:failed", "task:cancelled"}:
+                self._draw_shape("cross", rect, color)
+            elif kind == "task:stalled":
+                self.renderer.draw_line(cx, rect.y + 4, cx, cy + 1, color)
+                self.renderer.draw_rect(Rect(cx, cy + 4, 2, 2), color)
+            else:
+                self.renderer.draw_line(cx, rect.y + 4, cx, cy, color)
+                self.renderer.draw_line(cx, cy, cx + 4, cy + 2, color)
+
     def _draw_table_tree_connector(self, cell: Rect, indent: int, value: dict[str, Any]) -> None:
         """Draw connected two-level ID branches, including through clipped rows."""
         if cell.w < 28 or cell.h < 12:
@@ -65560,6 +65697,10 @@ class Widgets:
                     display_value = value.get("label", "") if isinstance(value, dict) else value
                     display_text = str(display_value)
                     indent = min(max(0, int(value.get("indent") or 0)), max(0, cell.w - 28)) if isinstance(value, dict) else 0
+                    if isinstance(value, dict) and value.get("icon"):
+                        icon_rect = Rect(cell.x + 10, cell.y + (cell.h - 18) // 2, 18, 18)
+                        self._draw_dashboard_cell_icon(icon_rect, str(value["icon"]), color, str(value.get("icon_key") or ""))
+                        indent += 26
                     if isinstance(value, dict) and value.get("tree_branch"):
                         # Large fonts need a longer branch, still with the same
                         # eighteen-pixel arrow gap and unindented requirements.
@@ -70687,6 +70828,8 @@ class Panels:
             "queued": Palette.muted,
             "waiting": Palette.muted2,
             "running": Palette.accent,
+            "inferencing": Palette.accent,
+            "using tools": Palette.accent2,
             "inference": Palette.accent,
             "stalled": Palette.warn,
             "retrying": Palette.warn,
@@ -80528,6 +80671,7 @@ class Panels:
         *,
         center_text: str = "",
         center_tooltip: str = "",
+        center_subtext: str = "",
     ) -> None:
         """Draw a continuous triangle-mesh annulus and a centered metric label."""
         size = max(24, min(rect.w, rect.h))
@@ -80538,14 +80682,19 @@ class Panels:
         if center_text:
             radius = max(10, size // 2 - 6)
             center_rect = Rect(cx - radius + 6, cy - self.f.line_h // 2, max(1, (radius - 6) * 2), self.f.line_h + 2)
-            self.widgets.clipped_text(center_rect, center_text, Palette.muted, align="center", tooltip=center_tooltip or center_text)
+            if center_subtext:
+                center_rect = Rect(center_rect.x, cy - self.f.line_h, center_rect.w, self.f.line_h + 2)
+            self.widgets.clipped_text(center_rect, center_text, Palette.text, align="center", tooltip=center_tooltip or center_text)
+            if center_subtext:
+                self.widgets.clipped_text(Rect(center_rect.x, cy + 2, center_rect.w, self.f.line_h + 2),
+                                          center_subtext, Palette.muted, align="center", tooltip=center_tooltip)
 
     def _draw_agent_metric_card(self, rect: Rect, title: str) -> Rect:
         self.r.draw_card(rect, radius=16, fill=Palette.panel)
         self.r.draw_round_outline(rect, 16, theme_alpha(Palette.border, 210))
         inner = rect.inset(14)
         self.r.draw_text_run_font(
-            getattr(self.widgets, "bold_font", self.f), str(title).upper(),
+            getattr(self.widgets, "bold_font", self.f), (str(title) + (" (" + str(getattr(self, "_dashboard_metric_window", "all time")) + ")" if title in {"Task outcomes", "Token usage"} else "")).upper(),
             inner.x, inner.y, Palette.white,
         )
         return Rect(inner.x, inner.y + self.f.line_h + 7, inner.w, max(1, inner.h - self.f.line_h - 7))
@@ -81409,6 +81558,127 @@ class Panels:
             )
         return handled
 
+    @staticmethod
+    def _dashboard_record_cost(rec: dict[str, Any]) -> dict[str, Any]:
+        breakdown = rec.get("chat_cost_breakdown")
+        if str(rec.get("task_kind") or rec.get("task_type") or "").lower() == "chat" and isinstance(breakdown, dict):
+            return breakdown.get("total") or {}
+        return rec.get("token_cost") or {}
+
+    @staticmethod
+    def _dashboard_status(rec: dict[str, Any]) -> str:
+        status = str(rec.get("display_status") or rec.get("state") or "waiting").lower()
+        return {"inferencing": "running", "inference": "running", "tool": "using tools",
+                "complete": "completed"}.get(status, status)
+
+    def _filter_dashboard_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        query = self.state.dashboard_search.strip().casefold()
+        result = []
+        for rec in records:
+            status = self._dashboard_status(rec)
+            priority = "Pinned" if rec.get("prioritized") else "Queued" if rec.get("priority") else "Not queued"
+            identity = str(rec.get("display_id") or (rec.get("metadata") or {}).get("display_id") or "")
+            if query and query not in (str(rec.get("title") or rec.get("description") or "") + " " + identity + " " + str(rec.get("task_id") or "")).casefold():
+                continue
+            if self.state.dashboard_status != "All" and status != self.state.dashboard_status.lower():
+                continue
+            if self.state.dashboard_type != "All" and rec.get("task_type") != self.state.dashboard_type:
+                continue
+            if self.state.dashboard_endpoint != "All" and str(rec.get("endpoint_name") or "Unassigned") != self.state.dashboard_endpoint:
+                continue
+            if self.state.dashboard_priority != "All" and priority != self.state.dashboard_priority:
+                continue
+            if self.state.dashboard_with_cost and float(self._dashboard_record_cost(rec).get("total_usd") or 0) <= 0:
+                continue
+            if self.state.dashboard_attention and status not in {"failed", "stalled", "waiting", "paused", "pausing", "waiting for input"}:
+                continue
+            result.append(rec)
+        return result
+
+    def _draw_dashboard_filters(self, rect: Rect, records: list[dict[str, Any]]) -> int:
+        """Wrap controls using the same measured rectangles for drawing and input."""
+        h = max(34, self.f.line_h + 12)
+        x, y = rect.x + 12, rect.y + 8
+        right = rect.x + rect.w - 12
+        def place(width: int) -> Rect:
+            nonlocal x, y
+            width = min(width, max(1, rect.w - 24))
+            if x + width > right and x > rect.x + 12:
+                x, y = rect.x + 12, y + h + 8
+            box = Rect(x, y, width, h)
+            x += width + 10
+            return box
+        self.state.dashboard_search = self.widgets.text_input(
+            "dashboard:search", place(270), self.state.dashboard_search, "Search tasks…",
+            tooltip="Search title or numeric / full Task ID")
+        filters = [
+            ("status", "Status", ["All", "Running", "Queued", "Using tools", "Completed", "Failed", "Cancelled", "Paused", "Pausing", "Stalled", "Waiting", "Waiting for input"], 148),
+            ("type", "Type", ["All", "Chat", "Agent", "Image"], 128),
+            ("endpoint", "Endpoint", ["All"] + sorted({str(r.get("endpoint_name") or "Unassigned") for r in records} - {"All"}), 190),
+            ("priority", "Priority", ["All", "Pinned", "Queued", "Not queued"], 160),
+        ]
+        for key, label, options, width in filters:
+            value = getattr(self.state, "dashboard_" + key)
+            # Keep a selected endpoint visible even when it has no matching rows.
+            if value not in options:
+                options.append(value)
+            labels = [label + ": " + option for option in options]
+            selected = self.widgets.dropdown("dashboard:filter:" + key, place(max(width, min(360, self.widgets._text_width(label + ": " + value) + 54))), label + ": " + value, labels)
+            setattr(self.state, "dashboard_" + key, selected[len(label) + 2:])
+        for key, label, tip in [
+            ("with_cost", "With Cost", "Only tasks with positive recorded cost; unknown / unpriced usage is not a zero-dollar charge."),
+            ("attention", "Needs Attention", "Failed, stalled, paused / pausing, or waiting for input / work.")]:
+            value = self.widgets.toggle("dashboard:filter:" + key, place(self.widgets._text_width(label) + 76),
+                                        label, getattr(self.state, "dashboard_" + key), tooltip=tip)
+            setattr(self.state, "dashboard_" + key, value)
+        if self.widgets.button("dashboard:clear", place(max(76, self.widgets._text_width("Clear") + 28)), "Clear", tooltip="Reset all task filters"):
+            self.state.dashboard_search = ""
+            for key in ("status", "type", "endpoint", "priority"):
+                setattr(self.state, "dashboard_" + key, "All")
+            self.state.dashboard_with_cost = self.state.dashboard_attention = False
+        return y + h + 8 - rect.y
+
+    @staticmethod
+    def _dashboard_task_columns(width: int, measure: Callable[[str], int] | None = None) -> list[dict[str, Any]]:
+        # The default table matches the mockup. Throughput remains in row details.
+        definitions = [
+            ("display_id", "ID", 70, "right"), ("endpoint", "Endpoint", 180, "left"),
+            ("priority", "Priority" if width >= 1450 else "Pri.", 86, "right"), ("task_type", "Type", 80, "left"),
+            ("title", "Title", max(220, width - 1380), "left"),
+            ("status", "Status", 140, "left"), ("started", "Started", 175, "left"),
+            ("duration", "Duration", 120, "right"), ("input_tokens", "Input", 134, "right"),
+            ("output_tokens", "Output", 125, "right"), ("cost", "Cost", 105, "right"),
+        ]
+        if measure is not None:
+            samples = {"display_id": "9999", "task_type": "Agent", "status": "Complete",
+                       "started": "00/00/00 00:00:00", "duration": "00:00:00",
+                       "input_tokens": "99,999,999", "output_tokens": "9,999,999", "cost": "$999.99"}
+            measured = []
+            for key, title, preferred, align in definitions:
+                if key == "priority" and measure(title.upper()) + 18 > preferred:
+                    title = "Pri."
+                required = max(measure(title.upper()) + 18,
+                               measure(samples.get(key, title)) + (44 if key == "status" else 18))
+                measured.append((key, title, max(preferred, required), align))
+            definitions = measured
+        numeric = {"display_id", "priority", "started", "duration", "input_tokens", "output_tokens", "cost"}
+        return [{"key": key, "title": title, "width": width, "min_width": width if key != "title" else 220,
+                    "align": align, "sortable": False, **({"sort_type": "number"} if key in numeric else {})}
+                   for key, title, width, align in definitions]
+
+    def _draw_dashboard_totals(self, rect: Rect, records: list[dict[str, Any]], total: int) -> None:
+        inputs = sum(int(r.get("input_tokens") or 0) for r in records)
+        outputs = sum(int(r.get("output_tokens") or 0) for r in records)
+        costs = sum_token_costs(self._dashboard_record_cost(r) for r in records)
+        count = f"Showing {len(records):,} of {total:,} tasks"
+        totals = f"Totals (shown):   Input  {inputs:,}    Output  {outputs:,}    Cost  {token_cost_label(costs)}"
+        if costs.get("unpriced_requests"):
+            totals += "  • includes unpriced usage"
+        count_w = self.widgets._text_width(count) + 20
+        self.widgets.clipped_text(Rect(rect.x + 14, rect.y, count_w, rect.h), count, Palette.muted)
+        self.widgets.clipped_text(Rect(rect.x + count_w + 24, rect.y, max(1, rect.w - count_w - 38), rect.h),
+                                  totals, Palette.text, align="right", tooltip=token_cost_tooltip(costs))
+
     def _dashboard_live_task_row(self, rec: dict[str, Any]) -> dict[str, Any] | None:
         task_id = str(rec.get("task_id") or "")
         if not task_id:
@@ -81434,14 +81704,16 @@ class Panels:
         return {
             "id": task_id,
             "display_id": {"label": str(display_id), "sort": display_id},
-            "endpoint": str(rec.get("endpoint_name") or "Unassigned"),
+            "endpoint": {"label": str(rec.get("endpoint_name") or "Unassigned"),
+                         "icon": "endpoint", "icon_key": str(rec.get("endpoint_name") or "Unassigned")},
             "priority": {
                 "label": "*" if prioritized else (str(priority) if priority else "—"),
                 "sort": -1 if prioritized else (priority if priority else 1_000_000),
             },
             "task_type": task_type,
             "title": str(rec.get("title") or rec.get("description") or "LLM Task"),
-            "status": {"label": status.title(), "sort": status, "color": self._agent_status_color(status)},
+            "status": {"label": {"inferencing": "Running", "completed": "Complete"}.get(status.lower(), status.title()),
+                       "sort": status, "color": self._agent_status_color(status), "icon": "task:" + self._dashboard_status(rec)},
             "started": {
                 "label": format_dashboard_start_time(rec.get("created_at")),
                 "sort": _iso_timestamp_epoch(rec.get("created_at")) or 0.0,
@@ -81614,10 +81886,21 @@ class Panels:
             return {"status": "loading"}
         return dict(entry["snapshot"])
 
+    def _dashboard_summary_min_width(self) -> int:
+        # Fit headings, the status labels, and a readable ring + outcome legend
+        # before choosing the four-column layout, including larger UI fonts.
+        ring_min = max(88, 2 * self.f.line_h + 22)
+        return max(
+            math.ceil((self.widgets._text_width("TASK STATUS") + 40) / .65),
+            self.widgets._text_width("TASK OUTCOMES (ALL TIME)") + 28,
+            self.widgets._text_width("100% Complete (999)") + ring_min + 68,
+            math.ceil((self.widgets._text_width("TOKEN USAGE (ALL TIME)") + 28) / 1.18),
+        )
+
     @staticmethod
     def _dashboard_summary_card_rects(rect: Rect, card_h: int, *, min_standard_width: int = 0) -> list[Rect]:
         gap = 12
-        groups = [(.5, 1., 1.5, 2.)] if rect.w >= max(1450, 5 * min_standard_width + 36) else ([(.5, 1.), (1.5, 2.)] if rect.w >= 760 else [(1.,)] * 4)
+        groups = [(.65, 1., 1.18, 2.17)] if rect.w >= max(1450, 5 * min_standard_width + 36) else ([(.8, 1.2), (1., 1.4)] if rect.w >= 760 else [(1.,)] * 4)
         cards: list[Rect] = []
         for row, weights in enumerate(groups):
             usable = max(1, rect.w - gap * (len(weights) - 1))
@@ -81629,35 +81912,66 @@ class Panels:
                 used = right
         return cards
 
+    @staticmethod
+    def _dashboard_provider_color(key: str, index: int = 0) -> Color:
+        name = key.casefold()
+        if "openai" in name:
+            return Palette.ok
+        if "anthropic" in name:
+            return Palette.danger
+        if "deepseek" in name:
+            return Palette.accent
+        return (Palette.accent, Palette.accent2, Palette.ok, Palette.warn, Palette.danger)[index % 5]
+
     def _draw_dashboard_cost_card(self, rect: Rect, costs: dict[str, Any]) -> None:
         body = self._draw_agent_metric_card(rect, "Costs")
         period = self.state.dashboard_cost_period
-        control_w = min(max(128, max(self.widgets._text_width(label) for label in DASHBOARD_COST_PERIODS) + 54), max(80, rect.w // 2))
+        control_w = min(max(150, self.widgets._text_width(period) + 54), max(80, rect.w // 2))
         control = Rect(rect.x + rect.w - control_w - 14, rect.y + 8, control_w, max(28, self.f.line_h + 8))
         selected = self.widgets.dropdown("dashboard:cost-period", control, period, list(DASHBOARD_COST_PERIODS),
-            tooltip="Rolling usage window. One year is the last 365 days. Costs are in USD.")
+            tooltip="Rolling usage window, compared with the preceding equal-length period. Costs in USD.")
         if selected != period:
             self.state.dashboard_cost_period = selected
             self.state.scroll["dashboard:cost-bars"] = 0
             costs = {"status": "loading"}
             period = selected
         line_h = max(23, self.f.line_h + 3)
-        total_y = max(body.y + 3, control.y + control.h + 6)
-        hint = token_cost_tooltip(costs)
-        if costs.get("error"):
-            hint += "\n" + str(costs["error"])
+        top = max(body.y + 4, control.y + control.h + 4)
         status = costs.get("status", "ready")
-        label = ("Loading costs..." if status == "loading" else "Costs unavailable" if status == "error"
-                 else "Total " + token_cost_label(costs) + (" !" if costs.get("error") else ""))
-        self.widgets.clipped_text(Rect(body.x, total_y, body.w, line_h), label, Palette.text, tooltip=hint)
-        chart = Rect(body.x, total_y + line_h + 8, body.w, max(1, body.y + body.h - total_y - line_h - 10))
-        ranked = costs.get("endpoints", costs.get("top_endpoints", [])) or []
-        if not ranked:
-            if status == "ready":
-                self.widgets.clipped_text(Rect(chart.x, chart.y, chart.w, line_h),
-                                          "No usage in this period", Palette.muted2)
+        hint = token_cost_tooltip(costs) + ("\n" + str(costs["error"]) if costs.get("error") else "")
+        if status != "ready":
+            self.widgets.clipped_text(Rect(body.x, top, body.w, line_h),
+                "Loading costs..." if status == "loading" else "Costs unavailable", Palette.muted, tooltip=hint)
             return
-        row_h = max(33, line_h + 11)
+        total = max(0., float(costs.get("total_usd") or 0))
+        # Side-by-side breakdown and seven-bin history, just like the mockup.
+        show_trend = body.w >= 580 and bool(costs.get("trend"))
+        breakdown_w = int(body.w * .53) if show_trend else body.w
+        label = token_cost_label(costs) + (" !" if costs.get("error") else "")
+        self.r.draw_text_run_font(getattr(self.widgets, "bold_font", self.f), label, body.x, top, Palette.white)
+        label_w = self.widgets._text_width(label) + 20
+        change = costs.get("change_percent")
+        change_label = (f"{'↓' if change < 0 else '↑' if change > 0 else '—'} {abs(change):.0f}% vs prior period"
+                        if change is not None else "No prior spend")
+        self.widgets.clipped_text(Rect(body.x + label_w, top, max(1, breakdown_w - label_w), line_h),
+            change_label, Palette.ok if change is not None and change <= 0 else Palette.warn, tooltip=hint)
+        self.widgets._queue_tooltip("dashboard:cost-total", Rect(body.x, top, breakdown_w, line_h), hint)
+        ranked = costs.get("providers", costs.get("endpoints", costs.get("top_endpoints", []))) or []
+        stack = Rect(body.x, top + line_h + 7, breakdown_w, 10)
+        self.r.draw_round_rect(stack, 5, Palette.panel3)
+        used = 0
+        for index, provider in enumerate(ranked):
+            amount = max(0., float(provider.get("total_usd") or 0))
+            width = round(stack.w * amount / total) if total else 0
+            width = min(width, stack.w - used)
+            if width > 0:
+                self.r.draw_rect(Rect(stack.x + used, stack.y, width, stack.h),
+                                  self._dashboard_provider_color(str(provider.get("endpoint_type") or provider.get("label") or ""), index))
+                used += width
+        chart = Rect(body.x, stack.y + stack.h + 6, breakdown_w, max(1, body.y + body.h - stack.y - stack.h - 6))
+        if not ranked:
+            self.widgets.clipped_text(chart, "No usage in this period", Palette.muted2)
+        row_h = max(27, line_h + 2)
         total_h = len(ranked) * row_h
         wid = "dashboard:cost-bars"
         scroll = int(self.state.scroll.get(wid, 0))
@@ -81670,45 +81984,72 @@ class Panels:
         scroll = int(clamp(scroll, 0, max(0, total_h - chart.h)))
         self.state.scroll[wid] = scroll
         available_w = max(1, chart.w - (16 if total_h > chart.h else 0))
-        maximum = max(float(row.get("total_usd") or 0) for row in ranked)
         self.r.push_clip(chart)
         try:
-            for index, endpoint in enumerate(ranked):
-                row = Rect(chart.x, chart.y + index * row_h - scroll, available_w, row_h - 3)
+            for index, provider in enumerate(ranked):
+                row = Rect(chart.x, chart.y + index * row_h - scroll, available_w, row_h)
                 if row.y + row.h <= chart.y or row.y >= chart.y + chart.h:
                     continue
-                value = token_cost_label(endpoint)
-                cost_w = min(row.w // 3, max(66, self.widgets._text_width(value) + 8))
-                track = Rect(row.x, row.y, max(1, row.w - cost_w - 10), row.h)
-                self.r.draw_round_rect(track, 5, Palette.panel2)
-                amount = max(0., float(endpoint.get("total_usd") or 0))
-                bar_w = int(track.w * amount / maximum) if maximum else 0
-                if bar_w:
-                    color_key = str(endpoint.get("endpoint_type") or endpoint.get("label") or "")
-                    color = (Palette.accent, Palette.accent2)[hashlib.sha256(color_key.encode()).digest()[0] % 2]
-                    self.r.draw_round_rect(Rect(track.x, track.y, max(2, bar_w), track.h), 5, theme_alpha(color, 85))
-                    self.r.draw_round_rect(Rect(track.x, track.y + 4, 3, max(1, track.h - 8)), 1, color)
-                self.widgets.clipped_text(Rect(track.x + 10, track.y, max(1, track.w - 18), track.h),
-                    str(endpoint.get("label") or "Unknown endpoint"), Palette.text)
-                self.widgets.clipped_text(Rect(row.x + row.w - cost_w, row.y, cost_w, row.h),
-                    value, Palette.text, align="right")
+                color = self._dashboard_provider_color(str(provider.get("endpoint_type") or provider.get("label") or ""), index)
+                self.r.draw_round_rect(Rect(row.x + 2, row.y + (row.h - 8) // 2, 8, 8), 4, color)
+                share = max(0., float(provider.get("total_usd") or 0)) * 100 / total if total else 0
+                value = token_cost_label(provider) + f" ({share:.0f}%)"
+                value_w = self.widgets._text_width(value) + 8
+                self.widgets.clipped_text(Rect(row.x + 18, row.y, max(1, row.w - value_w - 22), row.h),
+                                          str(provider.get("label") or "Unknown provider"), Palette.text)
+                self.widgets.clipped_text(Rect(row.x + row.w - value_w, row.y, value_w, row.h), value, Palette.text, align="right")
                 hover = Rect(row.x, max(row.y, chart.y), row.w,
-                             max(0, min(row.y + row.h, chart.y + chart.h) - max(row.y, chart.y)))
-                self.widgets._queue_tooltip(wid + ":" + str(endpoint.get("endpoint_type") or index), hover,
-                                           endpoint_cost_bar_tooltip(endpoint, period))
+                    max(0, min(row.y + row.h, chart.y + chart.h) - max(row.y, chart.y)))
+                self.widgets._queue_tooltip(wid + ":" + str(provider.get("endpoint_type") or index), hover,
+                                           endpoint_cost_bar_tooltip(provider, period))
         finally:
             self.r.pop_clip()
         self.widgets._scrollbar_draw(wid, chart, scroll, total_h)
+        if show_trend:
+            history = Rect(body.x + breakdown_w + 24, top, max(1, body.w - breakdown_w - 24), body.y + body.h - top)
+            self._draw_dashboard_cost_trend(history, costs)
+
+    def _draw_dashboard_cost_trend(self, rect: Rect, costs: dict[str, Any]) -> None:
+        trend = list(costs.get("trend") or [])
+        if not trend:
+            return
+        line_h = max(20, self.f.line_h)
+        title = "Last 7 days" if int(costs.get("trend_seconds") or 0) == 7 * 86400 else "Selected period"
+        self.widgets.clipped_text(Rect(rect.x, rect.y, rect.w, line_h), title, Palette.muted2)
+        axis_w = max(44, self.widgets._text_width("$100") + 6)
+        plot = Rect(rect.x + axis_w, rect.y + line_h + 5, max(1, rect.w - axis_w), max(16, rect.h - 2 * line_h - 8))
+        maximum = max(float(row.get("total_usd") or 0) for row in trend)
+        ceiling = max(1., math.ceil(maximum))
+        for fraction in (0., .5, 1.):
+            y = plot.y + round(plot.h * (1 - fraction))
+            self.r.draw_line(plot.x, y, plot.x + plot.w, y, theme_alpha(Palette.border, 180))
+            self.widgets.clipped_text(Rect(rect.x, y - line_h // 2, axis_w - 6, line_h), f"${ceiling * fraction:g}", Palette.muted2, align="right")
+        step = plot.w / len(trend)
+        for i, row in enumerate(trend):
+            value = max(0., float(row.get("total_usd") or 0))
+            h = round(plot.h * value / ceiling)
+            bar = Rect(plot.x + round(i * step) + 4, plot.y + plot.h - h, max(1, round(step) - 8), max(1, h))
+            if value:
+                self.r.draw_round_rect(bar, 2, Palette.accent if i < len(trend) - 1 else Palette.accent2)
+            stamp = datetime.fromtimestamp(float(row["end"]), timezone.utc).astimezone()
+            label = stamp.strftime("%b %d").replace(" 0", " ")
+            dense = step < self.widgets._text_width("Nov 28") + 4
+            if not dense or i in {0, len(trend) // 2, len(trend) - 1}:
+                label_w = min(plot.w, max(round(step), self.widgets._text_width(label) + 6))
+                label_x = int(clamp(plot.x + round((i + .5) * step) - label_w // 2, plot.x, plot.x + plot.w - label_w))
+                self.widgets.clipped_text(Rect(label_x, plot.y + plot.h + 3, label_w, line_h),
+                                          label, Palette.muted2, align="center")
+            self.widgets._queue_tooltip("dashboard:cost-trend:" + str(i),
+                Rect(plot.x + round(i * step), plot.y, max(1, round(step)), plot.h),
+                f"{format_display_datetime(datetime.fromtimestamp(float(row['start']), timezone.utc).isoformat())} – {format_display_datetime(datetime.fromtimestamp(float(row['end']), timezone.utc).isoformat())}\nCost: {token_cost_label(row)}")
 
     def _draw_agent_summary_cards(self, rect: Rect, stats: dict[str, Any]) -> int:
-        """Four cards, weighted 0.5 : 1 : 1.5 : 2 on a full-width Dashboard."""
+        """Compact status, outcomes, token/cache and cost cards."""
         gap = 12
-        # Keep the pre-bar-chart height. Width weights must not enlarge cards
-        # vertically; additional cost bars use the existing chart scrollbar.
-        card_h = max(232, self.f.line_h + 64 + 5 * max(27, self.f.line_h + 3),
-                     self.f.line_h + 60 + 6 * max(23, self.f.line_h + 1))
+        self._dashboard_metric_window = str(stats.get("window_label") or "all time")
+        card_h = max(206, self.f.line_h + 56 + 4 * max(29, self.f.line_h + 6))
         cards = self._dashboard_summary_card_rects(rect, card_h,
-            min_standard_width=2 * (max(self.widgets._text_width("TASK STATUS"), self.widgets._text_width("0 Inferencing")) + 32))
+            min_standard_width=self._dashboard_summary_min_width())
         row_count = len({card.y for card in cards})
 
         counts = stats.get("counts") if isinstance(stats.get("counts"), dict) else {}
@@ -81721,7 +82062,10 @@ class Panels:
             first_y = body.y + 8
             for index, (text, _color, tooltip) in enumerate(lines):
                 line_rect = Rect(body.x, first_y + index * (line_h + line_gap), body.w, line_h)
-                self.widgets.clipped_text(line_rect, text, Palette.muted, tooltip=tooltip or text)
+                self.widgets._draw_dashboard_cell_icon(Rect(line_rect.x, line_rect.y + (line_h - 18) // 2, 18, 18),
+                    "task:" + ("running", "queued", "using tools", "paused")[index], _color)
+                self.widgets.clipped_text(Rect(line_rect.x + 28, line_rect.y, max(1, line_rect.w - 28), line_rect.h),
+                                          text, Palette.text, tooltip=tooltip or text)
 
         def draw_bullet_lines(body: Rect, x: int, width: int, lines: list[tuple[str, Color, str]]) -> None:
             first_y = body.y + 8
@@ -81746,12 +82090,13 @@ class Panels:
                     offset += line_h + line_gap
 
         def ring_layout(body: Rect) -> tuple[Rect, int, int]:
-            size = max(88, min(body.h - 8, int((min(cards[1].w, cards[2].w) - 28) * 0.43)))
+            minimum = max(88, 2 * self.f.line_h + 22)
+            size = max(minimum, min(body.h - 8, int((min(cards[1].w, cards[2].w) - 28) * 0.43)))
             # At larger text sizes preserve the outcome counts, not an oversized
             # donut. Heights and the explicit 24-pixel legend gap stay fixed.
             legend_width = max(self.widgets._text_width(text) for text, _color, _tip in outcome_lines)
             common_body_width = min(cards[1].w, cards[2].w) - 28
-            size = min(size, max(88, common_body_width - 24 - 16 - legend_width))
+            size = min(size, max(minimum, common_body_width - 24 - 16 - legend_width))
             ring = Rect(body.x, body.y + max(0, (body.h - size) // 2), size, size)
             legend_x = ring.x + ring.w + 24
             return ring, legend_x, max(1, body.x + body.w - legend_x)
@@ -81773,7 +82118,7 @@ class Panels:
         status_body = self._draw_agent_metric_card(cards[0], "Task status")
         draw_plain_lines(status_body, [
             (
-                f"{running:,} Inferencing" + (f" ({stalled:,} stalled)" if stalled else ""),
+                f"{running:,} Running" + (f" ({stalled:,} stalled)" if stalled else ""),
                 Palette.accent,
                 f"Tasks actively using an endpoint inference slot; stalled means no provider stream progress for at least {stall_minutes_label} minutes",
             ),
@@ -81797,7 +82142,8 @@ class Panels:
         self._draw_ring_chart(
             ring, [(completed, Palette.ok), (failed, Palette.danger), (cancelled, Palette.warn)],
             center_text=f"{float(percentages.get('completed', 0.0) or 0.0):.0f}%",
-            center_tooltip=f"Completion rate across {terminal_tasks:,} terminal Tasks",
+            center_tooltip=f"Completion rate across {terminal_tasks:,} terminal Tasks ({self._dashboard_metric_window})",
+            center_subtext=f"{terminal_tasks:,} tasks",
         )
         draw_bullet_lines(outcomes_body, legend_x, legend_w, outcome_lines)
 
@@ -81807,16 +82153,29 @@ class Panels:
         tokens_body = self._draw_agent_metric_card(cards[2], "Token usage")
         token_ring, token_x, token_w = ring_layout(tokens_body)
         self._draw_ring_chart(
-            token_ring, [(input_tokens, Palette.accent), (output_tokens, Palette.accent2)],
+            token_ring, [(input_tokens, Palette.accent), (output_tokens, Palette.ok)],
             center_text=self._format_agent_metric_value(total_tokens),
-            center_tooltip=f"{total_tokens:,} total tokens across Chat, Agent, Image, and System Tasks",
+            center_tooltip=f"{total_tokens:,} total tokens across Chat, Agent, Image, and System Tasks ({self._dashboard_metric_window})",
+            center_subtext="tokens",
         )
+        def token_label(label: str, value: int) -> str:
+            share = value * 100 / total_tokens if total_tokens else 0
+            return f"{label} {self._format_agent_metric_value(value)} ({share:.1f}%)"
+        cached = max(0, int(stats.get("cached_input_tokens") or 0))
+        known_cache = cached_input_label(stats) != "N/A"
         draw_bullet_lines(tokens_body, token_x, token_w, [
-            (f"Input {input_tokens:,}", Palette.accent, cached_input_tooltip(stats)),
-            ("Cached Input: " + cached_input_label(stats), Palette.accent, cached_input_tooltip(stats)),
-            (f"Output {output_tokens:,}", Palette.accent2, f"Output tokens: {output_tokens:,}"),
-            (f"Total {total_tokens:,}", Palette.text, f"Total tokens: {total_tokens:,}"),
+            (token_label("Input", input_tokens), Palette.accent, f"Input: {input_tokens:,} tokens (includes cached input)"),
+            (token_label("Cached Input:", cached) if known_cache else "Cached Input: N/A", Palette.accent2, cached_input_tooltip(stats)),
+            (token_label("Output", output_tokens), Palette.ok, f"Output: {output_tokens:,} tokens"),
         ])
+        rate = cached * 100 / input_tokens if input_tokens and known_cache else 0
+        partial = int(stats.get("cache_reported_rounds") or 0) < int(stats.get("cache_total_rounds") or 0)
+        badge_text = f"Cache hit rate: {rate:.0f}%" + ("*" if partial else "") if known_cache else "Cache hit rate: N/A"
+        badge = Rect(token_x, tokens_body.y + 8 + 3 * (line_h + line_gap), token_w, line_h)
+        self.r.draw_round_rect(badge, 8, theme_alpha(Palette.ok, 25))
+        self.r.draw_round_outline(badge, 8, theme_alpha(Palette.ok, 140))
+        self.widgets.clipped_text(Rect(badge.x + 8, badge.y, max(1, badge.w - 16), badge.h), badge_text,
+                                  Palette.text, tooltip=cached_input_tooltip(stats))
 
         self._draw_dashboard_cost_card(cards[3], stats.get("costs", stats.get("costs_24h", {})) or {})
         return row_count * card_h + (row_count - 1) * gap
@@ -82368,6 +82727,41 @@ class Panels:
         return handled
 
     def draw_agents_panel(self, rect: Rect) -> None:
+        """Scrollable dashboard: short windows never collapse the task tables."""
+        card_h = max(206, self.f.line_h + 56 + 4 * max(29, self.f.line_h + 6))
+        min_width = self._dashboard_summary_min_width()
+        cards = self._dashboard_summary_card_rects(Rect(rect.x, rect.y, max(1, rect.w - 18), rect.h), card_h, min_standard_width=min_width)
+        rows = len({card.y for card in cards})
+        title_h = max(30, getattr(self.widgets, "bold_font", self.f).line_h + 8)
+        total_h = max(rect.h, rows * card_h + (rows - 1) * 12 + title_h * 2 + 620)
+        viewport = Rect(rect.x, rect.y, max(1, rect.w - (18 if total_h > rect.h else 0)), rect.h)
+        wid = "dashboard:page"
+        scroll = int(clamp(self.state.scroll.get(wid, 0), 0, total_h - rect.h))
+        scroll = self.widgets._scrollbar_input(wid, rect, scroll, total_h)
+        consumed = self.state.input.mouse_consumed
+        if not point_in_rect(self.state.input.mouse_x, self.state.input.mouse_y, viewport):
+            self.state.input.mouse_consumed = True
+        self.r.push_clip(viewport)
+        try:
+            self._draw_dashboard_content(Rect(viewport.x, viewport.y - scroll, viewport.w, total_h))
+        finally:
+            self.r.pop_clip()
+            if not point_in_rect(self.state.input.mouse_x, self.state.input.mouse_y, viewport):
+                self.state.input.mouse_consumed = consumed
+        if total_h > rect.h and self.widgets._can_receive_pointer(wid) and point_in_rect(self.state.input.mouse_x, self.state.input.mouse_y, viewport):
+            if self.state.input.wheel_y:
+                scroll -= self.state.input.wheel_y * max(36, self.f.line_h * 3)
+                self.state.input.mouse_consumed = True
+        if not self.state.active_widget and not self.widgets._input_blocked(wid):
+            if self.state.input.key_page_down:
+                scroll += rect.h * .8
+            elif self.state.input.key_page_up:
+                scroll -= rect.h * .8
+        scroll = int(clamp(scroll, 0, total_h - rect.h))
+        self.state.scroll[wid] = scroll
+        self.widgets._scrollbar_draw(wid, rect, scroll, total_h)
+
+    def _draw_dashboard_content(self, rect: Rect) -> None:
         """Draw Dashboard metrics plus separate Chat/Agent and System Task tables."""
         self.r.draw_rect(rect, Palette.bg)
         outer = rect
@@ -82381,6 +82775,14 @@ class Panels:
 
         stats = dict(getattr(self.state, "llm_task_stats_cache", {}) or self.services.monitor.statistics(include_costs=False))
         stats["costs"] = self._dashboard_cost_statistics()
+        recent = stats["costs"].get("dashboard_24h")
+        if isinstance(recent, dict):
+            counts = dict(stats.get("counts") or {})
+            counts.update({key: int((recent.get("counts") or {}).get(key) or 0)
+                           for key in ("completed", "failed", "cancelled")})
+            stats.update({key: value for key, value in recent.items() if key != "counts"})
+            stats["counts"] = counts
+            stats["window_label"] = "24h"
         summary_h = self._draw_agent_summary_cards(Rect(outer.x, outer.y, outer.w, outer.h), stats)
         title_font = getattr(self.widgets, "bold_font", self.f)
         title_h = max(30, title_font.line_h + 8)
@@ -82414,53 +82816,17 @@ class Panels:
             rec for rec in cached_records
             if str(rec.get("task_type") or "System") == "System"
         ]
-        task_rows = [row for row in (self._dashboard_live_task_row(rec) for rec in chat_agent_records) if row is not None]
+        self.r.draw_card(chat_table_rect, radius=14, fill=Palette.panel)
+        self.r.draw_round_outline(chat_table_rect, 14, theme_alpha(Palette.border, 210))
+        filter_h = self._draw_dashboard_filters(chat_table_rect, chat_agent_records)
+        filtered_records = self._filter_dashboard_records(chat_agent_records)
+        footer_h = max(32, self.f.line_h + 10)
+        totals_rect = Rect(chat_table_rect.x, chat_table_rect.y + chat_table_rect.h - footer_h, chat_table_rect.w, footer_h)
+        chat_table_rect = Rect(chat_table_rect.x, chat_table_rect.y + filter_h, chat_table_rect.w,
+                               max(1, chat_table_rect.h - filter_h - footer_h))
+        task_rows = [row for row in (self._dashboard_live_task_row(rec) for rec in filtered_records) if row is not None]
 
-        fixed_columns = [
-            ("display_id", "ID", 72, 72, "right"),
-            ("endpoint", "Endpoint", 220, 150, None),
-            ("priority", "Priority", 84, 70, "right"),
-            ("task_type", "Type", 84, 72, None),
-            ("status", "Status", 144, 123, None),
-            ("started", "Started", 227, 175, None),
-            ("duration", "Duration", 135, 135, "right"),
-            ("input_tokens", "Input", 150, 150, "right"),
-            ("output_tokens", "Output", 150, 150, "right"),
-            ("input_tps", "IN t/s", 110, 110, "right"),
-            ("generation_tps", "OUT t/s", 110, 110, "right"),
-            ("cost", "Cost", 140, 140, "right"),
-        ]
-        preferred_fixed = sum(row[2] for row in fixed_columns)
-        minimum_fixed = sum(row[3] for row in fixed_columns)
-        scrollbar_and_borders = 24
-        title_min = 220
-        usable_w = max(1, chat_table_rect.w - scrollbar_and_borders)
-        if usable_w >= preferred_fixed + title_min:
-            widths = {key: preferred for key, _title, preferred, _minimum, _align in fixed_columns}
-        else:
-            available_fixed = max(minimum_fixed, usable_w - title_min)
-            span = max(1, preferred_fixed - minimum_fixed)
-            fraction = clamp((available_fixed - minimum_fixed) / span, 0.0, 1.0)
-            widths = {
-                key: int(round(minimum + (preferred - minimum) * fraction))
-                for key, _title, preferred, minimum, _align in fixed_columns
-            }
-        title_w = max(title_min, usable_w - sum(widths.values()))
-        columns = [
-            {"key": "display_id", "title": "ID", "width": widths["display_id"], "min_width": 72, "fixed_width": 72, "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "endpoint", "title": "Endpoint", "width": widths["endpoint"], "min_width": 150, "sortable": False},
-            {"key": "priority", "title": "Priority", "width": widths["priority"], "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "task_type", "title": "Type", "width": widths["task_type"], "sortable": False},
-            {"key": "title", "title": "Title", "width": title_w, "min_width": title_min, "sortable": False},
-            {"key": "status", "title": "Status", "width": widths["status"], "sortable": False},
-            {"key": "started", "title": "Started", "width": widths["started"], "sort_type": "number", "sortable": False},
-            {"key": "duration", "title": "Duration", "width": 135, "min_width": 135, "fixed_width": 135, "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "input_tokens", "title": "Input", "width": 150, "min_width": 150, "fixed_width": 150, "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "output_tokens", "title": "Output", "width": 150, "min_width": 150, "fixed_width": 150, "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "input_tps", "title": "IN t/s", "width": 110, "min_width": 110, "fixed_width": 110, "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "generation_tps", "title": "OUT t/s", "width": 110, "min_width": 110, "fixed_width": 110, "sort_type": "number", "align": "right", "sortable": False},
-            {"key": "cost", "title": "Cost", "width": 140, "min_width": 140, "fixed_width": 140, "sort_type": "number", "align": "right", "sortable": False},
-        ]
+        columns = self._dashboard_task_columns(chat_table_rect.w, self.widgets._text_width)
         self.state.selected_llm_task_id, action = self.widgets.table_view(
             "dashboard.tasks", chat_table_rect, columns, task_rows,
             self.state.selected_llm_task_id, id_key="id",
@@ -82469,6 +82835,7 @@ class Panels:
         if action:
             task_id, action_name = action
             self._handle_dashboard_task_action(task_id, action_name)
+        self._draw_dashboard_totals(totals_rect, filtered_records, len(chat_agent_records))
 
         self.r.draw_text_run_font(
             title_font, "SYSTEM TASKS", system_title_rect.x + 4,

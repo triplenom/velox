@@ -2062,7 +2062,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('(\"context\", \"CONTEXT\")', nav)
         self.assertIn('draw_text_run_font(brand_font, \"VELOX\"', nav)
         self.assertIn('draw_font = self.bold_font', self._method_source(velox.Widgets, "global_nav_button"))
-        dashboard = self._method_source(velox.Panels, "draw_agents_panel")
+        dashboard = self._method_source(velox.Panels, "_draw_dashboard_content")
         self.assertIn("self.services.monitor.statistics(include_costs=False)", dashboard)
         self.assertIn("_refresh_llm_task_entries", dashboard)
         refresh = self._method_source(velox.Panels, "_refresh_llm_task_entries")
@@ -2070,17 +2070,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn("_draw_agent_summary_cards", dashboard)
         self.assertNotIn("self.services.agents.statistics()", dashboard)
         self.assertNotIn('double_click_action=\"view\"', dashboard)
-        self.assertIn('\"title\": \"Endpoint\"', dashboard)
-        self.assertEqual(dashboard.count('\"title\": \"Endpoint\"'), 1)
-        self.assertNotIn('\"title\": \"Group\"', dashboard)
-        self.assertIn('\"title\": \"Title\"', dashboard)
-        self.assertIn("title_w = max(title_min, usable_w - sum(widths.values()))", dashboard)
         self.assertNotIn("Live per-endpoint inference queues", dashboard)
         self.assertNotIn("No LLM requests recorded", dashboard)
         self.assertNotIn('button(\"dashboard.refresh\"', dashboard)
         self.assertNotIn('\"Show System Tasks\"', dashboard)
         self.assertNotIn('show_system_tasks', dashboard)
-        self.assertIn('(\"status\", \"Status\", 144, 123, None)', dashboard)
         self.assertIn('\"CHAT/AGENT TASKS\"', dashboard)
         self.assertIn('\"SYSTEM TASKS\"', dashboard)
         self.assertIn('_draw_system_tasks_table', dashboard)
@@ -2093,7 +2087,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         summary_cards = self._method_source(velox.Panels, "_draw_agent_summary_cards")
         for label in ("Task status", "Token usage", "Task outcomes"):
             self.assertIn(label, summary_cards)
-        self.assertIn("card_h = max(232,", summary_cards)
+        self.assertIn("card_h = max(206,", summary_cards)
         self.assertNotIn("Avg requirements/list", summary_cards)
         self.assertNotIn("Avg sub-items/list", summary_cards)
         self.assertNotIn("Active time", summary_cards)
@@ -2101,11 +2095,6 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("Generation time", summary_cards)
         self.assertNotIn("total requests", summary_cards)
         self.assertNotIn("Inference rounds", summary_cards)
-        self.assertIn('"fixed_width": 150', dashboard)
-        self.assertIn('"fixed_width": 150', dashboard)
-        self.assertIn('"fixed_width": 135', dashboard)
-        self.assertIn('"fixed_width": 110', dashboard)
-        self.assertNotIn('"fixed_width": 125', dashboard)
         self.assertNotIn('\"key\": \"pause_resume\"', dashboard)
         self.assertNotIn('\"key\": \"cancel\"', dashboard)
 
@@ -2116,6 +2105,11 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         table = self._method_source(velox.Widgets, "table_view")
         self.assertIn('row.get(\"_context_menu\")', table)
         self.assertIn('row.get(\"_tooltip\")', table)
+        columns = velox.Panels._dashboard_task_columns(1920)
+        self.assertEqual([c['title'] for c in columns],
+                         ['ID','Endpoint','Priority','Type','Title','Status','Started','Duration','Input','Output','Cost'])
+        self.assertTrue(all(c['min_width'] > 0 for c in columns))
+        self.assertGreater(next(c['width'] for c in columns if c['key']=='title'),220)
 
     def test_developer_mode_toggle_is_in_developer_settings(self) -> None:
         developer = self._method_source(velox.Panels, "_draw_developer_settings_content")
@@ -4995,18 +4989,13 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("draw_chat_settings_panel", chat_side)
         send_source = self._method_source(velox.Panels, "_send_composer_message")
         self.assertIn('self.state.scroll[\"chat.thread\"] = 10**9', send_source)
-        dashboard = self._method_source(velox.Panels, "draw_agents_panel")
-        self.assertIn('\"title\": \"Endpoint\"', dashboard)
-        self.assertNotIn('\"title\": \"Group\"', dashboard)
+        dashboard = self._method_source(velox.Panels, "_draw_dashboard_content")
         self.assertNotIn('\"key\": \"group\"', dashboard)
-        self.assertEqual(dashboard.count('\"title\": \"Endpoint\"'), 1)
-        self.assertIn('\"title\": \"Title\"', dashboard)
-        self.assertIn("title_w = max(title_min, usable_w - sum(widths.values()))", dashboard)
-        self.assertIn('\"title\": \"Input\"', dashboard)
-        self.assertNotIn('\"title\": \"Cached\"', dashboard)
-        self.assertIn('\"title\": \"Output\"', dashboard)
-        self.assertIn('\"title\": \"IN t/s\"', dashboard)
-        self.assertIn('\"title\": \"OUT t/s\"', dashboard)
+        columns = velox.Panels._dashboard_task_columns(1920)
+        self.assertEqual([c['title'] for c in columns],
+                         ['ID','Endpoint','Priority','Type','Title','Status','Started','Duration','Input','Output','Cost'])
+        self.assertTrue(all(c['min_width'] > 0 for c in columns))
+        self.assertGreater(next(c['width'] for c in columns if c['key']=='title'),220)
 
     def test_file_and_system_toggles_exhaustively_control_their_tool_groups(self) -> None:
         with _TemporaryDataDirectory() as td:
@@ -13002,7 +12991,7 @@ class SettingsAndExecutionTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("page_margin =", frame)
 
         settings = inspect.getsource(velox.Panels.draw_global_settings)
-        agents = inspect.getsource(velox.Panels.draw_agents_panel)
+        agents = inspect.getsource(velox.Panels._draw_dashboard_content)
         vault = inspect.getsource(velox.Panels.draw_vault_panel)
         self.assertIn("outer = rect", settings)
         self.assertIn("outer = rect", agents)
@@ -15438,11 +15427,11 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
             self.assertIn("_agent_row_context_items", source)
             self.assertIn("_agent_statistics_tooltip_for_id", source)
             self.assertIn("_handle_agent_row_action", source)
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
+        dashboard = inspect.getsource(velox.Panels._draw_dashboard_content)
         live_row = inspect.getsource(velox.Panels._dashboard_live_task_row)
         menu = inspect.getsource(velox.Panels._dashboard_task_context_menu_items)
-        self.assertIn('"title": "Title"', dashboard)
-        self.assertIn('"title": "Endpoint"', dashboard)
+        self.assertIn('Title', [c['title'] for c in velox.Panels._dashboard_task_columns(1920)])
+        self.assertIn('Endpoint', [c['title'] for c in velox.Panels._dashboard_task_columns(1920)])
         self.assertIn('"action": "resume" if resumable else "pause"', menu)
         self.assertIn('"label": "Cancel", "action": "cancel"', menu)
         self.assertIn('"label": "Delete", "action": "delete"', menu)
@@ -15460,7 +15449,7 @@ class ResponsesAndTaskInspectionTests(_DataRootsIsolatedTestMixin, unittest.Test
         self.assertNotIn('double_click_action="view"', dashboard)
         self.assertNotIn('"title": "Source chat"', dashboard)
         self.assertNotIn('"title": "Updated"', dashboard)
-        self.assertIn('"title": "Duration"', dashboard)
+        self.assertIn('Duration', [c['title'] for c in velox.Panels._dashboard_task_columns(1920)])
 
     def test_agent_statistics_reuses_chat_statistics_modal_structure(self) -> None:
         modal = inspect.getsource(velox.Panels.draw_modals)
@@ -16395,38 +16384,16 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
 
 
     def test_dashboard_has_no_inline_action_columns_and_reclaims_width(self) -> None:
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
-        system_table = inspect.getsource(velox.Panels._draw_system_tasks_table)
-        live_row = inspect.getsource(velox.Panels._dashboard_live_task_row)
-        summary = inspect.getsource(velox.Panels._draw_agent_summary_cards)
-
-        for source in (dashboard, system_table, live_row):
-            self.assertNotIn('"key": "pause_resume"', source)
-            self.assertNotIn('"key": "cancel"', source)
-        self.assertNotIn('"pause_resume":', live_row)
-        self.assertNotIn('"cancel":', live_row)
-
-        for key in ("duration", "input_tokens", "output_tokens"):
-            self.assertIn(
-                f'{{"key": "{key}"', dashboard,
-            )
-        self.assertEqual(dashboard.count('"fixed_width": 150'), 2)
-        self.assertEqual(dashboard.count('"fixed_width": 135'), 1)
-        self.assertEqual(dashboard.count('"fixed_width": 110'), 2)
-        self.assertNotIn('"fixed_width": 125', dashboard)
-        self.assertIn('("started", "Started", 227, 175', dashboard)
-        self.assertIn('("duration", "Duration", 135, 135', dashboard)
-        self.assertIn('("input_tokens", "Input", 150, 150', dashboard)
-        self.assertIn('("output_tokens", "Output", 150, 150', dashboard)
-        self.assertIn('("input_tps", "IN t/s", 110, 110', dashboard)
-        self.assertIn('("generation_tps", "OUT t/s", 110, 110', dashboard)
-        self.assertIn('{"key": "started", "title": "Started", "width": 242', system_table)
-        self.assertIn('"title": "IN t/s"', dashboard)
-        self.assertIn('"title": "OUT t/s"', dashboard)
-        self.assertIn('(f"Input {input_tokens:,}"', summary)
-        self.assertNotIn('Cached input', summary)
-        self.assertNotIn('Normal input', summary)
-        self.assertIn("card_h = max(232,", summary)
+        columns = velox.Panels._dashboard_task_columns(1920)
+        keys = [c['key'] for c in columns]
+        self.assertEqual(keys, ['display_id','endpoint','priority','task_type','title','status',
+                                'started','duration','input_tokens','output_tokens','cost'])
+        self.assertTrue(all(c['width'] > 0 for c in columns))
+        self.assertNotIn('pause_resume', keys); self.assertNotIn('cancel', keys)
+        panel = DashboardMockupTests.panel()
+        row = panel._dashboard_live_task_row(DashboardPresentationTests.metrics())
+        self.assertIn('IN t/s:', row['_tooltip']); self.assertIn('OUT t/s:', row['_tooltip'])
+        self.assertIn('Cached Input:', row['_tooltip'])
 
     def test_all_day_events_share_one_row_up_to_four(self) -> None:
         area = velox.Rect(10, 20, 401, 34)
@@ -18327,11 +18294,11 @@ class SchedulingAndTaskMetricsTests(_AppLogDataRootsIsolatedTestMixin, unittest.
         self.assertGreater(response_tokens + schema_tokens, response_tokens)
 
     def test_dashboard_and_test_orchestrator_keep_recent_contracts(self) -> None:
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
-        self.assertIn('"title": "Endpoint"', dashboard)
+        dashboard = inspect.getsource(velox.Panels._draw_dashboard_content)
+        self.assertIn('Endpoint', [c['title'] for c in velox.Panels._dashboard_task_columns(1920)])
         self.assertNotIn('"title": "Group"', dashboard)
-        self.assertEqual(dashboard.count('"title": "Endpoint"'), 1)
-        self.assertIn('"title": "Title"', dashboard)
+        self.assertEqual([c['title'] for c in velox.Panels._dashboard_task_columns(1920)].count('Endpoint'), 1)
+        self.assertIn('Title', [c['title'] for c in velox.Panels._dashboard_task_columns(1920)])
         self.assertNotIn("Live per-endpoint inference queues", dashboard)
         runner = inspect.getsource(run_test_suite)
         self.assertIn('for name, count in class_rows', runner)
@@ -19886,7 +19853,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
             ["View Raw…", "Copy raw", "Open Workspace…", "Resume", "Run Now", "Cancel", "Delete"],
         )
         self.assertNotIn("View Chat", " ".join(str(row.get("label")) for row in items))
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
+        dashboard = inspect.getsource(velox.Panels._draw_dashboard_content)
         self.assertLess(dashboard.index('"dashboard.tasks"'), dashboard.index("_draw_system_tasks_table"))
         self.assertIn('"CHAT/AGENT TASKS"', dashboard)
         self.assertIn('"SYSTEM TASKS"', dashboard)
@@ -20102,7 +20069,7 @@ class ScheduledAndContextTests(_AppLogDataRootsIsolatedTestMixin, unittest.TestC
         self.assertIn("delete_doc(doc_id)", modal_source)
 
     def test_dashboard_separates_chat_agent_image_and_system_tables_in_due_order(self) -> None:
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
+        dashboard = inspect.getsource(velox.Panels._draw_dashboard_content)
         system_table = inspect.getsource(velox.Panels._draw_system_tasks_table)
         self.assertIn('"CHAT/AGENT TASKS"', dashboard)
         self.assertIn('"SYSTEM TASKS"', dashboard)
@@ -23339,25 +23306,24 @@ class TextWrappingUsageAndPromptTests(_DataRootsIsolatedTestMixin, unittest.Test
         stamp = velox.format_dashboard_start_time("2026-08-29T12:34:56Z")
         self.assertRegex(stamp, r"^\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
         self.assertEqual(velox.format_dashboard_start_time("not-a-time"), "—")
-        chat_source = inspect.getsource(velox.Panels.draw_agents_panel)
-        system_source = inspect.getsource(velox.Panels._draw_system_tasks_table)
-        for source in (chat_source, system_source):
-            status_index = source.index('"key": "status"')
-            started_index = source.index('"key": "started"')
-            self.assertLess(status_index, started_index)
-        self.assertLess(chat_source.index('"key": "started"'), chat_source.index('"key": "duration"'))
-        self.assertIn('strftime("%d/%m/%y %H:%M:%S")', inspect.getsource(velox.format_dashboard_start_time))
-        self.assertNotIn('strftime("%d%m%y-%H%M%S")', inspect.getsource(velox.format_dashboard_start_time))
+        keys = [c['key'] for c in velox.Panels._dashboard_task_columns(1920)]
+        self.assertLess(keys.index('status'),keys.index('started'))
+        self.assertLess(keys.index('started'),keys.index('duration'))
+        source = inspect.getsource(velox.Panels._draw_system_tasks_table)
+        self.assertLess(source.index('"key": "status"'),source.index('"key": "started"'))
 
 
     def test_visible_token_labels_use_total_input_and_output_only(self) -> None:
         production = application_source()
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
+        dashboard = inspect.getsource(velox.Panels._draw_dashboard_content)
         system_table = inspect.getsource(velox.Panels._draw_system_tasks_table)
         summary = inspect.getsource(velox.Panels._draw_agent_summary_cards)
         chat_stats = inspect.getsource(velox.Panels._chat_statistics_text)
-        for label in ('"title": "Input"', '"title": "Output"', '"title": "IN t/s"', '"title": "OUT t/s"'):
-            self.assertIn(label, dashboard)
+        columns = velox.Panels._dashboard_task_columns(1920)
+        for label in ('Input', 'Output', 'Cost'):
+            self.assertIn(label, [c['title'] for c in columns])
+        for key in ('input_tps', 'generation_tps'):
+            self.assertNotIn(key, [c['key'] for c in columns])
         self.assertNotIn('"title": "Cached"', dashboard)
         self.assertNotIn('"title": "Prefill', dashboard)
         self.assertNotIn('"key": "pause_resume"', dashboard + system_table)
@@ -23472,7 +23438,7 @@ class DashboardRawAndToolUsageTests(_DataRootsIsolatedTestMixin, unittest.TestCa
 
     def test_cost_card_uses_scrollable_endpoint_bars_and_table_terms(self) -> None:
         summary = inspect.getsource(velox.Panels._draw_agent_summary_cards)
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
+        dashboard = inspect.getsource(velox.Panels._draw_dashboard_content)
         self.assertIn('self._draw_dashboard_cost_card(cards[3]', summary)
         chart = inspect.getsource(velox.Panels._draw_dashboard_cost_card)
         self.assertIn("_scrollbar_draw", chart)
@@ -23482,9 +23448,10 @@ class DashboardRawAndToolUsageTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertNotIn('"Checklist statistics"', summary)
         self.assertIn("endpoint_cost_bar_tooltip", chart)
         self.assertNotIn('"Inference throughput"', summary)
-        self.assertIn('"title": "IN t/s"', dashboard)
-        self.assertIn('"title": "OUT t/s"', dashboard)
-        self.assertIn("card_h = max(232,", summary)
+        row = DashboardMockupTests.panel()._dashboard_live_task_row(DashboardPresentationTests.metrics())
+        self.assertIn('IN t/s:', row['_tooltip'])
+        self.assertIn('OUT t/s:', row['_tooltip'])
+        self.assertIn("card_h = max(206,", summary)
 
     def test_raw_build_runs_off_loop_and_applies_one_line_snapshot(self) -> None:
         async def scenario() -> None:
@@ -24707,7 +24674,7 @@ class VerifiedCompletionHistoryAndLayoutTests(_DataRootsIsolatedTestMixin, unitt
         action = inspect.getsource(velox.Panels._handle_dashboard_task_action)
         dispatch = inspect.getsource(velox.Panels.draw_modals)
         header = inspect.getsource(velox.Panels.draw_chat_thread_header)
-        dashboard = inspect.getsource(velox.Panels.draw_agents_panel)
+        dashboard = inspect.getsource(velox.Panels._draw_dashboard_content)
         self.assertIn('icon="expert_history"', card)
         self.assertIn('"CHECKLISTS HISTORY"', history_modal)
         self.assertIn("markdown_renderer.view", history_modal)
@@ -24727,8 +24694,8 @@ class VerifiedCompletionHistoryAndLayoutTests(_DataRootsIsolatedTestMixin, unitt
         self.assertIn("(statistics_label_rect.w - activity_text_w) // 2", header)
         self.assertIn("activity_color = Palette.muted", header)
         self.assertIn("activity_color = Palette.ok", header)
-        self.assertIn('(\"input_tokens\", \"Input\", 150, 150', dashboard)
-        self.assertIn('(\"output_tokens\", \"Output\", 150, 150', dashboard)
+        columns = {c['key']: c for c in velox.Panels._dashboard_task_columns(1920)}
+        self.assertEqual([(columns[k]['title'], columns[k]['width']) for k in ('input_tokens', 'output_tokens')], [('Input', 134), ('Output', 125)])
         self.assertIn("expert_history", velox.EMBEDDED_ICON_GRAYSCALE_32)
         self.assertIn("checklist_export", velox.EMBEDDED_ICON_GRAYSCALE_32)
         self.assertEqual(velox.embedded_icon_native_size("expert_history"), 32)
@@ -41434,7 +41401,8 @@ class TokenDashboardTests(_StorageFixture):
             self.assertEqual([value for value, _ in token_segments], [1000, 100])
             body = next(rect for title, rect in cards if title == "Token usage")
             cache = next((rect, text) for rect, text, _ in seen if text.startswith("Cached Input"))
-            self.assertIn("750 [75.0%]", " ".join(text for _rect, text, _kw in seen))
+            self.assertIn("Cached Input: 750 (68.2%)", " ".join(text for _rect, text, _kw in seen))
+            self.assertIn("Cache hit rate: 75%", " ".join(text for _rect, text, _kw in seen))
             self.assertTrue(body.y <= cache[0].y and cache[0].y + cache[0].h <= body.y + body.h)
             self.assertGreater(cache[0].x, body.x)
             self.assertLess(cache[0].w, body.w)
@@ -41980,19 +41948,22 @@ class DashboardPresentationTests(_StorageFixture):
                 self.assertEqual((first[0].w,first[0].h), (second[0].w,second[0].h))
                 body = bodies["Token usage"]
                 shared_width = min(body.w, bodies["Task outcomes"].w)
-                original_size = max(88, min(body.h - 8, int(shared_width * .43)))
+                ring_min = max(88, 2 * panel.f.line_h + 22)
+                original_size = max(ring_min, min(body.h - 8, int(shared_width * .43)))
                 outcome_labels = [text for _r, text in labels if re.match(r"\d+% (Complete|Failed|Cancelled)", text)]
                 legend_width = max(panel.widgets._text_width(text) for text in outcome_labels)
-                self.assertEqual(first[0].w, min(original_size, max(88, shared_width - 24 - 16 - legend_width)))
+                self.assertEqual(first[0].w, min(original_size, max(ring_min, shared_width - 24 - 16 - legend_width)))
                 self.assertEqual(first[0].y-body.y, (body.h-first[0].h)//2)
                 self.assertEqual([v for v,_c in first[1]], [335233,47754])
+                self.assertEqual([color for _,color in first[1]], [velox.Palette.accent,velox.Palette.ok])
                 self.assertIn("382,987 total", first[2]["center_tooltip"])
                 index = next(i for i,(_r,t) in enumerate(labels) if t.startswith("Input "))
                 cache_index = next(i for i,(_r,t) in enumerate(labels) if t.startswith("Cached Input:"))
                 output_index = next(i for i,(_r,t) in enumerate(labels) if t.startswith("Output "))
                 self.assertLess(index,cache_index); self.assertLess(cache_index,output_index)
                 self.assertGreater(labels[cache_index][0].x, first[0].x+first[0].w)
-                self.assertIn("12,288 [3.7%]", " ".join(t for _r,t in labels))
+                self.assertIn("Cached Input: 12.3K (3.2%)", " ".join(t for _r,t in labels))
+                self.assertIn("Cache hit rate: 4%", " ".join(t for _r,t in labels))
                 for rect, text in labels[index:output_index+2]:
                     self.assertLessEqual(rect.y+rect.h, body.y+body.h, text)
                     self.assertLessEqual(rect.x+rect.w, body.x+body.w, text)
@@ -42007,7 +41978,7 @@ class DashboardPresentationTests(_StorageFixture):
                  mock.patch.object(panel.widgets,"clipped_text",side_effect=lambda r,t,*a,**k:labels.append((r,t))):
                 panel._draw_agent_summary_cards(velox.Rect(0,0,1920,1600),self.metrics())
             body=bodies['Token usage']
-            matching=[(r,t) for r,t in labels if t.startswith(('Input ','Cached Input:','12,288','Output ','Total '))]
+            matching=[(r,t) for r,t in labels if t.startswith(('Input ','Cached Input:','Output ','Cache hit rate:'))]
             self.assertGreaterEqual(len(matching),4)
             for rect,text in matching:
                 self.assertLessEqual(rect.y+rect.h,body.y+body.h,text)
@@ -46783,8 +46754,7 @@ class DashboardCostAndChecklistLayoutTests(_StorageFixture):
         self.assertEqual(row['cost']['label'],'Unpriced')
         for text in ('Estimated token cost (USD)','Input $','Cache read $','Output $','unpriced'):
             self.assertIn(text,velox.normalize_tooltip_text(row['_tooltip']))
-        source=inspect.getsource(velox.Panels.draw_agents_panel)
-        self.assertGreater(source.index('{"key": "cost"'), source.index('{"key": "generation_tps"'))
+        self.assertEqual(velox.Panels._dashboard_task_columns(1920)[-1]['key'],'cost')
 
     def test_compact_cost_card_keeps_all_endpoint_rows_reachable(self) -> None:
         for font_h in (16, 24, 32, 48):
@@ -47103,8 +47073,8 @@ class CostDisplayRoundingTests(_StorageFixture):
         self.assertIn('USD', velox.normalize_tooltip_text(row['_tooltip']))
 
     def test_cost_ui_labels_do_not_expose_currency_or_removed_qualifier(self) -> None:
-        source = inspect.getsource(velox.Panels.draw_agents_panel)
-        self.assertIn('"title": "Cost"', source)
+        source = inspect.getsource(velox.Panels._draw_dashboard_content)
+        self.assertEqual(velox.Panels._dashboard_task_columns(1920)[-1]['title'], 'Cost')
         self.assertNotIn('Est. USD', source)
         self.assertNotIn('USD', inspect.getsource(velox.Panels._draw_agent_summary_cards))
         self.assertNotIn('theoretical', application_source())
@@ -47854,11 +47824,11 @@ class DashboardCostBarRenderingTests(_StorageFixture):
                'input_usd':.25,'cached_input_usd':.05,'output_usd':.7,'requests':1} for i in range(count)]
         return {**velox.sum_token_costs(rows),'endpoints':rows,'status':'ready'}
 
-    def test_wide_card_ratio_is_half_one_one_and_half_double(self) -> None:
+    def test_wide_card_proportions_follow_dashboard_mockup(self) -> None:
         for width in (1450,1920,2048,3840):
             rect=velox.Rect(9,13,width,500);rows=velox.Panels._dashboard_summary_card_rects(rect,250)
             standard=(width-36)/5
-            for row,weight in zip(rows,(.5,1,1.5,2)):
+            for row,weight in zip(rows,(.65,1,1.18,2.17)):
                 self.assertAlmostEqual(row.w,standard*weight,delta=1)
             self.assertEqual(rows[-1].x+rows[-1].w,rect.x+rect.w)
             self.assertTrue(all(a.x+a.w+12==b.x for a,b in zip(rows,rows[1:])))
@@ -47907,12 +47877,16 @@ class DashboardCostBarRenderingTests(_StorageFixture):
                 self.assertIn(text,hint)
             self.assertGreaterEqual(hint.count('\n'),6)
 
-    def test_bar_widths_are_proportional_and_use_unrounded_costs(self) -> None:
-        panel=self.panel();value=self.costs();value['endpoints'][0]['total_usd']=.004
-        value['endpoints'][1]['total_usd']=.002;value['endpoints'][2]['total_usd']=0
+    def test_stacked_shares_are_proportional_and_use_unrounded_costs(self) -> None:
+        panel=self.panel(); value=self.costs()
+        value['endpoints'][0]['total_usd']=.004
+        value['endpoints'][1]['total_usd']=.002
+        value['endpoints'][2]['total_usd']=0
+        value['total_usd']=.006
         panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),value)
-        bars=[a[0] for name,a,k in panel.r.drawn if name=='draw_round_rect' and a[1]==5 and a[2].a==85]
-        self.assertEqual(len(bars),2);self.assertAlmostEqual(bars[0].w/2,bars[1].w,delta=1)
+        bars=[args[0] for name,args,_ in panel.r.drawn if name=='draw_rect' and args[0].h==10]
+        self.assertEqual(len(bars),2); self.assertAlmostEqual(bars[0].w/2,bars[1].w,delta=1)
+        self.assertEqual(bars[0].x+bars[0].w,bars[1].x)
 
     def test_many_endpoints_are_virtualized_and_scroll_to_last(self) -> None:
         panel=self.panel();rect=velox.Rect(0,0,720,280);value=self.costs(100)
@@ -47950,7 +47924,7 @@ class DashboardCostBarRenderingTests(_StorageFixture):
         with mock.patch.object(panel.widgets,'clipped_text') as text:
             panel._draw_dashboard_cost_card(velox.Rect(0,0,720,280),value)
         shown=[c.args[1] for c in text.call_args_list]
-        for label in ('Endpoint 0','Endpoint 1','$0.00','Unpriced'):self.assertIn(label,shown)
+        for label in ('Endpoint 0','Endpoint 1','$0.00 (0%)','Unpriced (0%)'):self.assertIn(label,shown)
         self.assertFalse(any('USD' in label for label in shown))
 
     def test_tooltip_warnings_are_specific_to_missing_data(self) -> None:
@@ -48261,7 +48235,7 @@ class DashboardCompactLayoutTests(_StorageFixture):
         panel.widgets.font.line_h = line_h
         return panel
 
-    def test_card_heights_match_pre_bar_chart_formula_at_all_font_sizes(self) -> None:
+    def test_compact_card_heights_leave_room_for_four_legend_lines(self) -> None:
         for height in (14, 18, 22, 28, 34):
             panel = self.panel(height); cards = []
             original = panel._draw_agent_metric_card
@@ -48269,8 +48243,7 @@ class DashboardCompactLayoutTests(_StorageFixture):
                 cards.append((rect, title)); return original(rect, title)
             with mock.patch.object(panel, "_draw_agent_metric_card", side_effect=card):
                 panel._draw_agent_summary_cards(velox.Rect(0, 0, 3840, 1600), {})
-            expected = max(232, height + 64 + 5 * max(27, height + 3),
-                           height + 60 + 6 * max(23, height + 1))
+            expected = max(206, height + 56 + 4 * max(29, height + 6))
             self.assertEqual([r.h for r, _ in cards], [expected] * 4)
 
     def test_changing_width_does_not_change_card_height(self) -> None:
@@ -48619,7 +48592,7 @@ class Release316PresentationTests(_StorageFixture):
             self.assertGreaterEqual(layout.output.h, min(velox.CHAT_OUTPUT_HEIGHT_MIN, (height - 40 - 2 * velox.CHAT_STACK_GAP_PX) // 2))
             self.assertGreater(layout.composer.h, 0)
 
-    def test_card_order_is_spatially_swapped_without_changing_height_or_weights(self) -> None:
+    def test_card_order_and_compact_mockup_weights_are_consistent(self) -> None:
         for width in (700, 1200, 1920, 3840):
             panel = DashboardCompactLayoutTests.panel(self); cards = []
             old = panel._draw_agent_metric_card
@@ -48631,7 +48604,7 @@ class Release316PresentationTests(_StorageFixture):
             self.assertEqual(len({r.h for r, _ in cards}), 1)
             if width >= 1920:
                 rects = dict((title, r) for r, title in cards)
-                self.assertAlmostEqual(rects['Token usage'].w, 1.5 * rects['Task outcomes'].w, delta=1)
+                self.assertAlmostEqual(rects['Token usage'].w, 1.18 * rects['Task outcomes'].w, delta=2)
 
     def test_endpoint_cost_labels_fit_measured_widths_and_keep_usd_in_tooltips(self) -> None:
         for line_h, char_w, width in ((20, 8, 1920), (32, 16, 1280), (38, 19, 1920)):
@@ -50090,6 +50063,254 @@ class ShippedEndpointDefaultsTests(_AppLogDataRootsIsolatedTestMixin, unittest.T
         source = source.replace(inspect.getsource(ShippedEndpointDefaultsTests), "")
         forbidden = re.compile(r"velox\.DEFAULT_\w*ENDPOINT_PROFILE_ID|velox\.default_endpoint_profiles\(")
         self.assertEqual([line.strip() for line in source.splitlines() if forbidden.search(line)], [])
+
+
+class DashboardMockupTests(unittest.TestCase):
+    """Controls use production widgets and records; no provider/network is needed."""
+
+    @staticmethod
+    def panel() -> Panels:
+        widgets = ChecklistRenderingTests.widgets()
+        widgets.renderer.host = SimpleNamespace(width=1920, height=1080)
+        panel = velox.Panels(widgets, widgets.state, SimpleNamespace(
+            monitor=SimpleNamespace(statistics=lambda **kwargs: {}),
+            scheduled_tasks=None, scheduled_task_scheduler=None))
+        panel.state.llm_task_cache_revision = 1
+        panel.state.llm_task_last_refresh_monotonic = time.monotonic()
+        panel.state.llm_task_stats_cache = {'total_tasks': 3}
+        panel.state.llm_task_entries_cache = DashboardMockupTests.records()
+        panel._dashboard_cost_statistics = lambda: {'status': 'ready'}
+        return panel
+
+    @staticmethod
+    def records() -> list[dict[str, Any]]:
+        return [
+            {'task_id':'alpha-uuid','display_id':42,'task_type':'Agent','title':'Refactor Velox tests',
+             'endpoint_name':'DeepSeek','display_status':'inferencing','prioritized':True,
+             'input_tokens':100,'output_tokens':10,'token_cost':{'total_usd':.104}},
+            {'task_id':'beta-uuid','display_id':43,'task_type':'Chat','title':'Draft follow-up email',
+             'endpoint_name':'OpenAI','display_status':'completed','priority':0,
+             'input_tokens':200,'output_tokens':20,'token_cost':{'total_usd':.202}},
+            {'task_id':'gamma-uuid','display_id':44,'task_type':'Image','title':'Research report',
+             'endpoint_name':'Local','display_status':'failed','priority':2,
+             'input_tokens':300,'output_tokens':30,'token_cost':{'unpriced_requests':1}},
+        ]
+
+    def test_search_matches_title_numeric_and_full_id_case_insensitively(self) -> None:
+        panel = self.panel()
+        for query, expected in [(' VELOX ', 'alpha-uuid'), ('43', 'beta-uuid'), ('GAMMA-UUID', 'gamma-uuid')]:
+            panel.state.dashboard_search = query
+            self.assertEqual([r['task_id'] for r in panel._filter_dashboard_records(self.records())], [expected])
+        panel.state.dashboard_search = 'no match'
+        self.assertEqual(panel._filter_dashboard_records(self.records()), [])
+
+    def test_all_filters_compose_without_hiding_available_endpoint_options(self) -> None:
+        panel = self.panel(); state = panel.state
+        state.dashboard_status='Running'; state.dashboard_type='Agent'
+        state.dashboard_endpoint='DeepSeek'; state.dashboard_priority='Pinned'; state.dashboard_with_cost=True
+        self.assertEqual([r['display_id'] for r in panel._filter_dashboard_records(self.records())], [42])
+        state.dashboard_attention=True
+        self.assertEqual(panel._filter_dashboard_records(self.records()), [])
+        with mock.patch.object(panel.widgets, 'dropdown', wraps=panel.widgets.dropdown) as dropdown:
+            panel._draw_dashboard_filters(velox.Rect(0,0,1900,100), self.records())
+        endpoint = next(c for c in dropdown.call_args_list if c.args[0]=='dashboard:filter:endpoint')
+        self.assertEqual(endpoint.args[3], ['Endpoint: All','Endpoint: DeepSeek','Endpoint: Local','Endpoint: OpenAI'])
+
+    def test_attention_aliases_and_positive_cost_are_explicit(self) -> None:
+        panel=self.panel(); panel.state.dashboard_attention=True
+        records=[{'task_id':str(i),'display_status':status} for i,status in enumerate(
+            ['failed','stalled','waiting','paused','pausing','waiting for input','running','completed','queued','tool'])]
+        self.assertEqual(len(panel._filter_dashboard_records(records)),6)
+        panel.state.dashboard_attention=False; panel.state.dashboard_with_cost=True
+        records += [{'task_id':'priced','token_cost':{'total_usd':.001}},
+                    {'task_id':'mixed','token_cost':{'total_usd':.02,'unpriced_requests':1}}]
+        self.assertEqual([r['task_id'] for r in panel._filter_dashboard_records(records)], ['priced','mixed'])
+
+    def test_queue_priority_retains_real_scheduler_semantics(self) -> None:
+        panel=self.panel()
+        for value, expected in [('Pinned',42),('Queued',44),('Not queued',43)]:
+            panel.state.dashboard_priority=value
+            self.assertEqual([r['display_id'] for r in panel._filter_dashboard_records(self.records())],[expected])
+
+    def test_actual_search_editor_and_clear_button_reset_filters(self) -> None:
+        panel=self.panel(); state=panel.state; widgets=panel.widgets
+        rect=velox.Rect(0,0,1900,100)
+        with mock.patch.object(widgets,'text_input',wraps=widgets.text_input) as editor:
+            panel._draw_dashboard_filters(rect,self.records())
+        box=editor.call_args.args[1]
+        state.input.mouse_x=box.x+20; state.input.mouse_y=box.y+15; state.input.mouse_pressed=True
+        panel._draw_dashboard_filters(rect,self.records())
+        state.input.begin_frame(); state.input.text='Velox'
+        panel._draw_dashboard_filters(rect,self.records())
+        self.assertEqual(state.dashboard_search,'Velox')
+        state.input.begin_frame(); state.dashboard_type='Agent'; state.dashboard_attention=True
+        with mock.patch.object(widgets,'button',wraps=widgets.button) as button:
+            panel._draw_dashboard_filters(rect,self.records())
+        box=next(c.args[1] for c in button.call_args_list if c.args[0]=='dashboard:clear')
+        state.input.mouse_x=box.x+20; state.input.mouse_y=box.y+15; state.input.mouse_pressed=True
+        panel._draw_dashboard_filters(rect,self.records())
+        self.assertEqual(state.dashboard_search,''); self.assertEqual(state.dashboard_type,'All')
+        self.assertFalse(state.dashboard_attention); self.assertFalse(state.dashboard_with_cost)
+
+    def test_dropdown_uses_real_overlay_and_does_not_click_through(self) -> None:
+        panel=self.panel(); w=panel.widgets; state=panel.state; rect=velox.Rect(0,0,1900,100)
+        with mock.patch.object(w,'dropdown',wraps=w.dropdown) as picker:
+            panel._draw_dashboard_filters(rect,self.records())
+        trigger=next(c.args[1] for c in picker.call_args_list if c.args[0]=='dashboard:filter:type')
+        state.input.mouse_x=trigger.x+10; state.input.mouse_y=trigger.y+10; state.input.mouse_pressed=True
+        panel._draw_dashboard_filters(rect,self.records())
+        self.assertEqual(state.open_dropdown,'dashboard:filter:type')
+        state.input.begin_frame()
+        overlay=state.dropdown_overlay; menu,row_h,pad,_=w._dropdown_menu_geometry(trigger,overlay['options'])
+        state.input.mouse_x=menu.x+15; state.input.mouse_y=menu.y+pad+2*row_h+row_h//2
+        state.input.mouse_pressed=True
+        w.draw_dropdown_overlay(velox.Rect(0,0,1920,1080))
+        state.input.begin_frame(); panel._draw_dashboard_filters(rect,self.records())
+        self.assertEqual(state.dashboard_type,'Agent'); self.assertIsNone(state.open_dropdown)
+
+    def test_filtered_rows_and_totals_come_from_the_same_records(self) -> None:
+        panel=self.panel(); panel.state.dashboard_search='42'
+        with mock.patch.object(panel.widgets,'table_view',wraps=panel.widgets.table_view) as table, \
+             mock.patch.object(panel.widgets,'clipped_text',wraps=panel.widgets.clipped_text) as text:
+            panel.draw_agents_panel(velox.Rect(0,0,1920,1080))
+        tasks=next(c for c in table.call_args_list if c.args[0]=='dashboard.tasks')
+        self.assertEqual([r['id'] for r in tasks.args[3]],['alpha-uuid'])
+        labels=[c.args[1] for c in text.call_args_list]
+        self.assertIn('Showing 1 of 3 tasks',labels)
+        self.assertIn('Totals (shown):   Input  100    Output  10    Cost  $0.10',labels)
+        self.assertEqual([c['key'] for c in tasks.args[2]],
+            ['display_id','endpoint','priority','task_type','title','status','started','duration','input_tokens','output_tokens','cost'])
+
+    def test_totals_round_once_and_expose_unpriced_usage(self) -> None:
+        panel=self.panel(); records=self.records()
+        records[1]['token_cost']['total_usd']=.104
+        with mock.patch.object(panel.widgets,'clipped_text') as text:
+            panel._draw_dashboard_totals(velox.Rect(0,0,1900,40),records,3)
+        labels=[c.args[1] for c in text.call_args_list]
+        self.assertTrue(any('Cost  $0.21 + ?' in label and 'unpriced usage' in label for label in labels))
+
+    def test_short_window_reserves_tables_and_page_scroll_reaches_system(self) -> None:
+        panel=self.panel(); captures=[]
+        original=panel._draw_dashboard_content
+        def content(rect): captures.append(rect); original(rect)
+        with mock.patch.object(panel,'_draw_dashboard_content',side_effect=content), \
+             mock.patch.object(panel.widgets,'table_view',wraps=panel.widgets.table_view) as table:
+            panel.draw_agents_panel(velox.Rect(0,0,1280,720))
+            panel.state.input.key_page_down=True
+            panel.draw_agents_panel(velox.Rect(0,0,1280,720))
+            panel.state.input.begin_frame()
+            panel.draw_agents_panel(velox.Rect(0,0,1280,720))
+        self.assertGreater(captures[0].h,720); self.assertLess(captures[-1].y,0)
+        for c in table.call_args_list:
+            self.assertGreater(c.args[1].h,100)
+
+    def test_new_marks_are_vectors_and_cache_badge_distinguishes_missing(self) -> None:
+        panel=self.panel(); w=panel.widgets
+        with mock.patch.object(w,'clipped_text') as text:
+            for provider in ('DeepSeek','OpenAI','Anthropic','Custom'):
+                w._draw_dashboard_cell_icon(velox.Rect(0,0,18,18),'endpoint',velox.Palette.text,provider)
+        text.assert_not_called()
+        with mock.patch.object(w,'clipped_text') as text:
+            panel._draw_agent_summary_cards(velox.Rect(0,0,1920,1080),{})
+        self.assertIn('Cache hit rate: N/A',[c.args[1] for c in text.call_args_list])
+        measure=lambda text:len(text)*14
+        columns={c['key']:c for c in velox.Panels._dashboard_task_columns(1920,measure)}
+        self.assertEqual(columns['priority']['title'],'Pri.')
+        self.assertGreaterEqual(columns['duration']['width'],measure('Duration')+18)
+        self.assertGreaterEqual(columns['status']['width'],measure('Complete')+44)
+
+    def test_filters_are_session_only_and_saved_views_are_absent(self) -> None:
+        panel=self.panel()
+        with mock.patch.object(panel.widgets,'button',wraps=panel.widgets.button) as buttons, \
+             mock.patch.object(panel.widgets,'dropdown',wraps=panel.widgets.dropdown) as dropdowns:
+            panel._draw_dashboard_filters(velox.Rect(0,0,1920,100),self.records())
+        labels=[str(c.args[2]) for c in buttons.call_args_list+dropdowns.call_args_list]
+        self.assertFalse(any('saved' in value.lower() for value in labels))
+        panel.state.dashboard_search='temporary'
+        self.assertEqual(velox.UIState().dashboard_search,'')
+
+
+class DashboardCostHistoryTests(unittest.TestCase):
+    def test_exact_boundaries_provider_rollup_and_live_final_deduplication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            ledger=velox.TokenCostLedger(Path(temp)); now=1800000000.
+            def event(key, epoch, amount, provider='openai'):
+                return {'schema':velox.data_schema('token_cost'),'event_id':key,'epoch':epoch,
+                        'pricing':{'endpoint_type':provider+':model','type_label':provider+' / model'},
+                        'cost':{**dict.fromkeys(velox.TOKEN_COST_SUM_FIELDS,0),'total_usd':amount}}
+            # Open-left, closed-right windows: cutoff belongs to prior, not current.
+            for row in [event('cutoff',now-86400,2),event('prior',now-90000,3),
+                        event('current',now-10,1),event('final',now,4,'anthropic'),
+                        event('too-old',now-8*86400,99),event('future',now+1,99)]: ledger.record(row)
+            result=ledger.dashboard_summary([event('final',now,400,'anthropic'),event('live',now-20,.5)],now=now)
+            self.assertEqual(result['total_usd'],5.5); self.assertEqual(result['previous_total_usd'],5)
+            self.assertAlmostEqual(result['change_percent'],10)
+            self.assertEqual([r['label'] for r in result['providers']],['Anthropic','OpenAI'])
+            self.assertEqual([r['total_usd'] for r in result['providers']],[4,1.5])
+            self.assertEqual(sum(r['total_usd'] for r in result['trend']),10.5)
+            self.assertEqual(len(result['trend']),7)
+            self.assertTrue(all(c['events'] is None for c in ledger._day_cache.values()))
+
+    def test_missing_prior_zero_and_invalid_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            ledger=velox.TokenCostLedger(Path(temp))
+            result=ledger.dashboard_summary(now=1800000000.)
+            self.assertEqual(result['total_usd'],0); self.assertIsNone(result['change_percent'])
+            self.assertEqual(result['providers'],[])
+            self.assertTrue(all(row['total_usd']==0 for row in result['trend']))
+            for seconds in (0,-1,366*86400,True):
+                with self.assertRaises(ValueError): ledger.dashboard_summary(window_seconds=seconds)
+
+    def test_dashboard_totals_equal_existing_ledger_for_all_periods(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            ledger=velox.TokenCostLedger(Path(temp)); now=1800000000.
+            for i, days in enumerate((0,.01,1,3,7,29,30,60,89,90,180,364,365,500)):
+                ledger.record({'schema':velox.data_schema('token_cost'),'event_id':str(i),'epoch':now-days*86400,
+                    'pricing':{'endpoint_type':'openai:model','type_label':'OpenAI / model'},
+                    'cost':{**dict.fromkeys(velox.TOKEN_COST_SUM_FIELDS,0),'total_usd':i+.25}})
+            for seconds in velox.DASHBOARD_COST_PERIODS.values():
+                result=ledger.dashboard_summary(now=now,window_seconds=seconds)
+                expected=ledger.summary(now=now,window_seconds=seconds)
+                self.assertEqual(result['total_usd'],expected['total_usd'])
+                prior=ledger.summary(now=now-seconds,window_seconds=seconds)
+                self.assertEqual(result['previous_total_usd'],prior['total_usd'])
+                if seconds>=7*86400:
+                    self.assertAlmostEqual(sum(row['total_usd'] for row in result['trend']),result['total_usd'])
+
+
+class DashboardRollingSummaryTests(_StorageFixture):
+    def test_cards_use_request_time_and_recent_terminal_outcomes_independent_of_cost_period(self) -> None:
+        now=time.time()
+        recent=velox.LLMTaskRecord('recent',velox.APP_SCOPE_ID,velox.now_iso(),velox.now_iso(),'completed','Recent')
+        old_stamp=datetime.fromtimestamp(now-3*86400,timezone.utc).isoformat()
+        old=velox.LLMTaskRecord('old',velox.APP_SCOPE_ID,old_stamp,old_stamp,'failed','Old')
+        self.monitor._records={'recent':recent,'old':old}
+        for i,days in enumerate((0,2)):
+            self.monitor.cost_ledger.record({'schema':velox.data_schema('token_cost'),'event_id':str(i),
+                'epoch':now-days*86400,'pricing':{'endpoint_type':'openai:model','type_label':'OpenAI / model'},
+                'cost':{**dict.fromkeys(velox.TOKEN_COST_SUM_FIELDS,0),'total_usd':1,
+                        'input_tokens':100*(i+1),'output_tokens':10,'cached_input_tokens':80,'requests':1}})
+        for seconds in (3600,86400,30*86400):
+            recent=self.monitor.cost_statistics(seconds)['dashboard_24h']
+            self.assertEqual(recent['input_tokens'],100); self.assertEqual(recent['output_tokens'],10)
+            self.assertEqual(recent['cached_input_tokens'],80)
+            self.assertEqual(recent['counts'],{'completed':1}); self.assertEqual(recent['terminal_tasks'],1)
+            self.assertEqual(recent['outcome_percentages']['completed'],100)
+            self.assertEqual(recent['cache_reported_rounds'],1)
+        self.monitor.cost_statistics(365*86400)
+        self.assertGreaterEqual(len(self.monitor.cost_ledger._day_cache),730)
+
+    def test_active_statuses_survive_rolling_terminal_override(self) -> None:
+        panel=DashboardMockupTests.panel()
+        panel.state.llm_task_stats_cache={'counts':{'running':3,'completed':999},'total_tasks':1002}
+        panel._dashboard_cost_statistics=lambda:{'status':'ready','dashboard_24h':{
+            'counts':{'completed':2},'terminal_tasks':2,'input_tokens':123,'output_tokens':12,'total_tokens':135}}
+        with mock.patch.object(panel,'_draw_agent_summary_cards',return_value=220) as cards:
+            panel.draw_agents_panel(velox.Rect(0,0,1920,1080))
+        data=cards.call_args.args[1]
+        self.assertEqual(data['window_label'],'24h'); self.assertEqual(data['input_tokens'],123)
+        self.assertEqual(data['counts']['running'],3); self.assertEqual(data['counts']['completed'],2)
+        self.assertEqual(data['counts']['failed'],0)
 
 
 def main() -> None:

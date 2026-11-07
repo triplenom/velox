@@ -92,6 +92,17 @@ Create a chat, choose its main/subagent endpoints, and **enable the tools** it n
 
 Follow progress on the dashboard and open a task to inspect its checklist, agent requests, transcript or tool output. **Pause** holds execution at safe boundaries and preserves unfinished work. **Stop** cancels the active chat run, its active checklist and chat-owned child work; cancelled checklist work requires an explicit user-authorized resume. Ordinary application shutdown preserves resumable work rather than treating it as a user Stop.
 
+### Dashboard
+
+The dashboard keeps the existing native layout: four summary cards, Chat/Agent/Image tasks, and a separate System Tasks table. Task actions remain on the row's right-click menu.
+
+- Search titles, numeric IDs or full Task IDs. Combine Status, Type, Endpoint and Priority filters; **Clear** resets them. Filters are session-only; there are no saved views.
+- Priority reflects the actual inference scheduler: **Pinned**, **Queued** (a queue position), or **Not queued**, rather than inventing High/Normal/Low task metadata.
+- **With Cost** keeps tasks with positive recorded cost. **Needs Attention** keeps failed, stalled, paused/pausing and waiting tasks. The footer sums the entire filtered list, including rows outside the table viewport, before rounding to cents. Unpriced usage stays explicit.
+- Outcome and token/cache cards show **24 hours**, independent of the cost picker. Tokens are counted at request time, not from a recently active Chat's lifetime total. While the first background snapshot loads, the existing counters remain explicitly labelled **All time**. Cached input is a subset of input, never an extra token-ring segment; an asterisk on the cache-hit badge indicates partial reporting.
+- **Costs** offers the existing rolling periods, a preceding-period comparison, provider shares and seven history bars. For periods up to 24 hours, the bars show the last seven days; longer selections divide the chosen period into seven intervals. Hover for exact intervals and accounting details. No previous spend means no fabricated percentage change.
+- Short windows scroll the dashboard as a page, while each table retains its own scrolling. Page Up/Down works when an editor is not focused. Larger text wraps the summary cards and filters instead of hiding task controls.
+
 ### Steering active work
 
 Send another message while a chat is running (the composer button becomes **Steer**, with the same Ctrl/Cmd+Enter shortcut). It stays in the transcript and is delivered before the next unstarted tool call. If a tool is already running, it finishes normally and its result carries the new guidance. Remaining calls from the old batch are not executed; the model reconsiders its next action. Multiple messages retain their order, and attachments use the normal chat attachment path.
