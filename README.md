@@ -82,6 +82,10 @@ Open **Settings** and configure an endpoint's URL, model name and API key where 
 
 Select the appropriate **Chat Completions**, **Responses**, or **Anthropic Messages** API transport. Model reasoning, vision support, image-analysis context, output/context limits, recovery policy, concurrency and token pricing are profile settings. Image analysis uses the requesting task's current endpoint, which must support the required images.
 
+**Anthropic Messages always uses [automatic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching).** Every Messages request includes top-level `"cache_control": {"type": "ephemeral"}`, for both streaming and non-streaming calls and tool continuations. This applies to existing profiles without a settings migration; no toggle or manual block breakpoints are needed. The default TTL is five minutes, refreshed when reused. To use the higher-priced one-hour TTL, set `{"cache_control":{"type":"ephemeral","ttl":"1h"}}` in the profile's Extra body JSON. Extra body values cannot disable automatic caching. Other API transports are unchanged.
+
+Anthropic manages the cache remotely; actual hits depend on identical prefixes, model minimum prompt lengths and TTL. Cache reads and writes remain included in Velox's token usage and cost accounting. Enabling caching is not a guarantee that every request produces a cache hit.
+
 Create a chat, choose its main/subagent endpoints, and **enable the tools** it needs. The six policy labels are **File, System, Web, Agent, Chat and Checklists**. New chats start with **Agent, Chat and Checklists off**; File, System and Web remain on. Saved per-chat choices are not changed. Endpoint/tool choices lock when the first real message is sent. Point coding/file work at a disposable workspace and state any write boundaries explicitly. For example:
 
 > Build a local tool for exploring CSV files. Let me import a file, inspect its columns, filter rows and export the result. Pick a suitable stack, add tests and run them. Work only in the workspace I specify.

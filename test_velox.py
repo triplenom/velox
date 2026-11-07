@@ -49486,6 +49486,7 @@ class AnthropicMessagesTests(_AsyncRuntimeFixture):
             self.assertEqual(headers['anthropic-version'], '2023-06-01')
             self.assertNotIn('Authorization', headers)
             self.assertEqual(json.loads(body), payload)
+            self.assertEqual(payload['cache_control'], {'type': 'ephemeral'})
             self.assertEqual(payload['system'], [{'type': 'text', 'text': 'Be useful.'}])
             self.assertEqual(payload['thinking'], {'type': 'adaptive'})
             self.assertEqual(payload['output_config'], {'effort': 'medium'})
@@ -49498,6 +49499,31 @@ class AnthropicMessagesTests(_AsyncRuntimeFixture):
             for field in ('reasoning_effort', 'stream_options', 'temperature', 'top_p', *velox.ENDPOINT_PRICE_FIELDS):
                 self.assertNotIn(field, payload)
             self.assertNotIn('test-anthropic-secret', body.decode())
+        self.assertEqual(messages, original)
+
+    def test_automatic_caching_is_always_enabled_and_preserves_ttl(self) -> None:
+        messages = [{'role': 'system', 'content': 'Stable instructions.'},
+                    {'role': 'user', 'content': 'First turn.'}]
+        original = copy.deepcopy(messages)
+        for control in (None, False, 'disabled', {}, {'type': 'disabled'},
+                        {'type': 'ephemeral', 'ttl': '5m'}, {'type': 'ephemeral', 'ttl': '1h'}):
+            extra = {'service_tier': 'standard', 'cache_control': control}
+            self.storage.update_config(lambda cfg: velox.endpoint_profile_ref(cfg, self.eid).update(
+                extra_body_json=json.dumps(extra)))
+            for stream in (False, True):
+                with self.subTest(control=control, stream=stream):
+                    request = velox.LLMRequest(None, self.eid, messages)
+                    _, _, body, _, _, payload = self.llm._payload_and_headers(request, stream=stream)
+                    expected = {'type': 'ephemeral'}
+                    if isinstance(control, dict) and 'ttl' in control:
+                        expected['ttl'] = control['ttl']
+                    self.assertEqual(payload['cache_control'], expected)
+                    self.assertEqual(json.loads(body)['cache_control'], expected)
+                    self.assertEqual(payload['service_tier'], 'standard')
+                    # Automatic caching belongs at the top level, not on blocks.
+                    self.assertTrue(all('cache_control' not in b for b in payload['system']))
+                    self.assertTrue(all('cache_control' not in b for m in payload['messages'] for b in m['content']))
+            self.assertEqual(json.loads(self.llm.resolve_endpoint(self.eid)['extra_body_json']), extra)
         self.assertEqual(messages, original)
 
     def test_utility_reasoning_overrides_use_supported_adaptive_effort(self) -> None:
@@ -49552,6 +49578,7 @@ class AnthropicMessagesTests(_AsyncRuntimeFixture):
                 result = await asyncio.wait_for(method(req), 5)
             self.assertEqual(len(captured), 1)
             self.assertEqual(captured[0][0], '/v1/messages')
+            self.assertEqual(captured[0][2]['cache_control'], {'type': 'ephemeral'})
             self.assertEqual({k.lower(): v for k, v in captured[0][1].items()}['x-api-key'], 'test-anthropic-secret')
             return result
         finally:
@@ -49652,6 +49679,8 @@ class AnthropicMessagesTests(_AsyncRuntimeFixture):
             await asyncio.wait_for(self.runtime._run_assistant_loop(velox.APP_SCOPE_ID, self.cid, str(assistant['turn_id']), self.eid, user['text'], 'Messages integration'), 8)
             self.assertEqual(calls, [1])
             self.assertEqual(len(requests), 2)
+            for payload in requests:
+                self.assertEqual(payload['cache_control'], {'type': 'ephemeral'})
             history = requests[1]['messages']
             replay = next(m for m in history if m['role'] == 'assistant' and any(b.get('type') == 'tool_use' for b in m['content']))
             self.assertEqual(replay['content'][:2], first['content'][:2])

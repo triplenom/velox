@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 328
+CURRENT_VERSION = 329
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -27936,7 +27936,14 @@ class LLMClient:
         maximum, capacity = bounded_request_output_tokens(endpoint, messages=accounting_messages,
             native_tools=tools, requested_output_tokens=requested)
         payload = parse_endpoint_extra_body(endpoint.get("extra_body_json"))
-        payload.update(model=model, messages=messages, max_tokens=maximum, stream=bool(stream))
+        # Always opt Messages requests into automatic prefix caching, including
+        # saved profiles with no cache setting. Keep an explicit TTL (e.g. 1h),
+        # but do not let extra-body values disable automatic caching.
+        cache_control = payload.get("cache_control")
+        cache_control = dict(cache_control) if isinstance(cache_control, dict) else {}
+        cache_control["type"] = "ephemeral"
+        payload.update(model=model, messages=messages, max_tokens=maximum, stream=bool(stream),
+                       cache_control=cache_control)
         if system:
             payload["system"] = system
         if tools:
