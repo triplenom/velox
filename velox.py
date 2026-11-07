@@ -26,7 +26,8 @@ Panels, Widgets and Renderer provide the SDL interface. The application stays in
 process runner live in test_velox.py.
 
 Run python velox.py from a separate application-data directory. Use --init-only
-to initialize it without opening the window. Run python test_velox.py from the
+to initialize it without opening the window. Settings, endpoint profiles and
+account credentials live in config.json beside velox.py (--config overrides). Run python test_velox.py from the
 source directory for the complete regression suite. README.md covers setup;
 SECURITY.md describes tool permissions and credential storage.
 """
@@ -292,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 327
+CURRENT_VERSION = 328
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -6680,7 +6681,7 @@ def _endpoint_token_calibration_key(profile: dict[str, Any]) -> str:
 
 
 def _endpoint_token_calibrations(storage: Any) -> tuple[Path, dict[str, Any]]:
-    path = storage.paths.app_json_path.parent / "endpoint_token_calibration.json"
+    path = storage.paths.root_dir / "endpoint_token_calibration.json"
     try:
         st = path.stat()
         signature = (st.st_mtime_ns, st.st_size, st.st_ctime_ns, st.st_ino)
@@ -9295,7 +9296,25 @@ def openai_tool_result_message(
 # =============================================================================
 
 
-DATA_MANIFEST_NAME = "app.json"
+# config.json holds every application-wide setting, endpoint profile and
+# account credential. By default it lives beside velox.py (``--config`` selects
+# another file). Each data root keeps only per-root data: state.json (UI state
+# plus the data-generation marker), chats/, agents/, skills/, calendar/, etc.
+CONFIG_FILE_NAME = "config.json"
+# config.json is versioned independently of CURRENT_VERSION and of the data
+# generation. Loading is additive and tolerant: missing fields take current
+# defaults and unknown fields are ignored, so a config.json written by any
+# earlier release keeps working. Renamed or reinterpreted fields must be handled
+# by a CONFIG_FILE_MIGRATIONS entry and a CONFIG_FILE_VERSION bump, never by
+# rejecting an older file.
+CONFIG_FILE_VERSION = 1
+APPLICATION_SOURCE_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = APPLICATION_SOURCE_DIR / CONFIG_FILE_NAME
+DATA_MANIFEST_NAME = "state.json"
+# Layout used through release 327: settings/state in <root>/app.json and
+# XOR-obscured account files in <root>/credentials/. Read only for migration.
+LEGACY_APP_MANIFEST_NAME = "app.json"
+LEGACY_CREDENTIALS_DIR_NAME = "credentials"
 
 
 class UnsupportedDataVersionError(RuntimeError):
@@ -9585,21 +9604,36 @@ class DataRootRegistry:
         self,
         root_dir: Path,
         *,
+        config_path: Path | None = None,
         llm: dict[str, Any] | None = None,
         environment: dict[str, Any] | None = None,
         chrome_path: str | None = None,
         node_path: str | None = None,
     ) -> DataRootContext:
+        """Create a new data root: state.json, bundled Skills and, if absent, config.json.
+
+        An existing config.json is shared configuration and is never replaced
+        here; ``llm`` only seeds the endpoint section of a newly created file.
+        """
         root = Path(root_dir).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         ctx = self.register(root)
-        manifest = default_app_manifest()
-        if isinstance(llm, dict):
-            manifest.setdefault("settings", {})["llm"] = copy.deepcopy(llm)
-        validate_exact_mapping_shape(manifest, default_app_manifest(), location="new app.json")
-        validate_endpoint_profiles_config(manifest["settings"]["llm"], location="new app.json.settings.llm")
+        resolved_config = (
+            Path(config_path).expanduser().resolve() if config_path is not None else root / CONFIG_FILE_NAME
+        )
+        manifest = default_root_manifest()
+        validate_exact_mapping_shape(manifest, default_root_manifest(), location="new state.json")
+        config_document: dict[str, Any] | None = None
+        if not resolved_config.exists():
+            settings = default_config()
+            if isinstance(llm, dict):
+                settings["llm"] = copy.deepcopy(llm)
+            validate_endpoint_profiles_config(settings["llm"], location="new config.json settings.llm")
+            config_document = default_config_document(settings)
         manifest_path = root / DATA_MANIFEST_NAME
-        with self.lock_for_path(manifest_path):
+        with self.lock_for_path(root):
+            if config_document is not None and not resolved_config.exists():
+                write_config_document(resolved_config, config_document)
             _plain_atomic_write_bytes(
                 manifest_path,
                 json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -9612,8 +9646,8 @@ class DataRootRegistry:
                 self._locks.setdefault(root, threading.RLock())
         return ctx
 
-    def configure_first_run(self, root_dir: Path) -> DataRootContext:
-        return self.write_manifest(root_dir)
+    def configure_first_run(self, root_dir: Path, *, config_path: Path | None = None) -> DataRootContext:
+        return self.write_manifest(root_dir, config_path=config_path)
 
     def clear_for_tests(self) -> None:
         # Drain background writers while their data-root locks still exist. A
@@ -9647,15 +9681,228 @@ class DataRootRegistry:
 DATA_ROOTS = DataRootRegistry()
 
 
-def default_app_manifest() -> dict[str, Any]:
-    """Return the complete app.json payload for the current data model."""
+def default_root_manifest() -> dict[str, Any]:
+    """Return the complete per-root state.json payload (UI state and data generation)."""
     return {
         "schema": APP_SCHEMA,
         "data_version": DATA_FILE_VERSION,
-        "settings": default_config(),
         "state": default_app_state(),
         "updated_at": now_iso(),
     }
+
+
+def default_app_manifest() -> dict[str, Any]:
+    """Return the combined in-memory manifest for the current data model.
+
+    Storage validates and edits one view: ``settings`` come from config.json and
+    the remaining fields from the data root's state.json. AppPaths splits the
+    view back into those two files whenever it is written.
+    """
+    root = default_root_manifest()
+    return {
+        "schema": root["schema"],
+        "data_version": root["data_version"],
+        "settings": default_config(),
+        "state": root["state"],
+        "updated_at": root["updated_at"],
+    }
+
+
+# -----------------------------------------------------------------------------
+# config.json: application-wide settings, endpoint profiles and credentials
+# -----------------------------------------------------------------------------
+
+# In-memory settings carry the data-generation tags used by Storage validation.
+# They are implied by the running release and are never written to config.json,
+# so a data-generation change cannot invalidate an existing configuration file.
+CONFIG_SETTINGS_VERSION_KEYS = ("schema", "data_version")
+# Upgrade steps keyed by the config_version they read. Each function receives a
+# complete document of that version and returns the next version's document.
+CONFIG_FILE_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+
+
+def default_credentials_config() -> dict[str, dict[str, Any]]:
+    """Return empty values for every account stored in config.json ``credentials``."""
+    return copy.deepcopy(CredentialStore._DEFAULTS)
+
+
+def settings_for_config_document(settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the persisted form of in-memory settings (without generation tags)."""
+    out = copy.deepcopy(settings or {})
+    for key in CONFIG_SETTINGS_VERSION_KEYS:
+        out.pop(key, None)
+    return out
+
+
+def default_config_document(
+    settings: dict[str, Any] | None = None,
+    credentials: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a complete config.json document for the current release."""
+    return {
+        "config_version": CONFIG_FILE_VERSION,
+        "written_by": APP_VERSION,
+        "updated_at": now_iso(),
+        "settings": settings_for_config_document(settings if settings is not None else default_config()),
+        "credentials": copy.deepcopy(credentials) if credentials is not None else default_credentials_config(),
+    }
+
+
+def config_document_version(document: dict[str, Any], *, location: str = CONFIG_FILE_NAME) -> int:
+    """Return a document's config_version; files without one are version 1."""
+    value = document.get("config_version", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise UnsupportedDataVersionError(f"{location} config_version must be a positive integer")
+    return value
+
+
+def migrate_config_document(document: dict[str, Any], *, location: str = CONFIG_FILE_NAME) -> dict[str, Any]:
+    """Upgrade an older config.json document in memory; the file itself is untouched.
+
+    Documents from a newer release are read on a best-effort basis: fields this
+    release does not know are ignored rather than treated as an error.
+    """
+    out = copy.deepcopy(document)
+    version = config_document_version(out, location=location)
+    while version < CONFIG_FILE_VERSION:
+        migration = CONFIG_FILE_MIGRATIONS.get(version)
+        if migration is None:
+            raise UnsupportedDataVersionError(f"{location} has no upgrade path from config_version {version}")
+        out = migration(copy.deepcopy(out))
+        version += 1
+        out["config_version"] = version
+    return out
+
+
+def read_config_document(path: Path) -> dict[str, Any] | None:
+    """Read and migrate config.json, or return None when it does not exist."""
+    target = Path(path)
+    try:
+        raw = _plain_read_bytes_with_retry(target)
+    except FileNotFoundError:
+        return None
+    try:
+        # utf-8-sig accepts the byte-order mark some Windows editors add.
+        document = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"{target} is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"{target} must contain one JSON object")
+    return migrate_config_document(document, location=str(target))
+
+
+def write_config_document(path: Path, document: dict[str, Any]) -> None:
+    """Atomically publish a complete config.json document."""
+    payload = copy.deepcopy(document)
+    payload["config_version"] = max(CONFIG_FILE_VERSION, config_document_version(payload, location=str(path)))
+    payload["written_by"] = APP_VERSION
+    payload["updated_at"] = now_iso()
+    ordered = {key: payload[key] for key in ("config_version", "written_by", "updated_at") if key in payload}
+    ordered.update({key: value for key, value in payload.items() if key not in ordered})
+    _plain_atomic_write_bytes(Path(path), json.dumps(ordered, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def _merge_config_section(value: Any, template: Any) -> Any:
+    """Overlay saved values on current defaults: absent keys get defaults, unknown keys drop.
+
+    Only mappings are merged. Any other saved value, including a mapping where
+    the current model expects a scalar, is retained so validation reports it.
+    """
+    if not isinstance(template, dict) or not isinstance(value, dict):
+        return copy.deepcopy(value)
+    merged: dict[str, Any] = {}
+    for key, default in template.items():
+        if key not in value:
+            merged[key] = copy.deepcopy(default)
+        elif isinstance(default, dict):
+            merged[key] = _merge_config_section(value[key], default)
+        else:
+            merged[key] = copy.deepcopy(value[key])
+    return merged
+
+
+def upgrade_saved_endpoint_profile(profile: Any) -> Any:
+    """Complete a saved endpoint profile with defaults for fields it does not contain.
+
+    Missing fields take the defaults a new profile of the same provider and
+    model type would receive; unknown fields are ignored. Present values are
+    kept exactly and validated by normalize_endpoint_profile afterwards.
+    """
+    if not isinstance(profile, dict):
+        return copy.deepcopy(profile)
+    raw_provider = str(profile.get("provider") or "").strip().lower()
+    base_url = str(profile.get("base_url") or "")
+    try:
+        template = default_endpoint_profile(
+            str(profile.get("id") or ""), str(profile.get("label") or ""),
+            timeout_seconds=ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url=base_url,
+            model_type=normalize_endpoint_model_type(profile.get("model_type")),
+            provider=raw_provider if raw_provider in ENDPOINT_PROVIDERS else None,
+        )
+    except Exception:
+        template = endpoint_profile_template()
+    return {
+        key: copy.deepcopy(profile[key]) if key in profile else copy.deepcopy(template.get(key))
+        for key in ENDPOINT_PROFILE_USER_FIELDS
+    }
+
+
+def settings_from_config_document(
+    document: dict[str, Any] | None, *, location: str = CONFIG_FILE_NAME,
+) -> dict[str, Any]:
+    """Return complete in-memory settings from a (possibly partial or older) config.json.
+
+    Missing sections and fields take the current defaults and unknown fields are
+    ignored. Values that are present must still be valid; Storage validates the
+    result. A missing default endpoint selection falls back to the shipped
+    default when that profile is saved, otherwise to the first saved profile.
+    """
+    template = default_config()
+    raw = document.get("settings") if isinstance(document, dict) else None
+    if raw is None:
+        return template
+    if not isinstance(raw, dict):
+        raise UnsupportedDataVersionError(f"{location} settings must be a JSON object")
+    merged = _merge_config_section(raw, settings_for_config_document(template))
+    raw_llm = raw.get("llm") if isinstance(raw.get("llm"), dict) else {}
+    llm = merged.get("llm")
+    if isinstance(llm, dict) and isinstance(llm.get("endpoint_profiles"), list):
+        llm["endpoint_profiles"] = [upgrade_saved_endpoint_profile(row) for row in llm["endpoint_profiles"]]
+        saved_ids = [
+            str(row.get("id") or "").strip() for row in llm["endpoint_profiles"]
+            if isinstance(row, dict) and str(row.get("id") or "").strip()
+        ]
+        for key in ("default_profile_id", "default_chat_subagent_profile_id"):
+            if key in raw_llm or not saved_ids:
+                continue
+            shipped = template["llm"][key]
+            llm[key] = shipped if shipped in saved_ids else saved_ids[0]
+    settings = {key: template[key] for key in CONFIG_SETTINGS_VERSION_KEYS}
+    settings.update(merged)
+    return settings
+
+
+def credentials_from_config_document(
+    document: dict[str, Any] | None, *, location: str = CONFIG_FILE_NAME,
+) -> dict[str, dict[str, Any]]:
+    """Return every account's saved credential fields, with defaults for absent ones."""
+    defaults = default_credentials_config()
+    raw = document.get("credentials") if isinstance(document, dict) else None
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ValueError(f"{location} credentials must be a JSON object")
+    out: dict[str, dict[str, Any]] = {}
+    for account, default in defaults.items():
+        value = raw.get(account)
+        if value is None:
+            out[account] = copy.deepcopy(default)
+        elif not isinstance(value, dict):
+            raise ValueError(f"{location} credentials.{account} must be a JSON object")
+        else:
+            out[account] = _merge_config_section(value, default)
+    return out
 
 
 def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, location: str) -> None:
@@ -9663,17 +9910,20 @@ def validate_exact_mapping_shape(value: Any, template: dict[str, Any], *, locati
 
     Dictionary keys are structural, arrays remain arrays, and current scalar
     fields retain their JSON type. A successful write therefore cannot create an
-    app.json that the next startup rejects because of a stale field or wrong type.
+    manifest that the next startup rejects because of a stale field or wrong type.
+    config.json documents are completed with current defaults before this
+    check (settings_from_config_document), so the exact shape applies to the
+    in-memory model rather than to what a user or older release wrote.
     """
     if not isinstance(value, dict):
         raise UnsupportedDataVersionError(f"{location} must be a JSON object")
     expected = set(template)
     actual = set(value)
-    # Existing data roots keep their format generation and remain readable
-    # without rewriting app.json. Absent Serper fields mean disabled/no key.
-    optional = {"serper_enabled", "serper_api_key"} if location in {
-        "settings.web", "app.json.settings.web", "new app.json.settings.web",
-    } else set()
+    # Legacy app.json manifests (migrated once into config.json) may predate
+    # the Serper fields. Absent Serper fields mean disabled/no key.
+    optional = {"serper_enabled", "serper_api_key"} if (
+        location == "settings.web" or location.endswith(".settings.web")
+    ) else set()
     missing = sorted(str(key) for key in expected.difference(actual).difference(optional))
     extra = sorted(str(key) for key in actual.difference(expected))
     if missing or extra:
@@ -11989,7 +12239,7 @@ def gmail_payload_to_vault_item(
 
 
 def default_config() -> dict[str, Any]:
-    """Return all app-wide settings stored inside root/app.json."""
+    """Return all app-wide settings; config.json stores them without the generation tags."""
     return {
         "schema": RUNTIME_CONFIG_SCHEMA,
         "data_version": DATA_FILE_VERSION,
@@ -12900,23 +13150,39 @@ def iter_agent_output_text(storage: Any, agent: dict[str, Any], *, include_think
 
 
 class AppPaths:
-    """Paths rooted at the process working directory.
+    """Paths for one data root (the process working directory) and its config.json.
 
-    app.json, log.jsonl, chats/, agents/, skills/, credentials/, calendar/, and
-    vault/ are direct children of this root. Calendar Events, local Items, and
-    normalized Vault records use one atomic JSON record per object;
-    each chat owns attachments/, workspace/, and temp/ directories.
+    state.json, log.jsonl, task_ids.json, chats/, agents/, skills/, calendar/,
+    and vault/ are direct children of the root. Calendar Events, local Items,
+    and normalized Vault records use one atomic JSON record per object; each
+    chat owns attachments/, workspace/, and temp/ directories.
+
+    Application-wide settings, endpoint profiles and account credentials live in
+    one config.json. The application passes the file beside velox.py; an
+    AppPaths constructed without ``config_path`` uses <root>/config.json, which
+    keeps independent roots (for example test fixtures) fully isolated.
     """
 
-    def __init__(self, root_dir: Path = ROOT_DIR):
+    def __init__(self, root_dir: Path = ROOT_DIR, config_path: Path | None = None):
         self.root_dir = Path(root_dir).expanduser().resolve()
+        self.config_json_path = (
+            Path(config_path).expanduser().resolve() if config_path is not None
+            else self.root_dir / CONFIG_FILE_NAME
+        )
         self._manifest_cache: dict[str, Any] | None = None
-        self._manifest_cache_sig: tuple[int, int, int, int] | None = None
+        self._manifest_cache_sig: tuple[int, ...] | None = None
         self._manifest_disk_read_count = 0
 
     @property
-    def app_json_path(self) -> Path:
+    def state_json_path(self) -> Path:
         return self.root_dir / DATA_MANIFEST_NAME
+
+    @property
+    def legacy_app_json_path(self) -> Path:
+        return self.root_dir / LEGACY_APP_MANIFEST_NAME
+
+    def legacy_credentials_dir(self) -> Path:
+        return self.root_dir / LEGACY_CREDENTIALS_DIR_NAME
 
     @property
     def log_jsonl_path(self) -> Path:
@@ -12926,37 +13192,68 @@ class AppPaths:
     def task_ids_json_path(self) -> Path:
         return self.root_dir / "task_ids.json"
 
-    def _read_app_manifest_plain_uncached(self) -> dict[str, Any]:
-        try:
-            self.app_json_path.stat()
-        except FileNotFoundError:
-            return default_app_manifest()
-        except (PermissionError, OSError):
-            # A transient denial is not proof that the manifest is absent.
-            pass
-        self._manifest_disk_read_count += 1
-        try:
-            with DATA_ROOTS.lock_for_path(self.app_json_path):
-                raw = _plain_read_bytes_with_retry(self.app_json_path)
-        except FileNotFoundError:
-            return default_app_manifest()
-        obj = json.loads(raw.decode("utf-8"))
-        if not isinstance(obj, dict):
-            raise ValueError("app.json must contain one JSON object")
-        return obj
+    def manifest_lock(self) -> threading.RLock:
+        """One lock serializes config.json and state.json read-modify-write cycles.
 
-    def _app_manifest_sig(self) -> tuple[int, int, int, int] | None:
+        config.json may live outside the data root, so it shares the root's
+        lock rather than the generic external-path lock.
+        """
+        return DATA_ROOTS.lock_for_path(self.root_dir)
+
+    @staticmethod
+    def _file_sig(path: Path) -> tuple[int, int, int, int]:
+        """Return a file signature; a missing file is all zeros, other errors propagate."""
         try:
-            st = self.app_json_path.stat()
-            # Atomic replacement normally changes at least mtime, ctime, or the
-            # file identity. Include all three plus size so even same-length
-            # updates on coarse-timestamp filesystems invalidate stale caches.
-            return (
-                int(st.st_mtime_ns),
-                int(st.st_ctime_ns),
-                int(st.st_size),
-                int(getattr(st, "st_ino", 0)),
-            )
+            st = path.stat()
+        except FileNotFoundError:
+            return (0, 0, 0, 0)
+        # Atomic replacement normally changes at least mtime, ctime, or the
+        # file identity. Include all three plus size so even same-length
+        # updates on coarse-timestamp filesystems invalidate stale caches.
+        return (
+            int(st.st_mtime_ns),
+            int(st.st_ctime_ns),
+            int(st.st_size),
+            int(getattr(st, "st_ino", 0)),
+        )
+
+    def config_signature(self) -> tuple[int, int, int, int] | None:
+        try:
+            return self._file_sig(self.config_json_path)
+        except (PermissionError, OSError):
+            return None
+
+    def read_config_document(self) -> dict[str, Any] | None:
+        """Return the migrated config.json document, or None if it does not exist yet."""
+        with self.manifest_lock():
+            return read_config_document(self.config_json_path)
+
+    def write_config_document(self, document: dict[str, Any]) -> None:
+        with self.manifest_lock():
+            write_config_document(self.config_json_path, document)
+            self._manifest_cache = None
+            self._manifest_cache_sig = None
+
+    def _read_app_manifest_plain_uncached(self) -> dict[str, Any]:
+        """Combine config.json settings with this root's state.json."""
+        self._manifest_disk_read_count += 1
+        with self.manifest_lock():
+            try:
+                raw = _plain_read_bytes_with_retry(self.state_json_path)
+            except FileNotFoundError:
+                root_manifest = default_root_manifest()
+            else:
+                root_manifest = json.loads(raw.decode("utf-8"))
+                if not isinstance(root_manifest, dict):
+                    raise ValueError("state.json must contain one JSON object")
+            document = read_config_document(self.config_json_path)
+        manifest = dict(root_manifest)
+        manifest["settings"] = settings_from_config_document(document, location=str(self.config_json_path))
+        return manifest
+
+    def _app_manifest_sig(self) -> tuple[int, ...] | None:
+        try:
+            return self._file_sig(self.state_json_path) + self._file_sig(self.config_json_path)
         except (PermissionError, OSError):
             # A transient sharing lock must not invalidate a known-good cache and
             # force a second failing read on the UI thread.
@@ -12967,9 +13264,9 @@ class AppPaths:
         self._manifest_cache_sig = None
 
     def _read_app_manifest_plain(self) -> dict[str, Any]:
-        # Always compare the on-disk signature before serving the per-instance
+        # Always compare the on-disk signatures before serving the per-instance
         # cache. A time-only fast path can return stale settings immediately
-        # after another Storage/AppPaths instance atomically replaces app.json,
+        # after another Storage/AppPaths instance atomically replaces a file,
         # which is exactly when account Settings and window-state callers need
         # to observe each other's writes. stat() is cheap and unchanged files
         # still avoid JSON parsing and disk reads.
@@ -12992,17 +13289,39 @@ class AppPaths:
         return copy.deepcopy(obj)
 
     def _write_app_manifest_plain(self, manifest: dict[str, Any]) -> None:
+        """Split the combined manifest into state.json and config.json.
+
+        state.json is always replaced. config.json is replaced only when its
+        settings actually change, so routine UI-state saves leave the shared
+        configuration file (and any credentials in it) untouched.
+        """
         payload = copy.deepcopy(manifest or {})
         if payload.get("schema") != APP_SCHEMA or payload.get("data_version") != DATA_FILE_VERSION:
-            raise UnsupportedDataVersionError("Cannot write an unsupported app.json model")
+            raise UnsupportedDataVersionError("Cannot write an unsupported data-root model")
         payload["updated_at"] = now_iso()
-        with DATA_ROOTS.lock_for_path(self.app_json_path):
+        settings = payload.pop("settings", None)
+        if not isinstance(settings, dict):
+            raise UnsupportedDataVersionError("Cannot write settings that are not a JSON object")
+        with self.manifest_lock():
+            document = read_config_document(self.config_json_path)
+            current = (
+                settings_from_config_document(document, location=str(self.config_json_path))
+                if document is not None else None
+            )
+            if current != settings:
+                updated = copy.deepcopy(document) if document is not None else default_config_document()
+                updated["settings"] = settings_for_config_document(settings)
+                updated.setdefault("credentials", default_credentials_config())
+                write_config_document(self.config_json_path, updated)
             _plain_atomic_write_bytes(
-                self.app_json_path,
+                self.state_json_path,
                 json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
             )
             DATA_ROOTS.register(self.root_dir)
-            self._manifest_cache = copy.deepcopy(payload)
+            payload["settings"] = settings
+            ordered = {key: payload[key] for key in ("schema", "data_version", "settings", "state", "updated_at") if key in payload}
+            ordered.update({key: value for key, value in payload.items() if key not in ordered})
+            self._manifest_cache = ordered
             self._manifest_cache_sig = self._app_manifest_sig()
 
     def app_manifest(self) -> dict[str, Any]:
@@ -13091,18 +13410,9 @@ class AppPaths:
     def skills_dir(self) -> Path:
         return self.root_dir / "skills"
 
-    def credentials_dir(self) -> Path:
-        return self.root_dir / "credentials"
-
-
-    def google_calendar_credentials_file(self) -> Path:
-        return self.credentials_dir() / "google_calendar.cred"
-
-    def google_drive_credentials_file(self) -> Path:
-        return self.credentials_dir() / "google_drive.cred"
-
-    def gmail_credentials_file(self) -> Path:
-        return self.credentials_dir() / "gmail.cred"
+    def legacy_credential_file(self, account: str) -> Path:
+        """Pre-config.json XOR credential file, read only to migrate an older root."""
+        return self.legacy_credentials_dir() / f"{str(account).strip().lower()}.cred"
 
 
     def calendar_dir(self) -> Path:
@@ -13344,11 +13654,11 @@ class TaskIdStore:
 
 
 class CredentialStore:
-    """Cross-revision account files stored outside the strict app data model.
+    """Account credentials stored in the ``credentials`` section of config.json.
 
-    Each account owns one small JSON payload whose UTF-8 bytes are XORed with
-    0x77 before the atomic write. This only hides plain text from casual viewing;
-    it is deliberately not presented as cryptographic protection.
+    Values are plain JSON, like endpoint API keys elsewhere in config.json;
+    protect that file accordingly. Saving one account rewrites config.json but
+    keeps its settings section and every other account exactly as stored.
     """
 
     _DEFAULTS: dict[str, dict[str, Any]] = {
@@ -13359,36 +13669,22 @@ class CredentialStore:
 
     def __init__(self, paths: AppPaths):
         self.paths = paths
-        # Credential files are shared by UI actions and background connector
+        # Credentials are shared by UI actions and background connector
         # threads. Keep cache reads and read-modify-write updates serialized so
         # a token refresh cannot overwrite a simultaneously edited OAuth client
         # value (or vice versa).
         self._lock = threading.RLock()
-        self._cache: dict[str, tuple[tuple[int, int, int, int], dict[str, Any]]] = {}
+        self._cache: tuple[tuple[int, int, int, int] | None, dict[str, dict[str, Any]]] | None = None
 
-    def ensure_directory(self) -> None:
-        self.paths.credentials_dir().mkdir(parents=True, exist_ok=True)
+    @property
+    def config_path(self) -> Path:
+        return self.paths.config_json_path
 
-    def _path(self, account: str) -> Path:
+    def _account(self, account: str) -> str:
         key = str(account or "").strip().lower()
-        if key == GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT:
-            return self.paths.google_calendar_credentials_file()
-        if key == GOOGLE_DRIVE_CREDENTIAL_ACCOUNT:
-            return self.paths.google_drive_credentials_file()
-        if key == GMAIL_CREDENTIAL_ACCOUNT:
-            return self.paths.gmail_credentials_file()
-        raise ValueError(f"Unsupported credential account: {account}")
-
-    @staticmethod
-    def _signature(path: Path) -> tuple[int, int, int, int]:
-        try:
-            stat = path.stat()
-            return (
-                int(stat.st_mtime_ns), int(stat.st_ctime_ns),
-                int(stat.st_size), int(getattr(stat, "st_ino", 0)),
-            )
-        except OSError:
-            return 0, 0, 0, 0
+        if key not in self._DEFAULTS:
+            raise ValueError(f"Unsupported credential account: {account}")
+        return key
 
     def _validate_values(self, account: str, values: Any) -> dict[str, Any]:
         defaults = self._DEFAULTS[account]
@@ -13412,70 +13708,61 @@ class CredentialStore:
             "token": copy.deepcopy(token),
         }
 
-    def _load(self, account: str) -> dict[str, Any]:
-        key = str(account or "").strip().lower()
-        path = self._path(key)
-        # Always acquire the app-root lock before the instance cache lock. The
+    def _load_all(self) -> dict[str, dict[str, Any]]:
+        # Always acquire the manifest lock before the instance cache lock. The
         # same ordering is used by _save() and _mutate(), preventing a direct
         # save in one thread from deadlocking with a read-modify-write update in
         # another thread using the same CredentialStore instance.
-        with DATA_ROOTS.lock_for_path(path):
+        with self.paths.manifest_lock():
             with self._lock:
-                signature = self._signature(path)
-                cached = self._cache.get(key)
-                if cached is not None and cached[0] == signature:
+                signature = self.paths.config_signature()
+                cached = self._cache
+                if cached is not None and signature is not None and cached[0] == signature:
                     return copy.deepcopy(cached[1])
-                if not path.is_file():
-                    values = copy.deepcopy(self._DEFAULTS[key])
-                    self._cache[key] = (signature, values)
-                    return copy.deepcopy(values)
                 try:
-                    decoded = xor_credential_bytes(file_read_bytes(path)).decode("utf-8")
-                    payload = json.loads(decoded)
+                    document = self.paths.read_config_document()
+                    raw_accounts = credentials_from_config_document(document, location=str(self.config_path))
+                    values = {
+                        account: self._validate_values(account, raw_accounts[account])
+                        for account in self._DEFAULTS
+                    }
                 except Exception as exc:
-                    raise ValueError(f"Credential file is malformed: {path}: {type(exc).__name__}: {exc}") from exc
-                if (
-                    not isinstance(payload, dict)
-                    or payload.get("schema") != CREDENTIAL_FILE_SCHEMA
-                    or payload.get("account") != key
-                    or set(payload) != {"schema", "account", "credentials", "updated_at"}
-                ):
-                    raise ValueError(f"Credential file has an unsupported account payload: {path}")
-                values = self._validate_values(key, payload.get("credentials"))
-                self._cache[key] = (signature, copy.deepcopy(values))
-                return copy.deepcopy(values)
+                    raise ValueError(
+                        f"Credentials in {self.config_path} are malformed: {type(exc).__name__}: {exc}"
+                    ) from exc
+                self._cache = (signature, copy.deepcopy(values))
+                return values
+
+    def _load(self, account: str) -> dict[str, Any]:
+        key = self._account(account)
+        return copy.deepcopy(self._load_all()[key])
 
     def _save(self, account: str, values: dict[str, Any]) -> dict[str, Any]:
-        key = str(account or "").strip().lower()
-        path = self._path(key)
-        with DATA_ROOTS.lock_for_path(path):
+        key = self._account(account)
+        with self.paths.manifest_lock():
             with self._lock:
                 clean = self._validate_values(key, values)
-                self.ensure_directory()
-                payload = {
-                    "schema": CREDENTIAL_FILE_SCHEMA,
-                    "account": key,
-                    "credentials": clean,
-                    "updated_at": now_iso(),
-                }
-                raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-                _plain_atomic_write_bytes(path, xor_credential_bytes(raw))
-                self._cache[key] = (self._signature(path), copy.deepcopy(clean))
+                document = self.paths.read_config_document() or default_config_document()
+                credentials = document.get("credentials")
+                if not isinstance(credentials, dict):
+                    credentials = {}
+                credentials[key] = copy.deepcopy(clean)
+                document["credentials"] = credentials
+                self.paths.write_config_document(document)
+                self._cache = None
                 return copy.deepcopy(clean)
 
     def _mutate(self, account: str, update: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
         """Atomically read, modify, and save one account across store instances."""
-        key = str(account or "").strip().lower()
-        path = self._path(key)
+        key = self._account(account)
         # DATA_ROOTS provides one re-entrant lock per app root, so independent
         # CredentialStore instances used by Settings and connector workers cannot
         # overwrite each other's client/token fields with stale snapshots.
-        with DATA_ROOTS.lock_for_path(path):
+        with self.paths.manifest_lock():
             with self._lock:
                 current = self._load(key)
                 update(current)
                 return self._save(key, current)
-
 
     def load_google_calendar(self) -> dict[str, Any]:
         return self._load(GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT)
@@ -13540,11 +13827,89 @@ class CredentialStore:
 
 
     def validate_all(self) -> None:
-        self.ensure_directory()
-        for account in self._DEFAULTS:
-            path = self._path(account)
-            if path.is_file():
-                self._load(account)
+        self._load_all()
+
+
+def read_legacy_credential_file(path: Path, account: str) -> dict[str, Any] | None:
+    """Decode one pre-config.json XOR credential file for migration, or None if absent."""
+    key = str(account or "").strip().lower()
+    target = Path(path)
+    if not target.is_file():
+        return None
+    try:
+        payload = json.loads(xor_credential_bytes(file_read_bytes(target)).decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Credential file is malformed: {target}: {type(exc).__name__}: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != CREDENTIAL_FILE_SCHEMA
+        or payload.get("account") != key
+        or set(payload) != {"schema", "account", "credentials", "updated_at"}
+    ):
+        raise ValueError(f"Credential file has an unsupported account payload: {target}")
+    store_defaults = CredentialStore._DEFAULTS[key]
+    values = payload.get("credentials")
+    if not isinstance(values, dict) or set(values) != set(store_defaults):
+        raise ValueError(f"Malformed {key} credential fields in {target}")
+    return copy.deepcopy(values)
+
+
+def migrate_legacy_data_root(paths: AppPaths) -> bool:
+    """Move a release-327-or-earlier root from app.json/credentials/ to the new layout.
+
+    Runs only when the root has app.json but no state.json. The legacy manifest
+    must be the supported data generation; anything else is rejected without
+    changing a byte. Settings and credentials are imported into config.json only
+    when that file does not exist yet; the root's UI state always moves to
+    state.json. The legacy files are removed only after their settings have been
+    imported and both new files read back successfully. Returns True if migrated.
+    """
+    if paths.state_json_path.exists() or not paths.legacy_app_json_path.is_file():
+        return False
+    DATA_ROOTS.register(paths.root_dir)
+    with paths.manifest_lock():
+        if paths.state_json_path.exists():
+            return False
+        try:
+            manifest = json.loads(_plain_read_bytes_with_retry(paths.legacy_app_json_path).decode("utf-8"))
+        except Exception as exc:
+            raise UnsupportedDataVersionError(f"Legacy app.json is unreadable: {type(exc).__name__}: {exc}") from exc
+        if not isinstance(manifest, dict) or manifest.get("data_version") != DATA_FILE_VERSION:
+            found = str(manifest.get("data_version") or "missing") if isinstance(manifest, dict) else "missing"
+            raise UnsupportedDataVersionError(
+                f"Unsupported Velox data version {found}; this build requires exactly {DATA_FILE_VERSION}."
+            )
+        Storage._validate_current_manifest(manifest)
+        import_settings = not paths.config_json_path.exists()
+        if import_settings:
+            credentials = default_credentials_config()
+            for account in credentials:
+                values = read_legacy_credential_file(paths.legacy_credential_file(account), account)
+                if values is not None:
+                    credentials[account] = values
+            write_config_document(
+                paths.config_json_path,
+                default_config_document(manifest["settings"], credentials),
+            )
+        _plain_atomic_write_bytes(paths.state_json_path, json.dumps({
+            "schema": manifest["schema"],
+            "data_version": manifest["data_version"],
+            "state": manifest["state"],
+            "updated_at": now_iso(),
+        }, ensure_ascii=False, indent=2).encode("utf-8"))
+        paths.invalidate_app_manifest_cache()
+        Storage._validate_current_manifest(paths._read_app_manifest_plain_uncached())
+        CredentialStore(paths).validate_all()
+        if import_settings:
+            paths.legacy_app_json_path.unlink()
+            legacy_dir = paths.legacy_credentials_dir()
+            for account in CredentialStore._DEFAULTS:
+                paths.legacy_credential_file(account).unlink(missing_ok=True)
+            try:
+                legacy_dir.rmdir()
+            except OSError:
+                pass  # Absent, or holds files Velox did not create.
+    return True
 
 
 class Storage:
@@ -13578,14 +13943,17 @@ class Storage:
         self._ensuring = True
         try:
             self.paths.root_dir.mkdir(parents=True, exist_ok=True)
-            if not self.paths.app_json_path.exists():
+            migrate_legacy_data_root(self.paths)
+            if not self.paths.state_json_path.exists():
                 DATA_ROOTS.write_manifest(
-                    self.paths.root_dir, environment=environment,
-                    chrome_path=chrome_path, node_path=node_path,
+                    self.paths.root_dir, config_path=self.paths.config_json_path,
+                    environment=environment, chrome_path=chrome_path, node_path=node_path,
                 )
-                self.data_root = DATA_ROOTS.register(self.paths.root_dir)
-            else:
-                self.data_root = DATA_ROOTS.register(self.paths.root_dir)
+            elif not self.paths.config_json_path.exists():
+                # An existing root opened with a new or deleted config.json gets
+                # the current defaults; root data is never reset for this.
+                self.paths.write_config_document(default_config_document())
+            self.data_root = DATA_ROOTS.register(self.paths.root_dir)
             DATA_ROOTS.assert_supported(self.paths.root_dir)
             self._validate_current_manifest(self.paths.app_manifest())
             TaskIdStore(self).ensure()
@@ -13595,9 +13963,7 @@ class Storage:
             # The native C/C++ Skill is machine-generated from live Visual Studio, MSVC, and CMake discovery on every startup.
             self.paths.skills_dir().mkdir(parents=True, exist_ok=True)
             refresh_machine_generated_skills_for_startup(self.paths.root_dir, environment)
-            credentials = CredentialStore(self.paths)
-            credentials.ensure_directory()
-            credentials.validate_all()
+            CredentialStore(self.paths).validate_all()
             if not self.paths.log_jsonl_path.exists():
                 atomic_write_text(self.paths.log_jsonl_path, "")
             for child in self.paths.chats_dir().iterdir():
@@ -13644,18 +14010,18 @@ class Storage:
     @staticmethod
     def _validate_current_manifest(manifest: dict[str, Any]) -> None:
         if not isinstance(manifest, dict) or manifest.get("schema") != APP_SCHEMA or manifest.get("data_version") != DATA_FILE_VERSION:
-            raise UnsupportedDataVersionError(f"app.json is not the Velox V{SOURCE_REVISION} data model")
-        validate_exact_mapping_shape(manifest, default_app_manifest(), location="app.json")
+            raise UnsupportedDataVersionError(f"state.json is not the Velox V{SOURCE_REVISION} data model")
+        validate_exact_mapping_shape(manifest, default_app_manifest(), location="manifest")
         settings = manifest["settings"]
-        validate_endpoint_profiles_config(settings.get("llm"), location="app.json.settings.llm")
+        validate_endpoint_profiles_config(settings.get("llm"), location="config.json settings.llm")
         try:
-            validate_chat_settings(settings.get("chat"), location="app.json.settings.chat")
-            validate_agent_settings(settings.get("agents"), location="app.json.settings.agents")
+            validate_chat_settings(settings.get("chat"), location="config.json settings.chat")
+            validate_agent_settings(settings.get("agents"), location="config.json settings.agents")
         except ValueError as exc:
             raise UnsupportedDataVersionError(str(exc)) from exc
         web_mode = str(settings.get("web", {}).get("user_agent_mode") or "")
         if web_mode not in WEB_USER_AGENT_MODES:
-            raise UnsupportedDataVersionError("app.json.settings.web.user_agent_mode is invalid")
+            raise UnsupportedDataVersionError("config.json settings.web.user_agent_mode is invalid")
         try:
             resolve_vault_timezone(settings.get("vault", {}).get("local_timezone"))
             normalize_vault_divider_fraction(settings.get("vault", {}).get("divider_fraction"))
@@ -13667,11 +14033,11 @@ class Storage:
             raise UnsupportedDataVersionError(str(exc)) from exc
         state = manifest["state"]
         if settings.get("schema") != RUNTIME_CONFIG_SCHEMA or settings.get("data_version") != DATA_FILE_VERSION:
-            raise UnsupportedDataVersionError("app.json settings are not the current Velox settings model")
+            raise UnsupportedDataVersionError("config.json settings are not the current Velox settings model")
         if state.get("schema") != APP_STATE_SCHEMA:
-            raise UnsupportedDataVersionError("app.json state is not the current Velox state model")
+            raise UnsupportedDataVersionError("state.json state is not the current Velox state model")
         if normalize_active_panel(state.get("active_panel")) != state.get("active_panel"):
-            raise UnsupportedDataVersionError("app.json state active_panel is invalid")
+            raise UnsupportedDataVersionError("state.json state active_panel is invalid")
         try:
             normalized_calendar_date = normalize_iso_date(
                 state.get("calendar_selected_date"), field_name="Calendar selected date",
@@ -13679,20 +14045,20 @@ class Storage:
         except ValueError as exc:
             raise UnsupportedDataVersionError(str(exc)) from exc
         if normalized_calendar_date != state.get("calendar_selected_date"):
-            raise UnsupportedDataVersionError("app.json state Calendar date is not normalized")
+            raise UnsupportedDataVersionError("state.json state Calendar date is not normalized")
         value = state.get("calendar_chat_width")
         if (
             isinstance(value, bool) or not isinstance(value, int)
             or not (CALENDAR_CHAT_WIDTH_MIN <= value <= CALENDAR_CHAT_WIDTH_MAX)
         ):
-            raise UnsupportedDataVersionError("app.json state calendar_chat_width is invalid")
+            raise UnsupportedDataVersionError("state.json state calendar_chat_width is invalid")
         split_fraction = state.get("calendar_right_split_fraction")
         if (
             isinstance(split_fraction, bool)
             or not isinstance(split_fraction, (int, float))
             or not (CALENDAR_RIGHT_SPLIT_MIN <= float(split_fraction) <= CALENDAR_RIGHT_SPLIT_MAX)
         ):
-            raise UnsupportedDataVersionError("app.json state calendar_right_split_fraction is invalid")
+            raise UnsupportedDataVersionError("state.json state calendar_right_split_fraction is invalid")
 
     def _install_config_view(
         self, config: dict[str, Any],
@@ -13713,7 +14079,7 @@ class Storage:
         The returned dictionary is owned by Storage and must never be mutated.
         Local writes install a new view immediately. A cheap file-signature poll
         detects writes from another process/Storage instance without reparsing or
-        revalidating app.json on every rendered frame.
+        revalidating config.json on every rendered frame.
         """
         self.ensure_first_run_files()
         now_mono = time.monotonic()
@@ -13807,14 +14173,14 @@ class Storage:
 
         Settings autosave uses ``preserve_live_fields`` so a concurrent
         window-geometry write cannot be replayed away by an older long-lived
-        editor draft. Account credentials are stored independently in credentials/.
+        editor draft. Account credentials in config.json are never touched here.
         Explicit config.write calls retain full replacement semantics.
         """
         self.ensure_first_run_files()
         cfg = self._validated_config_copy(config)
-        with DATA_ROOTS.lock_for_path(self.paths.app_json_path):
+        with self.paths.manifest_lock():
             # Bypass the short-lived read cache for read/modify/write. A second
-            # Storage/AppPaths instance may have updated app.json since this
+            # Storage/AppPaths instance may have updated config.json since this
             # instance last read it, and replaying a cached manifest would erase
             # the other instance's settings or state change.
             manifest = self.paths._read_app_manifest_plain_uncached()
@@ -13835,7 +14201,7 @@ class Storage:
         if not callable(updater):
             raise TypeError("config updater must be callable")
         self.ensure_first_run_files()
-        with DATA_ROOTS.lock_for_path(self.paths.app_json_path):
+        with self.paths.manifest_lock():
             manifest = self.paths._read_app_manifest_plain_uncached()
             self._validate_current_manifest(manifest)
             cfg = copy.deepcopy(manifest["settings"])
@@ -13918,11 +14284,11 @@ class Storage:
     def write_app_state_and_geometry(
         self, state: dict[str, Any], geometry: dict[str, Any] | None = None,
     ) -> None:
-        """Commit state and optional window geometry with one app.json replacement."""
+        """Commit state and optional window geometry with one manifest write (state.json, config.json if changed)."""
         self.ensure_first_run_files()
         payload = self._normalized_app_state_payload(state)
         requested_geometry = dict(geometry or {})
-        with DATA_ROOTS.lock_for_path(self.paths.app_json_path):
+        with self.paths.manifest_lock():
             manifest = self.paths._read_app_manifest_plain_uncached()
             self._validate_current_manifest(manifest)
             manifest["state"] = payload
@@ -16678,7 +17044,7 @@ class VaultStore:
             account_id or "google-calendar",
             enabled=True,
             connection_state="connected" if account_id else "not_configured",
-            credential_reference="credentials/google_calendar.cred",
+            credential_reference="config.json#credentials.google_calendar",
             metadata={"provider": "google", "read_only": True},
         )
         calendar_external_id = str(event["external_calendar_id"])
@@ -18981,7 +19347,7 @@ class GmailConnector(BaseVaultConnector):
             email_address or "gmail",
             enabled=bool(self._settings().get("enabled")),
             connection_state="connected" if connected else "not_configured",
-            credential_reference="credentials/gmail.cred",
+            credential_reference="config.json#credentials.gmail",
             metadata={"provider": "gmail_imap", "read_only": True},
         )
         container = self.vault.upsert_container(
@@ -19405,7 +19771,7 @@ class GmailConnector(BaseVaultConnector):
                 source["account_identifier"],
                 enabled=False,
                 connection_state="disabled",
-                credential_reference="credentials/gmail.cred",
+                credential_reference="config.json#credentials.gmail",
                 metadata=source.get("metadata", {}),
                 source_id=source["id"],
             )
@@ -19679,7 +20045,7 @@ class CalendarStore:
             return (0, 0, 0)
 
     def _calendar_display_timezone(self, *, force_poll: bool = False) -> tuple[str, Any]:
-        """Return the configured display timezone without parsing app.json every frame."""
+        """Return the configured display timezone without parsing config.json every frame."""
         now_mono = time.monotonic()
         with self._cache.lock:
             if (
@@ -19965,7 +20331,7 @@ class CalendarStore:
             account_identifier,
             enabled=True,
             connection_state=("error" if state.get("last_error") else ("connected" if connected else "not_configured")),
-            credential_reference="credentials/google_calendar.cred",
+            credential_reference="config.json#credentials.google_calendar",
             metadata={"provider": "google", "read_only": True},
         )
         source = vault.update_data_source_sync_status(
@@ -26510,16 +26876,10 @@ class LLMClient:
 
     def _endpoint_cache_signature(self) -> tuple[int, int, int, int]:
         try:
-            stat = self.storage.paths.app_json_path.stat()
             # Atomic settings writes can preserve the same byte length and, on
             # coarse filesystems, the same visible modification timestamp. ctime
             # and inode/file-id keep endpoint changes from remaining stale.
-            return (
-                int(getattr(stat, "st_mtime_ns", 0)),
-                int(stat.st_size),
-                int(getattr(stat, "st_ctime_ns", 0)),
-                int(getattr(stat, "st_ino", 0)),
-            )
+            return self.storage.paths._file_sig(self.storage.paths.config_json_path)
         except Exception:
             return 0, 0, 0, 0
 
@@ -30115,7 +30475,7 @@ Keep synthesis, decisions and the final answer here. Use direct tools for small 
 
     def assemble_chat_context(self, _scope_id: str, chat_id: str) -> list[dict[str, Any]]:
         try:
-            manifest = read_json(self.paths.app_json_path, {}) or {}
+            manifest = self.paths.app_manifest()
             config = manifest.get("settings") if isinstance(manifest, dict) else {}
         except Exception:
             config = {}
@@ -78294,19 +78654,31 @@ class Panels:
         value_w = max(1, inner_width - label_w - 10)
         return int(label_w), int(value_w)
 
+    def _app_data_rows(self) -> list[tuple[str, str]]:
+        """Label/path rows for the Application data card; also sizes the card."""
+        services = getattr(self, "services", None)
+        storage = getattr(services, "storage", None)
+        paths = getattr(storage, "paths", None)
+
+        def show(value: Callable[[Any], Any]) -> str:
+            return str(value(paths)) if paths is not None else ""
+
+        return [
+            ("Working directory", show(lambda p: p.root_dir)),
+            ("config.json", show(lambda p: p.config_json_path)),
+            ("state.json", show(lambda p: p.state_json_path)),
+            ("Chats", show(lambda p: p.chats_dir())),
+            ("Agents", show(lambda p: p.agents_dir())),
+            ("Skills", show(lambda p: p.skills_dir())),
+            ("Log", show(lambda p: p.log_jsonl_path)),
+        ]
+
     def _draw_app_data_card(self, rect: Rect) -> None:
-        """Show the application-data paths under the working directory."""
+        """Show the application-data paths and the configuration file."""
         inner = self._draw_settings_card_shell(rect, "Application data")
         y = inner.y
         label_w = min(180, max(120, int(inner.w * 0.26)))
-        rows = [
-            ("Working directory", str(self.services.storage.paths.root_dir)),
-            ("app.json", str(self.services.storage.paths.app_json_path)),
-            ("Chats", str(self.services.storage.paths.chats_dir())),
-            ("Agents", str(self.services.storage.paths.agents_dir())),
-            ("Skills", str(self.services.storage.paths.skills_dir())),
-            ("Log", str(self.services.storage.paths.log_jsonl_path)),
-        ]
+        rows = self._app_data_rows()
         for index, (label, value) in enumerate(rows):
             self.widgets.label(Rect(inner.x, y, label_w, SETTINGS_CONTROL_H), label, Palette.muted2)
             available_w = max(1, inner.w - label_w - 10)
@@ -78578,7 +78950,7 @@ class Panels:
     def _general_settings_card_heights(self, column_width: int) -> tuple[int, ...]:
         _ = column_width
         one_control_h = self._settings_card_height_for_content(SETTINGS_CONTROL_H)
-        data_h = self._settings_card_height_for_content(self._settings_rows_height(6))
+        data_h = self._settings_card_height_for_content(self._settings_rows_height(len(self._app_data_rows())))
         history_h = self._settings_card_height_for_content(
             self._settings_rows_height(2) + SETTINGS_ROW_GAP + 28 + 180
         )
@@ -79171,7 +79543,7 @@ class Panels:
             str(google_cfg.get("client_secret") or ""),
             "GOCSPX-...",
             password=True,
-            tooltip="Desktop app OAuth Client secret stored in credentials/google_calendar.cred for the browser sign-in flow.",
+            tooltip="Desktop app OAuth Client secret stored in config.json for the browser sign-in flow.",
         )
         if (
             next_google_client_id != str(google_cfg.get("client_id") or "")
@@ -79458,7 +79830,7 @@ class Panels:
         next_drive_client_secret = self.widgets.text_input(
             "settings.accounts.google_drive.client_secret", Rect(value_x, cy, value_w, SETTINGS_CONTROL_H),
             str(drive_credentials.get("client_secret") or ""), "GOCSPX-...", password=True,
-            tooltip="Desktop app OAuth Client secret stored in credentials/google_drive.cred.",
+            tooltip="Desktop app OAuth Client secret stored in config.json.",
         )
         if (
             next_drive_client_id != str(drive_credentials.get("client_id") or "")
@@ -79509,7 +79881,7 @@ class Panels:
             "settings.accounts.google_drive.copy_calendar_oauth",
             self._settings_account_action_button_rect(setup_column, 2),
             "Use Calendar OAuth app",
-            tooltip="Copy the configured Calendar OAuth Client ID and secret into the separate Drive credential file.",
+            tooltip="Copy the configured Calendar OAuth Client ID and secret into the separate Drive credentials in config.json.",
         ):
             try:
                 calendar_credentials = credential_store.load_google_calendar()
@@ -79987,7 +80359,7 @@ class Panels:
                 web_cfg["serper_api_key"] = self.widgets.text_input(
                     "settings.web.serper_api_key", Rect(input_x, cy, available_w, SETTINGS_CONTROL_H),
                     str(web_cfg.get("serper_api_key") or ""), "API key from serper.dev",
-                    password=True, tooltip="Required when Use Serper is on. Saved locally in app.json with your other settings.",
+                    password=True, tooltip="Required when Use Serper is on. Saved locally in config.json with your other settings.",
                 )
                 cy += SETTINGS_CONTROL_H + SETTINGS_ROW_GAP
                 self.widgets.label(Rect(inner.x, cy, label_w, SETTINGS_CONTROL_H), "Scrape provider", Palette.muted2)
@@ -82104,9 +82476,11 @@ class Panels:
 
 
 class VeloxApp:
-    def __init__(self):
+    def __init__(self, config_path: Path | None = None):
         initialize_host_environment()
-        self.paths = AppPaths()
+        # Data lives under the working directory; application-wide configuration
+        # lives in config.json beside velox.py unless --config names another file.
+        self.paths = AppPaths(ROOT_DIR, config_path if config_path is not None else DEFAULT_CONFIG_PATH)
         self.storage = Storage(self.paths)
         # A fresh working directory is initialized immediately. The previous
         # first-run confirmation screen was redundant because service construction
@@ -82254,7 +82628,7 @@ class VeloxApp:
         return {"kind": kind, "id": object_id}
 
     def ensure_chat_if_empty(self) -> None:
-        """Create or restore the active chat from app.json state."""
+        """Create or restore the active chat from state.json."""
         self.storage.ensure_first_run_files()
         app_state = self.storage.load_app_state()
         candidates = [str(app_state.get("active_chat_id") or "")]
@@ -82849,7 +83223,7 @@ class VeloxApp:
     def developer_mode_enabled(self) -> bool:
         # Same low-rate config polling strategy as the perf overlay: Settings writes
         # update config_draft immediately, while disk edits are picked up without
-        # parsing app.json on every frame.
+        # parsing config.json on every frame.
         try:
             if self.ui_state.config_draft is not None:
                 return bool(self.ui_state.config_draft.get("ui", {}).get("developer_mode", False))
@@ -83010,7 +83384,7 @@ class RecoveryService:
     def scan_for_corrupt_json(self) -> list[dict[str, Any]]:
         """Validate only Velox-owned JSON files in the execution directory."""
         errors: list[dict[str, Any]] = []
-        candidates = [self.storage.paths.app_json_path]
+        candidates = [self.storage.paths.state_json_path, self.storage.paths.config_json_path]
         if self.storage.paths.chats_dir().exists():
             for chat_dir in self.storage.paths.chats_dir().iterdir():
                 if chat_dir.is_dir() and chat_dir.name.startswith("chat_"):
@@ -83047,18 +83421,13 @@ class RecoveryService:
                 read_json(candidate)
             except Exception as exc:
                 errors.append({"path": str(candidate), "error": str(exc)})
-        credential_store = CredentialStore(self.storage.paths)
-        for account, path, loader in (
-            (GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT, self.storage.paths.google_calendar_credentials_file(), credential_store.load_google_calendar),
-            (GOOGLE_DRIVE_CREDENTIAL_ACCOUNT, self.storage.paths.google_drive_credentials_file(), credential_store.load_google_drive),
-            (GMAIL_CREDENTIAL_ACCOUNT, self.storage.paths.gmail_credentials_file(), credential_store.load_gmail),
-        ):
-            if not path.is_file():
-                continue
+        if self.storage.paths.config_json_path.is_file():
             try:
-                loader()
+                CredentialStore(self.storage.paths).validate_all()
             except Exception as exc:
-                errors.append({"path": str(path), "account": account, "error": str(exc)})
+                errors.append({
+                    "path": str(self.storage.paths.config_json_path), "account": "credentials", "error": str(exc),
+                })
         return errors
 
     def rebuild_derived_state(self) -> None:
@@ -83145,6 +83514,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         f"Data format: {DATA_FILE_VERSION}."
     ))
     parser.add_argument("--init-only", action="store_true", help="create data defaults and exit")
+    parser.add_argument(
+        "--config", default="", metavar="PATH",
+        help=f"configuration file (default: {CONFIG_FILE_NAME} beside velox.py)",
+    )
     parser.add_argument("--test", action="store_true", help="run the companion test_velox.py suite")
     parser.add_argument("--test-class", default="", help=argparse.SUPPRESS)
     parser.add_argument("--no-ui", action="store_true", help="initialize services but do not open the PySDL3 window")
@@ -83157,13 +83530,14 @@ async def async_main(argv: list[str]) -> int:
         import test_velox
         return test_velox.run_test_suite()
 
-    app = VeloxApp()
+    app = VeloxApp(config_path=Path(args.config) if str(args.config or "").strip() else None)
     if args.init_only or args.no_ui:
         app.storage.ensure_first_run_files()
         app.ensure_chat_if_empty()
         app.persist_app_state()
         await asyncio.to_thread(APP_LOG_WRITER.flush)
         print(f"{APP_NAME} initialized at: {app.paths.root_dir}")
+        print(f"{APP_NAME} configuration: {app.paths.config_json_path}")
         return 0
 
     try:

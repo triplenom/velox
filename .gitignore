@@ -6,9 +6,16 @@ venv/
 .pytest_cache/
 *.egg-info/
 
+# Application configuration: settings, endpoint API keys and account credentials
+/config.json
+/config.json.*
+
 # Application data when launched from the source directory
+/state.json
+/state.json.*
 /app.json
 /app.json.*
+/endpoint_token_calibration.json
 /task_ids.json
 /task_ids.json.*
 /log.jsonl

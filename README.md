@@ -47,7 +47,9 @@ Set-Location ..\velox-data
 & $python $app
 ```
 
-The **working directory is the application data directory**, not the source directory. Keep it separate from the checkout. Settings/state live in `app.json`; conversations, agent records, skills, context and working files are stored beneath that data root. Do not commit the data directory.
+The **working directory is the application data directory**, not the source directory. Keep it separate from the checkout. Conversations, agent records, skills, context, working files and the root's UI state (`state.json`) are stored beneath that data root. Do not commit the data directory.
+
+All application configuration lives in **one file, `config.json`, beside `velox.py`**: app settings, endpoint profiles (including API keys) and account credentials. Pass `--config PATH` to use a different file. Settings edits from the UI are saved there, and you can also edit it by hand while Velox is closed. It is plain JSON and contains secrets, so keep it private; `.gitignore` excludes it from the repository.
 
 To initialize data files without opening the window:
 
@@ -55,7 +57,7 @@ To initialize data files without opening the window:
 & $python $app --init-only
 ```
 
-`--no-ui` also initializes services/data without opening the PySDL3 window. Use `--help` for the current CLI options.
+`--no-ui` also initializes services/data without opening the PySDL3 window. Use `--help` for the current CLI options, including `--config`.
 
 The interface uses the pinned [PySDL3](https://pysdl3.readthedocs.io/en/latest/install.html) package and Pillow. PySDL3 normally downloads its native binaries on first import; its documentation explains custom/offline binary configuration. Interactive startup also needs a usable graphics environment. See `requirements.txt` for the exact dependency constraints.
 
@@ -64,6 +66,15 @@ The interface uses the pinned [PySDL3](https://pysdl3.readthedocs.io/en/latest/i
 `CURRENT_VERSION` identifies the application release. `BACKWARD_COMPATIBLE_VERSION` identifies the supported persisted-data generation. Valid roots from the supported data generation remain compatible, while other generations are rejected without automatic migration. See these constants in `velox.py` for the supported release and data generation. Use a fresh directory for incompatible data; do not expect a version bump to convert an old root.
 
 **Every commit must bump `CURRENT_VERSION`, no exceptions.** Compatible changes increment the application version only. Change `BACKWARD_COMPATIBLE_VERSION` as well only when the data format actually breaks compatibility, and update the relevant tests/documentation.
+
+`config.json` follows a separate, deliberately tolerant contract so that every future release can read it:
+
+- It carries its own `config_version` (`CONFIG_FILE_VERSION`), independent of both version constants above. The data-generation tags are never written into it.
+- Fields missing from the file take the current defaults, and fields the running release does not know are ignored. Adding or removing a setting therefore needs no migration.
+- Values that are present must be valid; an invalid value is reported with its location instead of being silently replaced. Loading never rewrites the file.
+- Renaming a field or changing its meaning requires bumping `CONFIG_FILE_VERSION` and registering an upgrade step in `CONFIG_FILE_MIGRATIONS`, never rejecting an older file.
+
+Data roots created by release 327 or earlier (`app.json` plus a `credentials/` directory) are migrated automatically on first start: settings, endpoint profiles and credentials move into `config.json`, UI state moves into `state.json`, and the old files are removed after the new ones read back successfully. If a `config.json` already exists, it is kept, only the UI state is migrated, and the old files are left in place for you to review.
 
 ## First task
 
@@ -162,6 +173,8 @@ python test_velox.py
 ```
 
 Headless regression tests do not require PySDL3. Tests use temporary data and local/mock provider fixtures, and cover transports, tools, persistence, agents, checklists, scheduling, UI contracts, ownership, timeout and cancellation behavior.
+
+Each fixture data root receives its own `config.json` containing a **test-owned endpoint inventory** (built with the public profile factory and test-only IDs), so adding, renaming or retiring a shipped endpoint preset does not affect unrelated tests. The shipped presets are covered only by structural invariants in `ShippedEndpointDefaultsTests`.
 
 Each discovered test class runs in its own disposable child process with a **1,800-second timeout** and validated PID/count/result records. Ordinary storage fixtures use deterministic discovery inputs; dedicated discovery/startup tests retain the production path. Functional cases still run on hosted Windows, but strict microbenchmark assertions are omitted when `GITHUB_ACTIONS=true`; local Windows and Linux retain them.
 
