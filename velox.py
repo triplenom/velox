@@ -292,7 +292,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 326
+CURRENT_VERSION = 327
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -4359,6 +4359,7 @@ ENDPOINT_MODEL_TYPE_LABELS = {
 DEFAULT_QWEN_3_6_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-6-vllm"
 DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-vllm"
 DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-llama-cpp"
+# Retired preset IDs stay stable so saved endpoints from earlier inventories resolve.
 DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-flash-next-vllm"
 DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID = "endpoint-qwen-3-8-flash-next-novita"
 DEFAULT_AGENTIC_CONTEXT_TOKENS = 524_288
@@ -5536,7 +5537,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
     """Return current out-of-box endpoint profiles; never overwrite saved choices."""
     return [
         default_endpoint_profile(
-            DEFAULT_OPUS_5_5_ENDPOINT_PROFILE_ID, "Anthropic Opus 5.5",
+            DEFAULT_OPUS_5_5_ENDPOINT_PROFILE_ID, "Opus 5.5 (Anthropic)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.anthropic.com/v1/messages",
             model_type=ENDPOINT_MODEL_TYPE_OPUS_5_5, provider=ENDPOINT_PROVIDER_ANTHROPIC,
@@ -5551,7 +5552,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID,
-            "DSV41F 1017 (Novita)",
+            "DeepSeek 4.1 1017 (Novita)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.novita.ai/openai/v1/chat/completions",
             model="deepseek/deepseek-v4.1-flash-1017",
@@ -5574,23 +5575,6 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
             provider=ENDPOINT_PROVIDER_LLAMA_CPP,
         ),
         default_endpoint_profile(
-            DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID,
-            "Qwen 3.8 Flash Next (vLLM, model alias)",
-            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
-            base_url="http://127.0.0.1:8090/v1/chat/completions",
-            model="model",
-            model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
-        ),
-        default_endpoint_profile(
-            DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID,
-            "Qwen 3.8 Flash Next (Novita)",
-            timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
-            base_url="https://api.novita.ai/openai/v1/chat/completions",
-            model="qwen/qwen3.8-flash",
-            model_type=ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT,
-            provider=ENDPOINT_PROVIDER_NOVITA,
-        ),
-        default_endpoint_profile(
             DEFAULT_KIMI_K3_ENDPOINT_PROFILE_ID,
             "Kimi K3 (Novita)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
@@ -5600,7 +5584,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
-            "DSV4F Exp (vLLM)",
+            "DeepSeek 4 Exp (vLLM)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="http://127.0.0.1:8090/v1/chat/completions",
             model="model",
@@ -5610,7 +5594,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID,
-            "ChatGPT 6.1 Sol",
+            "GPT-6.1 Sol (OpenAI)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.openai.com/v1/responses",
             model_type=ENDPOINT_MODEL_TYPE_GPT_6_SOL,
@@ -5618,7 +5602,7 @@ def default_endpoint_profiles() -> list[dict[str, Any]]:
         ),
         default_endpoint_profile(
             DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID,
-            "ChatGPT 6 Luna",
+            "GPT-6 Luna (OpenAI)",
             timeout_seconds=LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="https://api.openai.com/v1/responses",
             model_type=ENDPOINT_MODEL_TYPE_GPT_6_LUNA,

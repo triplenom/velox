@@ -96,6 +96,14 @@ def _legacy_endpoint_fixture_profiles() -> list[dict[str, Any]]:
             "Qwen 3.6 (vLLM)", timeout_seconds=velox.IMAGE_ANALYSIS_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="http://127.0.0.1:8070/v1/chat/completions", model="model",
             model_type=velox.ENDPOINT_MODEL_TYPE_QWEN_3_6),
+        velox.default_endpoint_profile(velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID,
+            "Qwen 3.8 Flash Next (vLLM, model alias)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="http://127.0.0.1:8090/v1/chat/completions", model="model",
+            model_type=velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT),
+        velox.default_endpoint_profile(velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID,
+            "Qwen 3.8 Flash Next (Novita)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
+            base_url="https://api.novita.ai/openai/v1/chat/completions", model="qwen/qwen3.8-flash",
+            model_type=velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT, provider=velox.ENDPOINT_PROVIDER_NOVITA),
         velox.default_endpoint_profile(velox.DEFAULT_DEEPSEEK_V4_FLASH_0731_ENDPOINT_PROFILE_ID,
             "DSV4F 0731 (vLLM)", timeout_seconds=velox.LONG_ENDPOINT_TIMEOUT_SECONDS_DEFAULT,
             base_url="http://127.0.0.1:8090/v1/chat/completions", model="model",
@@ -2721,7 +2729,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertEqual(local["provider"], velox.ENDPOINT_PROVIDER_VLLM)
         self.assertEqual(local["max_concurrent_requests"], 4)
         self.assertEqual(local["context_window_tokens"], 524_288)
-        novita = velox.endpoint_profile_ref(cfg, velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID)
+        novita = velox.endpoint_profile_ref(cfg, velox.DEFAULT_KIMI_K3_ENDPOINT_PROFILE_ID)
         self.assertEqual(novita["provider"], velox.ENDPOINT_PROVIDER_NOVITA)
         self.assertEqual(novita["max_concurrent_requests"], 4)
         self.assertEqual(cfg["tools"]["chat_max_tool_iterations"], velox.TOOL_CALL_MAX_ITERATIONS)
@@ -10074,7 +10082,7 @@ class ConfigurationAndConnectorConcurrencyTests(_DataRootsIsolatedTestMixin, uni
         profile = velox.endpoint_profile_ref(
             config, velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
         )
-        self.assertEqual(profile["label"], "DSV4F Exp (vLLM)")
+        self.assertEqual(profile["label"], "DeepSeek 4 Exp (vLLM)")
         self.assertEqual(profile["model_type"], velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP)
         self.assertEqual(profile["base_url"], "http://127.0.0.1:8090/v1/chat/completions")
         self.assertEqual(profile["model"], "model")
@@ -10321,7 +10329,7 @@ class EndpointAndPersonalAssistantTests(_DataRootsIsolatedTestMixin, unittest.Te
         dsv4f = velox.endpoint_profile_ref(
             config, velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
         )
-        self.assertEqual(dsv4f["label"], "DSV4F Exp (vLLM)")
+        self.assertEqual(dsv4f["label"], "DeepSeek 4 Exp (vLLM)")
         self.assertEqual(dsv4f["max_image_inputs_per_prompt"], 256)
         self.assertTrue(velox.endpoint_supports_vision(dsv4f))
         self.assertEqual(dsv4f["image_analysis_context"], "inline")
@@ -16083,14 +16091,14 @@ class EndpointSettingsAndChatRenderingTests(_DataRootsIsolatedTestMixin, unittes
             velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID,
             velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID,
             velox.DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID,
-            velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID,
-            velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID,
             velox.DEFAULT_KIMI_K3_ENDPOINT_PROFILE_ID,
             velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
             velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID,
             velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID,
         }
         self.assertTrue(required_ids.issubset(by_id))
+        self.assertNotIn(velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID, by_id)
+        self.assertNotIn(velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID, by_id)
         for profile in profiles:
             with self.subTest(endpoint_id=profile["id"]):
                 self.assertTrue(str(profile["label"]).strip())
@@ -20388,8 +20396,8 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         self.assertNotIn("Analyze images" + " in current Task", editor_source)
         self.assertNotIn("native_" + "image_analysis", editor_source)
 
-    def test_qwen38_flash_next_profile_payload_and_official_defaults(self) -> None:
-        config = velox.default_config()
+    def test_legacy_qwen38_flash_next_model_alias_payload(self) -> None:
+        config = _config_with_legacy_endpoint_fixtures()
         profile = velox.endpoint_profile_ref(config, velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID)
         defaults = velox.endpoint_model_type_defaults(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8_FLASH_NEXT)
         self.assertEqual(
@@ -20427,6 +20435,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
         with _TemporaryDataDirectory() as td:
             storage = velox.Storage(velox.AppPaths(Path(td)))
             _ensure_test_storage(storage)
+            _install_legacy_endpoint_fixtures(storage)
             client = velox.LLMClient(storage)
             request = velox.LLMRequest(
                 scope_id=velox.APP_SCOPE_ID,
@@ -23507,7 +23516,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
         self.assertEqual(
             defaults["model"], "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
         )
-        self.assertEqual(profile["label"], "DSV4F Exp (vLLM)")
+        self.assertEqual(profile["label"], "DeepSeek 4 Exp (vLLM)")
         self.assertEqual(profile["provider"], velox.ENDPOINT_PROVIDER_VLLM)
         self.assertEqual(
             profile["model_type"], velox.ENDPOINT_MODEL_TYPE_DEEPSEEK_V4_FLASH_VISION_EXP,
@@ -23690,7 +23699,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             })
             second[velox.CURRENT_CONTEXT_VISION_RESULT_KEY] = second_handoff
             qwen = velox.endpoint_profile_ref(
-                storage.load_config(), velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID,
+                storage.load_config(), velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID,
             )
             multi, multi_summary = velox.build_current_context_vision_message(
                 [], [first, second], qwen,
@@ -23764,7 +23773,7 @@ class VisionEndpointAndRoutingTests(_DataRootsIsolatedTestMixin, unittest.TestCa
             assistant = velox.make_turn(
                 chat_id, "assistant", "",
                 endpoint_profile_id=velox.DEFAULT_DEEPSEEK_V4_FLASH_VISION_EXP_ENDPOINT_PROFILE_ID,
-                endpoint_label="DSV4F Exp (vLLM)",
+                endpoint_label="DeepSeek 4 Exp (vLLM)",
                 status="streaming",
             )
             chats.append_turn(velox.APP_SCOPE_ID, chat_id, user)
@@ -37097,6 +37106,7 @@ class EndpointDefaultsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.tmp = _TemporaryDataDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.storage = _make_test_storage(Path(self.tmp.name))
+        _install_legacy_endpoint_fixtures(self.storage)
         self.client = velox.LLMClient(self.storage)
 
     def profile(self, hosted: bool = True) -> dict[str, Any]:
@@ -37140,13 +37150,14 @@ class EndpointDefaultsTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 self.assertEqual(p['max_output_tokens'], 131072)
                 self.assertEqual(velox.endpoint_prompt_capacity_tokens(p), 393216)
 
-    def test_profile_inventory_adds_one_unique_endpoint(self) -> None:
+    def test_default_profile_inventory_excludes_retired_qwen_presets(self) -> None:
         profiles = velox.default_endpoint_profiles()
-        self.assertEqual(len({p['id'] for p in profiles}), len(profiles))
-        hosted = [p for p in profiles if p['id'] == velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID]
-        self.assertEqual(len(hosted), 1)
-        self.assertEqual(hosted[0]['model'], 'qwen/qwen3.8-flash')
-        self.assertEqual(hosted[0]['provider'], velox.ENDPOINT_PROVIDER_NOVITA)
+        ids = [p['id'] for p in profiles]
+        self.assertEqual(len(set(ids)), len(profiles))
+        self.assertNotIn(velox.DEFAULT_QWEN_3_8_FLASH_NEXT_ENDPOINT_PROFILE_ID, ids)
+        self.assertNotIn(velox.DEFAULT_QWEN_3_8_FLASH_NEXT_NOVITA_ENDPOINT_PROFILE_ID, ids)
+        self.assertIn(velox.DEFAULT_QWEN_3_8_ENDPOINT_PROFILE_ID, ids)
+        self.assertIn(velox.DEFAULT_QWEN_3_8_LLAMA_CPP_ENDPOINT_PROFILE_ID, ids)
 
     def test_unrelated_qwen_27b_and_kimi_baseten_defaults_unchanged(self) -> None:
         q = velox.endpoint_model_type_defaults(velox.ENDPOINT_MODEL_TYPE_QWEN_3_8)
@@ -37436,7 +37447,7 @@ class PromptContractTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('fresh post-fix capture',velox.DEFAULT_IMAGE_ANALYSIS_SKILL_MARKDOWN)
 
 
-class QwenHTTPTests(_AsyncRuntimeFixture):
+class QwenHTTPTests(_LegacyEndpointFixtureMixin, _AsyncRuntimeFixture):
     """Actual localhost HTTP round trips for both Qwen provider configurations."""
 
     async def round_trip(self, hosted: bool, streaming: bool) -> None:
@@ -45095,6 +45106,11 @@ class CurrentEndpointPresetRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRu
         (velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_SOL, 'gpt-6.1-sol', 'medium'),
         (velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID, velox.ENDPOINT_MODEL_TYPE_GPT_6_ASTRA, 'gpt-6-astra', 'medium'),
     )
+    GPT6_LABELS = {
+        velox.DEFAULT_GPT_6_LUNA_ENDPOINT_PROFILE_ID: 'GPT-6 Luna (OpenAI)',
+        velox.DEFAULT_GPT_6_SOL_ENDPOINT_PROFILE_ID: 'GPT-6.1 Sol (OpenAI)',
+        velox.DEFAULT_GPT_6_ASTRA_ENDPOINT_PROFILE_ID: 'ChatGPT 6 Astra',
+    }
 
     def test_current_inventory_excludes_all_retired_presets(self) -> None:
         profiles = velox.default_endpoint_profiles()
@@ -45116,7 +45132,7 @@ class CurrentEndpointPresetRegressionTests(_LegacyEndpointFixtureMixin, _AsyncRu
                 self.assertEqual(p['reasoning_effort'], effort)
                 self.assertEqual(p['api_transport'], velox.ENDPOINT_API_TRANSPORT_RESPONSES)
                 self.assertEqual(p['base_url'], 'https://api.openai.com/v1/responses')
-                self.assertEqual(p['label'], 'ChatGPT ' + model.split('-')[1] + ' ' + model.rsplit('-', 1)[1].title())
+                self.assertEqual(p['label'], self.GPT6_LABELS[eid])
                 self.assertEqual((p['context_window_tokens'], p['max_output_tokens']), (1050000, 128000))
                 self.assertEqual(velox.normalize_endpoint_profile(p), p)
 
@@ -45201,7 +45217,7 @@ class DeepSeek1017AndQwenPresetTests(_AsyncRuntimeFixture):
     def test_novita_profile_sends_provider_model_auth_and_reasoning_contract(self) -> None:
         eid = velox.DEFAULT_DEEPSEEK_V4_1_FLASH_1017_NOVITA_ENDPOINT_PROFILE_ID
         profile = velox.endpoint_profile_ref(self.storage.load_config(), eid)
-        self.assertEqual(profile['label'], 'DSV41F 1017 (Novita)')
+        self.assertEqual(profile['label'], 'DeepSeek 4.1 1017 (Novita)')
         self.assertEqual(profile['provider'], velox.ENDPOINT_PROVIDER_NOVITA)
         self.assertEqual(profile['api_key'], '')
         self.assertEqual(tuple(profile[key] for key in velox.ENDPOINT_PRICE_FIELDS), (.30, .006, 1.20))
@@ -49575,7 +49591,7 @@ class DropdownPopupWidthTests(unittest.TestCase):
         widgets = self.widgets(1920)
         option = 'Qwen 3.8 Flash Next (llama.cpp)'
         trigger = velox.Rect(1440, 235, 270, 34)
-        menu, *_ = widgets._dropdown_menu_geometry(trigger, [option, 'Anthropic Opus 5.5'])
+        menu, *_ = widgets._dropdown_menu_geometry(trigger, [option, 'Opus 5.5 (Anthropic)'])
         self.assertGreaterEqual(menu.w - 36, widgets._text_width(option))
         self.assertGreaterEqual(menu.x, 8)
         self.assertLessEqual(menu.x + menu.w, 1912)
