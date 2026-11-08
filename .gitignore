@@ -40,3 +40,7 @@ venv/
 *.zip
 .DS_Store
 Thumbs.db
+
+# Shared local documents and generated conversion cache
+/library/*
+!/library/README.md

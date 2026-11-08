@@ -1,0 +1,2 @@
+# Optional offline PDF/Office conversion; text search uses only the standard library.
+markitdown[pdf,docx,pptx,xlsx,xls]==0.1.5

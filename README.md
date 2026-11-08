@@ -88,7 +88,7 @@ Select the appropriate **Chat Completions**, **Responses**, or **Anthropic Messa
 
 Anthropic manages the cache remotely; actual hits depend on identical prefixes, model minimum prompt lengths and TTL. Cache reads and writes remain included in Velox's token usage and cost accounting. Enabling caching is not a guarantee that every request produces a cache hit.
 
-Create a chat, choose its main/subagent endpoints, and **enable the tools** it needs. The seven policy labels are **File, System, Web, Agent, Chat, Checklists and Computer Use**. New chats start with **Agent, Chat, Checklists and Computer Use off**; File, System and Web remain on. Saved per-chat choices are not changed. Endpoint/tool choices lock when the first real message is sent. Point coding/file work at a disposable workspace and state any write boundaries explicitly. For example:
+Create a chat, choose its main/subagent endpoints, and **enable the tools** it needs. The eight policy labels are **File, System, Web, Agent, Chat, Checklists, Computer Use and Local Library**. New chats start with **Agent, Chat, Checklists and Computer Use off**; File, System, Web and Local Library remain on. Saved per-chat choices are not changed. Endpoint/tool choices lock when the first real message is sent. Point coding/file work at a disposable workspace and state any write boundaries explicitly. For example:
 
 > Build a local tool for exploring CSV files. Let me import a file, inspect its columns, filter rows and export the result. Pick a suitable stack, add tests and run them. Work only in the workspace I specify.
 
@@ -104,6 +104,32 @@ The dashboard keeps the existing native layout: five summary cards (Task status,
 - Outcome and token/cache cards show **24 hours**, independent of the cost picker. Tokens are counted at request time, not from a recently active Chat's lifetime total. While the first background snapshot loads, the existing counters remain explicitly labelled **All time**. Cached input is a subset of input, never an extra token-ring segment; an asterisk on the cache-hit badge indicates partial reporting.
 - **Costs** offers the existing rolling periods, a preceding-period comparison, provider shares and seven history bars. For periods up to 24 hours, the bars show the last seven days; longer selections divide the chosen period into seven intervals. Hover for exact intervals and accounting details. No previous spend means no fabricated percentage change.
 - Short windows scroll the dashboard as a page, while each table retains its own scrolling. Page Up/Down works when an editor is not focused. Larger text wraps the summary cards and filters instead of hiding task controls.
+
+### Local Library
+
+**Local Library** is on by default in **NEW CHAT SETTINGS** and is independent of both **File** and **System**. The choice is saved per chat, copied/branched with it, inherited (and never broadened at creation) by its agents, and locked at the first message. Off removes all three tools from model schemas and rejects their execution. Older compatible chat/agent records default to on without changing existing tool choices or `config.json`; the data generation remains 316 (release 337).
+
+Put shared documents and subfolders in **`library/` beside `velox.py`**, not under the working/data directory. The application creates it at startup. Its contents and `.cache/` are git-ignored (except its README). Library tools never search the rest of the computer. They refuse traversal, alternate data streams, symlinks, Windows junctions/reparse points and direct access to `.cache/`. Sources are read-only; only generated conversion cache files are written.
+
+| Tool | Behavior |
+| --- | --- |
+| `library_search(query, max_results, timeout_in_seconds)` | Case-insensitive Unicode keyword/quoted-phrase scanning. Up to 50 results and 32,000 serialized result characters; 0.1–120 seconds. Each result includes the original library-relative path, an inclusive 1-based line range, a short excerpt and a deterministic relevance score. |
+| `library_read_doc_lines(path, start_line, end_line)` | Expands an original source path, including cached PDF/Office Markdown. Inclusive 1-based ranges, at most 1,000 requested lines and 24,000 returned characters. |
+| `library_read_doc(path)` | Returns at most 24,000 characters, with an explicit `truncated` flag. Use line reads to continue. |
+
+Text and Markdown are scanned directly as strict UTF-8 (a UTF-8 BOM is accepted); line numbers use universal newline handling. Keywords are literal substring matches, not regular expressions. Quoted phrases must occur together (whitespace, including a newline, is normalized). Unquoted terms may match independently; exact phrases and multiple nearby terms rank higher. Ranking uses a rolling three-fragment window (fragments are at most 16,384 characters); path and line order break ties. Overlapping excerpts are deduplicated, not returned repeatedly. Scanning retains only bounded fragments and the best results, never the whole library in memory. No database, index, embeddings, retrieval model or external search program is used.
+
+PDF, DOCX, PPTX, XLSX and XLS reuse the existing **MarkItDown** conversion. Install the optional local converters with:
+
+```bash
+python -m pip install -r requirements-library.txt
+```
+
+Converted Markdown is cached under `library/.cache/`, keyed by original path and validated against source size, modification/change timestamps and file identity. Unchanged sources reuse it across chats and restarts; changed sources are reconverted. Results keep the **original filename**, and their line numbers refer to the converted Markdown, not PDF pages or Office layout. Plugins, cloud endpoints, LLM captioning and OCR are not enabled; conversion runs offline in a cancellable child process. Image-only PDFs therefore yield no searchable text. Missing dependencies, corrupt files and other conversion failures are reported with source paths, not silently treated as no matches.
+
+Searches run off the UI thread and honor Stop/cancellation. `incomplete: true` and `reasons` explicitly report timeouts, cancellation and unreadable/failed files; `errors` contains bounded diagnostics and `error_count` includes omitted diagnostics. `results_limited` separately indicates top-result/output caps; it does not mean scanning stopped early. A partial search cannot prove a document or term is absent. Reads report truncation explicitly and have a 120-second operation deadline. The general tool cancellation result also marks an interrupted search incomplete.
+
+Library access is shared across chats, **not a private per-chat vault**. Treat documents as untrusted text. Conversion/search stay local, but returned excerpts can be sent to the configured chat/agent model, including a hosted endpoint. General File/System tools remain separately privileged; the library boundary is not an OS sandbox for those tools.
 
 ### Computer Use
 

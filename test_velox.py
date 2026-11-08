@@ -1624,7 +1624,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(set(features), {
                 "file_tools_enabled", "system_tools_enabled", "web_tools_enabled",
                 "agent_tools_enabled", "chat_history_enabled", "checklists_enabled",
-                "computer_use_enabled", "show_reasoning_content",
+                "computer_use_enabled", "local_library_enabled", "show_reasoning_content",
             })
             self.assertEqual(set(chats.get_chat_tool_features(chat["chat_id"])), set(velox.CHAT_TOOL_FEATURE_KEYS))
             self.assertNotIn("persistence_mode_enabled", features)
@@ -1803,6 +1803,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             ))
             self.assertTrue(chats.is_chat_endpoint_locked(chat_id))
             self.assertEqual(chats.get_chat_tool_features(chat_id), {
+                "local_library_enabled": True,
                 "file_tools_enabled": True,
                 "system_tools_enabled": False,
                 "web_tools_enabled": True,
@@ -1995,6 +1996,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             ("chat_history_enabled", "Chat"),
             ("checklists_enabled", "Checklists"),
             ("computer_use_enabled", "Computer Use"),
+            ("local_library_enabled", "Local Library"),
         ))
         self.assertIn("CHAT_TOOL_CATEGORY_LABELS", setup)
         self.assertIn('("agent_tools_enabled", "Agent tools", True)', defaults)
@@ -4995,6 +4997,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             for name in registry.tools:
                 expected = (
                     "checklists_enabled" if name in velox.EXPERT_MODE_TOOL_NAMES or name in velox.CHECKLIST_TOOL_NAMES
+                    else "local_library_enabled" if name.startswith("library_")
                     else "computer_use_enabled" if name.startswith("computer_")
                     else "file_tools_enabled" if name.startswith(velox.FILE_TOOL_PREFIXES)
                     else "web_tools_enabled" if name.startswith(("web_", "browser_"))
@@ -20699,6 +20702,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
                 ("chat_history_enabled", "Chat"),
                 ("checklists_enabled", "Checklists"),
                 ("computer_use_enabled", "Computer Use"),
+                ("local_library_enabled", "Local Library"),
             ),
         )
         self.assertEqual(velox.CHAT_TOOL_FEATURE_KEYS, tuple(key for key, _label in velox.CHAT_TOOL_CATEGORY_LABELS))
@@ -20782,7 +20786,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             velox.chat_task_settings_label(
                 "Endpoint", {key: True for key in velox.CHAT_TOOL_FEATURE_KEYS},
             ),
-            "Endpoint - Tools [File, System, Web, Agent, Chat, Checklists] - Computer Use: On",
+            "Endpoint - Tools [File, System, Web, Agent, Chat, Checklists, Local Library] - Computer Use: On",
         )
 
     def test_consecutive_image_groups_preserve_boundaries_and_order(self) -> None:
@@ -42056,7 +42060,7 @@ class ChecklistToggleTests(_StorageFixture):
         self.assertIs(velox.ChatStore(self.storage).load_chat(self.cid)['features']['checklists_enabled'],False)
         other=self.chats.create_chat('Independent defaults')
         self.assertIs(other['features']['checklists_enabled'],False)
-        self.assertEqual(len(velox.CHAT_TOOL_FEATURE_KEYS),7)
+        self.assertEqual(len(velox.CHAT_TOOL_FEATURE_KEYS),8)
         self.assertIn(('checklists_enabled','Checklists'),velox.CHAT_TOOL_CATEGORY_LABELS)
 
     def test_first_real_message_locks_checklists_but_display_preference_stays_editable(self) -> None:
@@ -42159,7 +42163,7 @@ class ChecklistToggleTests(_StorageFixture):
             calls.append((key,rect,label,value)); return original(key,rect,label,value,**kwargs)
         with mock.patch.object(panel.widgets,'toggle',side_effect=toggle):
             self.assertTrue(panel._draw_new_chat_task_settings(velox.Rect(0,0,1000,600)))
-        self.assertEqual(len(calls),7)
+        self.assertEqual(len(calls),8)
         key,rect,label,value=next(row for row in calls if row[0].endswith('checklists_enabled'))
         self.assertEqual(label,'Checklists'); self.assertTrue(value)
         panel.widgets.inp.mouse_x=rect.x+rect.w-20; panel.widgets.inp.mouse_y=rect.y+rect.h//2
@@ -51196,7 +51200,7 @@ class ComputerUsePolicyTests(_StorageFixture):
         self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
         on_prompt = context.assemble_chat_context(velox.APP_SCOPE_ID, self.cid)[0]["content"]
         self.assertIn("COMPUTER USE\n\nComputer Use is ON", on_prompt)
-        self.assertIn("Computer Use. Use no other category", on_prompt)
+        self.assertIn("Computer Use, Local Library. Use no other category", on_prompt)
         self.assertIn("Ctrl+P+End", on_prompt)
         self.assertNotIn("Computer Use is OFF", on_prompt)
         on_agent = runtime.build_standard_system_prompt(agents.create_agent(self.cid, "On"))
@@ -51215,19 +51219,19 @@ class ComputerUsePolicyTests(_StorageFixture):
         view = velox.Rect(0, 0, 1000, 700)
         with mock.patch.object(panel.widgets, "toggle", side_effect=toggle), mock.patch.object(panel.r, "draw_card", side_effect=draw_card):
             self.assertTrue(panel._draw_new_chat_task_settings(view))
-        self.assertEqual(len(calls), 7)
-        key, rect, label, value, tooltip = calls[-1]
+        self.assertEqual(len(calls), 8)
+        key, rect, label, value, tooltip = next(row for row in calls if row[0] == "chat.task_setup.computer_use_enabled")
         self.assertEqual((key, label, value), ("chat.task_setup.computer_use_enabled", "PC Control", False))
         self.assertIn("Ctrl+P+End", tooltip)
         card = cards[0]
         for _key, toggle_rect, *_rest in calls:
             self.assertGreaterEqual(toggle_rect.y, card.y)
             self.assertLessEqual(toggle_rect.y + toggle_rect.h, card.y + card.h - 12, "toggle must sit inside the card padding")
-        # Alone in the last row, Computer Use spans the card so its label is not truncated,
-        # and the card height is derived from the drawn rows (18 px inset on every side).
-        self.assertEqual((rect.x, rect.w), (card.x + 18, card.w - 36))
+        # Computer Use shares the final row with Local Library; both fit inside the card.
+        self.assertEqual(rect.x, card.x + 18)
+        self.assertEqual(rect.w, (card.w - 36 - 16) // 2)
         self.assertEqual(card.y + card.h - (rect.y + rect.h), 18)
-        self.assertLess(calls[-2][1].w, rect.w)
+        self.assertEqual(calls[-1][1].w, rect.w)
         panel.widgets.inp.mouse_x = rect.x + rect.w - 20; panel.widgets.inp.mouse_y = rect.y + rect.h // 2
         panel.widgets.inp.mouse_pressed = True; panel.widgets.inp.mouse_down = True
         panel._draw_new_chat_task_settings(view)
@@ -51676,6 +51680,416 @@ class ComputerUseRealDesktopTests(_StorageFixture):
                 backend.user32.SetCursorPos(original_cursor["x"], original_cursor["y"])
                 if original_foreground and backend.is_window(original_foreground):
                     backend.focus(original_foreground)
+
+
+class LocalLibraryTests(_StorageFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.library = Path(self.temp.name) / "library"
+        self.library.mkdir()
+        patch = mock.patch.object(velox.LibraryTools, "root", return_value=self.library)
+        patch.start(); self.addCleanup(patch.stop)
+        self.tools = velox.LibraryTools(self.storage)
+        self.ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, cancel_event=threading.Event())
+
+    def put(self, name: str, text: str) -> Path:
+        path = self.library / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def search(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        return asyncio.run(self.tools.search(self.ctx, {"query": query, "max_results": 10, "timeout_in_seconds": 10, **kwargs}))
+
+    def test_keywords_ranking_phrases_and_original_line_ranges(self) -> None:
+        self.put("single.txt", "alpha only\n")
+        self.put("together.md", "heading\nALPHA beta\ntail\n")
+        result = self.search("alpha beta")
+        self.assertFalse(result["incomplete"])
+        self.assertEqual(result["results"][0]["path"], "together.md")
+        self.assertIn("ALPHA beta", result["results"][0]["excerpt"])
+        self.assertLessEqual(result["results"][0]["start_line"], 2)
+        self.assertGreaterEqual(result["results"][0]["end_line"], 2)
+        self.assertEqual([r["path"] for r in self.search('"alpha beta"')["results"]], ["together.md"])
+        self.assertEqual(self.search('"beta alpha"')["results"], [])
+
+    def test_phrase_excerpt_is_relevant_after_long_whitespace_and_chunk_boundaries(self) -> None:
+        self.put("long.md", "x" * 16380 + " red\n" + " " * 2000 + "fox final\n")
+        result = self.search('"red   fox"')
+        self.assertFalse(result["incomplete"], result)
+        self.assertEqual(len(result["results"]), 1)
+        self.assertIn("red fox", result["results"][0]["excerpt"])
+        self.assertLessEqual(result["results"][0]["start_line"], 1)
+        self.assertGreaterEqual(result["results"][0]["end_line"], 2)
+        self.put("boundary.txt", "x" * 16380 + "boundaryneedle\n")
+        self.assertIn("boundaryneedle", self.search("boundaryneedle")["results"][0]["excerpt"])
+
+    def test_unicode_casefold_bom_subfolders_and_cross_line_phrase(self) -> None:
+        self.put("子/文.md", "\ufeffStraße CAFÉ 東京\nred\nfox\n")
+        self.assertEqual(self.search("STRASSE café 東京")["results"][0]["path"], "子/文.md")
+        self.assertEqual(len(self.search('"red fox"')["results"]), 1)
+
+    def test_deduplicates_overlaps_and_caps_output_deterministically(self) -> None:
+        for number in range(70):
+            self.put(f"{number:02}.txt", ("match " * 120 + "\n") * 5)
+        result = self.search("match", max_results=50)
+        self.assertLessEqual(len(json.dumps(result, ensure_ascii=False)), self.tools.MAX_OUTPUT)
+        self.assertTrue(result["results_limited"])
+        self.assertEqual(result, self.search("match", max_results=50))
+        for index, a in enumerate(result["results"]):
+            for b in result["results"][index+1:]:
+                if a["path"] == b["path"]:
+                    self.assertTrue(a["end_line"] < b["start_line"] or b["end_line"] < a["start_line"])
+
+    def test_only_supported_files_and_no_cache_search(self) -> None:
+        self.put("code.py", "hidden")
+        self.put(".cache/hidden.md", "hidden")
+        Path(self.temp.name, "outside.txt").write_text("hidden", encoding="utf-8")
+        self.assertEqual(self.search("hidden")["results"], [])
+
+    def test_bounded_reads_inclusive_lines_and_empty_ranges(self) -> None:
+        self.put("a.md", "one\ntwo\n三\nfour\n")
+        result = asyncio.run(self.tools.read_lines(self.ctx, {"path": "a.md", "start_line": 2, "end_line": 3}))
+        self.assertEqual((result["text"], result["start_line"], result["end_line"], result["truncated"]), ("two\n三\n", 2, 3, False))
+        self.assertIsNone(asyncio.run(self.tools.read_lines(self.ctx, {"path": "a.md", "start_line": 9, "end_line": 10}))["end_line"])
+        self.put("large.txt", "abc\n" * 10000)
+        result = asyncio.run(self.tools.read_doc(self.ctx, {"path": "large.txt"}))
+        self.assertEqual(len(result["text"]), self.tools.MAX_CHARS)
+        self.assertTrue(result["truncated"])
+        for start, end in [(0, 1), (3, 2), (1, 1001), (True, 2)]:
+            with self.assertRaises(ValueError):
+                asyncio.run(self.tools.read_lines(self.ctx, {"path": "a.md", "start_line": start, "end_line": end}))
+
+    def test_exact_read_cap_does_not_count_lookahead_as_a_returned_line(self) -> None:
+        self.put("boundary.md", "a\nb\nc\n")
+        with mock.patch.object(self.tools, "MAX_CHARS", 4):
+            result = asyncio.run(self.tools.read_lines(self.ctx, {"path": "boundary.md", "start_line": 1, "end_line": 3}))
+            self.assertEqual((result["text"], result["end_line"], result["truncated"]), ("a\nb\n", 2, True))
+            result = asyncio.run(self.tools.read_doc(self.ctx, {"path": "boundary.md"}))
+            self.assertEqual((result["text"], result["end_line"], result["truncated"]), ("a\nb\n", 2, True))
+            self.put("exact.md", "a\nb\n")
+            result = asyncio.run(self.tools.read_doc(self.ctx, {"path": "exact.md"}))
+            self.assertEqual((result["text"], result["end_line"], result["truncated"]), ("a\nb\n", 2, False))
+
+    def test_giant_lines_stream_fully_and_invalid_utf8_is_explicit(self) -> None:
+        self.put("huge.txt", "match" + "x" * 100000 + " distantneedle\n")
+        (self.library / "invalid.md").write_bytes(b"\xffmatch")
+        result = self.search("match")
+        self.assertTrue(result["incomplete"])
+        self.assertEqual(set(result["reasons"]), {"file_errors"})
+        distant = self.search("distantneedle")["results"][0]
+        self.assertEqual((distant["start_line"], distant["end_line"]), (1, 1))
+        self.assertIn("distantneedle", distant["excerpt"])
+        self.assertEqual(result["error_count"], 1)
+        self.assertTrue(asyncio.run(self.tools.read_doc(self.ctx, {"path": "huge.txt"}))["truncated"])
+
+    def test_conversion_cache_invalidates_and_reads_keep_original_source(self) -> None:
+        source = self.put("report.docx", "fake document")
+        def convert(src: Path, output: Path, *args: Any) -> None:
+            output.write_text("# Report\nneedle\n", encoding="utf-8")
+        with mock.patch.object(self.tools, "_convert", side_effect=convert) as converter:
+            result = self.search("needle")
+            self.assertEqual(result["results"][0]["path"], "report.docx")
+            read = asyncio.run(self.tools.read_lines(self.ctx, {"path": "report.docx", "start_line": 2, "end_line": 2}))
+            self.assertEqual(read["text"], "needle\n")
+            self.assertEqual(read["line_basis"], "converted Markdown")
+            self.assertEqual(converter.call_count, 1)
+            source.write_text("changed source", encoding="utf-8")
+            self.search("needle")
+            self.assertEqual(converter.call_count, 2)
+        self.assertEqual(source.read_text(encoding="utf-8"), "changed source")
+        self.assertTrue(list((self.library / ".cache").glob("*.md")))
+
+    def test_conversion_failure_and_source_change_are_not_silent(self) -> None:
+        source = self.put("bad.pdf", "bad")
+        with mock.patch.object(self.tools, "_convert", side_effect=RuntimeError("conversion exploded")):
+            result = self.search("needle")
+            self.assertTrue(result["incomplete"])
+            self.assertIn("conversion exploded", result["errors"][0]["error"])
+            with self.assertRaisesRegex(RuntimeError, "conversion exploded"):
+                asyncio.run(self.tools.read_doc(self.ctx, {"path": "bad.pdf"}))
+        def changed(src: Path, output: Path, *args: Any) -> None:
+            source.write_text("new source", encoding="utf-8")
+            output.write_text("needle", encoding="utf-8")
+        with mock.patch.object(self.tools, "_convert", side_effect=changed):
+            self.assertIn("Source changed", self.search("needle")["errors"][0]["error"])
+        self.assertEqual(list((self.library / ".cache").glob("*.tmp")), [])
+
+    def test_traversal_absolute_outside_ads_and_cache_are_rejected(self) -> None:
+        outside = Path(self.temp.name) / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        for path in ["../outside.txt", str(outside), ".cache/anything.md", ".cache./anything.md", "a.txt:stream", ""]:
+            with self.subTest(path=path), self.assertRaises((ValueError, PermissionError)):
+                asyncio.run(self.tools.read_doc(self.ctx, {"path": path}))
+
+    def test_symlink_and_windows_junction_escapes_are_rejected(self) -> None:
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir(); (outside / "secret.txt").write_text("secret", encoding="utf-8")
+        link = self.library / "escape"
+        if os.name == "nt":
+            created = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], capture_output=True)
+            self.assertEqual(created.returncode, 0, created.stderr)
+        else:
+            link.symlink_to(outside, target_is_directory=True)
+        self.addCleanup(lambda: link.rmdir() if os.name == "nt" else link.unlink())
+        with self.assertRaises(PermissionError):
+            asyncio.run(self.tools.read_doc(self.ctx, {"path": "escape/secret.txt"}))
+        result = self.search("secret")
+        self.assertEqual(result["results"], [])
+        self.assertTrue(result["incomplete"])
+
+    def test_file_symlink_is_rejected_without_following_it(self) -> None:
+        outside = Path(self.temp.name) / "outside-symlink.txt"
+        outside.write_text("secret", encoding="utf-8")
+        link = self.library / "link.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", 0) == 1314:
+                self.skipTest("Windows symlink privilege unavailable; junction escape tests still run")
+            raise
+        self.addCleanup(link.unlink)
+        with self.assertRaises(PermissionError):
+            asyncio.run(self.tools.read_doc(self.ctx, {"path": "link.txt"}))
+        result = self.search("secret")
+        self.assertEqual(result["results"], [])
+        self.assertTrue(result["incomplete"])
+
+    def test_cache_junction_cannot_write_outside_library(self) -> None:
+        outside = Path(self.temp.name) / "outside-cache"; outside.mkdir()
+        link = self.library / ".cache"
+        if os.name == "nt":
+            created = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], capture_output=True)
+            self.assertEqual(created.returncode, 0, created.stderr)
+        else:
+            link.symlink_to(outside, target_is_directory=True)
+        self.addCleanup(lambda: link.rmdir() if os.name == "nt" else link.unlink())
+        self.put("report.pdf", "fake")
+        result = self.search("fake")
+        self.assertTrue(result["incomplete"])
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_timeout_cancel_and_async_worker_not_ui_thread(self) -> None:
+        self.put("a.txt", "needle\n")
+        self.ctx.cancel_event.set()
+        self.assertEqual(self.search("needle")["reasons"], ["cancelled"])
+        self.ctx.cancel_event.clear()
+        original_path = self.tools._text_path
+        def slow(*args: Any) -> Path:
+            time.sleep(0.12); return original_path(*args)
+        with mock.patch.object(self.tools, "_text_path", side_effect=slow):
+            self.assertIn("timeout", self.search("needle", timeout_in_seconds=0.1)["reasons"])
+        original = self.tools._search_sync; threads = []
+        def worker(*args: Any) -> Any:
+            threads.append(threading.get_ident()); return original(*args)
+        with mock.patch.object(self.tools, "_search_sync", side_effect=worker):
+            self.assertTrue(self.search("needle")["results"])
+        self.assertNotEqual(threads[0], threading.get_ident())
+
+    def test_killable_converter_cleans_up_on_deadline_and_cancellation(self) -> None:
+        process = mock.Mock(); process.poll.return_value = None
+        with mock.patch.object(velox.subprocess, "Popen", return_value=process):
+            with self.assertRaises(TimeoutError):
+                self.tools._convert(self.library / "a.pdf", self.library / "out", self.ctx, time.monotonic()-1)
+            process.kill.assert_called_once(); process.wait.assert_called_once()
+        self.ctx.cancel_event.set(); process.reset_mock()
+        with mock.patch.object(velox.subprocess, "Popen", return_value=process):
+            with self.assertRaises(velox.ToolCancelledError):
+                self.tools._convert(self.library / "a.pdf", self.library / "out", self.ctx, time.monotonic()+1)
+            process.kill.assert_called_once(); process.wait.assert_called_once()
+
+    def test_disabled_permissions_system_independence_and_agent_inheritance(self) -> None:
+        registry = velox.ToolRegistry(self.storage)
+        names = lambda **kwargs: {r["name"] for r in registry.tool_definitions_for_context(velox.APP_SCOPE_ID, self.cid, **kwargs)}
+        library_names = {"library_search", "library_read_doc_lines", "library_read_doc"}
+        self.assertTrue(self.chat["features"][velox.LIBRARY_FEATURE_KEY])
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "system_tools_enabled", False)
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "file_tools_enabled", False)
+        self.assertTrue(library_names <= names())
+        agents = velox.AgentStore(self.storage)
+        agent = agents.create_agent(self.cid, "Read library")
+        self.assertTrue(agent["tool_features"][velox.LIBRARY_FEATURE_KEY])
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, velox.LIBRARY_FEATURE_KEY, False)
+        self.assertFalse(library_names & names())
+        self.assertFalse(library_names & names(feature_overrides=agent["tool_features"]))
+        disabled = agents.create_agent(self.cid, "Disabled", tool_features={key: True for key in velox.CHAT_TOOL_FEATURE_KEYS})
+        self.assertFalse(disabled["tool_features"][velox.LIBRARY_FEATURE_KEY])
+        for name in library_names:
+            with self.assertRaisesRegex(PermissionError, "Local Library"):
+                registry._reject_disabled_tool(velox.APP_SCOPE_ID, name, self.cid)
+            with self.assertRaises(PermissionError):
+                registry._reject_disabled_tool(velox.APP_SCOPE_ID, name, self.cid, agent_id=agent["agent_id"])
+        reloaded = velox.ChatStore(self.storage).load_chat(self.cid)
+        self.assertFalse(reloaded["features"][velox.LIBRARY_FEATURE_KEY])
+
+    def test_copy_branch_and_child_agents_preserve_or_narrow_library_permissions(self) -> None:
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, velox.LIBRARY_FEATURE_KEY, False)
+        copied = self.chats.copy_chat(velox.APP_SCOPE_ID, self.cid)
+        self.assertFalse(copied["features"][velox.LIBRARY_FEATURE_KEY])
+        turn = velox.make_turn(self.cid, "user", "branch point")
+        self.chats.append_turn(velox.APP_SCOPE_ID, self.cid, turn)
+        branched = self.chats.branch_chat(velox.APP_SCOPE_ID, self.cid, turn["turn_id"])
+        self.assertFalse(branched["features"][velox.LIBRARY_FEATURE_KEY])
+        other = self.chats.create_chat("Library on")
+        agents = velox.AgentStore(self.storage)
+        parent = agents.create_agent(other["chat_id"], "Narrowed parent", tool_features={**self.chats.get_chat_tool_features(other["chat_id"]), velox.LIBRARY_FEATURE_KEY: False})
+        child = agents.create_agent(other["chat_id"], "Child asks for library", tool_features={key: True for key in velox.CHAT_TOOL_FEATURE_KEYS},
+                                    parent_agent_id=parent["agent_id"], parent_task_run_id=parent["task_run_id"])
+        self.assertFalse(child["tool_features"][velox.LIBRARY_FEATURE_KEY])
+
+    def test_legacy_records_preserve_settings_and_default_library_on(self) -> None:
+        legacy = copy.deepcopy(self.chat)
+        del legacy["features"][velox.LIBRARY_FEATURE_KEY]
+        legacy["features"]["system_tools_enabled"] = False
+        velox.validate_chat_record(legacy)
+        self.paths.chat_json(self.cid).write_text(json.dumps(legacy), encoding="utf-8")
+        config_before = self.paths.config_json_path.read_bytes()
+        saved = velox.ChatStore(self.storage).load_chat(self.cid)
+        self.assertEqual(self.paths.config_json_path.read_bytes(), config_before)
+        self.assertTrue(saved["features"][velox.LIBRARY_FEATURE_KEY])
+        self.assertFalse(saved["features"]["system_tools_enabled"])
+        wrong = copy.deepcopy(saved); wrong["features"][velox.LIBRARY_FEATURE_KEY] = "yes"
+        with self.assertRaises(ValueError):
+            velox.validate_chat_record(wrong)
+
+    def test_query_and_numeric_validation(self) -> None:
+        for query in ["", '"unfinished', '""', "x"*513]:
+            with self.assertRaises(ValueError): self.search(query)
+        for options in [{"max_results": 0}, {"max_results": True}, {"timeout_in_seconds": float("nan")}, {"timeout_in_seconds": 0}]:
+            with self.assertRaises(ValueError): self.search("x", **options)
+
+
+    def test_real_offline_pdf_docx_pptx_xlsx_conversion_and_cache_reuse(self) -> None:
+        try:
+            import markitdown
+            import mammoth
+            import pdfminer
+            from pptx import Presentation
+            from pptx.util import Inches
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("Install requirements-library.txt for real PDF/Office conversion fixtures")
+        import zipfile
+        with zipfile.ZipFile(self.library / "word.docx", "w") as archive:
+            archive.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+            archive.writestr("_rels/.rels", '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+            archive.writestr("word/document.xml", '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>libraryneedle Word</w:t></w:r></w:p></w:body></w:document>')
+        workbook = Workbook(); workbook.active["A1"] = "libraryneedle Excel"
+        workbook.save(self.library / "sheet.xlsx")
+        presentation = Presentation(); slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(1), Inches(1), Inches(5), Inches(1)).text = "libraryneedle PowerPoint"
+        presentation.save(self.library / "slides.pptx")
+        stream = b"BT /F1 16 Tf 30 100 Td (libraryneedle PDF) Tj ET"
+        objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                   b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+                   b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+                   b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"]
+        pdf = bytearray(b"%PDF-1.4\n"); offsets = [0]
+        for index, body in enumerate(objects, 1):
+            offsets.append(len(pdf)); pdf.extend(str(index).encode() + b" 0 obj\n" + body + b"\nendobj\n")
+        xref = len(pdf); pdf.extend(b"xref\n0 6\n0000000000 65535 f \n")
+        for offset in offsets[1:]: pdf.extend(f"{offset:010} 00000 n \n".encode())
+        pdf.extend(f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+        (self.library / "paper.pdf").write_bytes(pdf)
+        result = self.search("libraryneedle", timeout_in_seconds=60)
+        self.assertFalse(result["incomplete"], result)
+        expected = {"word.docx", "sheet.xlsx", "slides.pptx", "paper.pdf"}
+        self.assertEqual({row["path"] for row in result["results"]}, expected)
+        with mock.patch.object(self.tools, "_convert", side_effect=AssertionError("unchanged source was reconverted")):
+            for name in expected:
+                read = asyncio.run(self.tools.read_doc(self.ctx, {"path": name}))
+                self.assertIn("libraryneedle", read["text"])
+                self.assertEqual(read["path"], name)
+
+    def test_converter_local_only_options_never_enable_plugins_or_llm(self) -> None:
+        converter = mock.Mock()
+        converter.convert_local.return_value = SimpleNamespace(text_content="local text")
+        module = SimpleNamespace(MarkItDown=mock.Mock(return_value=converter))
+        with mock.patch.dict(sys.modules, {"markitdown": module}):
+            result = velox.AttachmentStore._convert_to_markdown(None, Path("fixture.docx"), local_only=True)
+        self.assertEqual(result, "local text")
+        module.MarkItDown.assert_called_once_with(enable_plugins=False)
+        converter.convert_local.assert_called_once_with("fixture.docx")
+        converter.convert.assert_not_called()
+
+    def test_library_toggle_real_widget_click_persists_and_locks(self) -> None:
+        panel = object.__new__(velox.Panels); panel.widgets = ChecklistRenderingTests.widgets(); panel.state = panel.widgets.state
+        panel.state.active_chat_id = self.cid; panel.services = SimpleNamespace(storage=self.storage, chats=self.chats)
+        calls = []; original = panel.widgets.toggle
+        def toggle(key: str, rect: Any, label: str, value: bool, **kwargs: Any) -> bool:
+            calls.append((key, rect, label, value)); return original(key, rect, label, value, **kwargs)
+        with mock.patch.object(panel.widgets, "toggle", side_effect=toggle):
+            panel._draw_new_chat_task_settings(velox.Rect(0, 0, 1000, 700))
+        _, rect, label, value = next(c for c in calls if c[0] == "chat.task_setup.local_library_enabled")
+        self.assertEqual((label, value), ("Local Library", True))
+        panel.widgets.inp.mouse_x = rect.x + rect.w - 20; panel.widgets.inp.mouse_y = rect.y + rect.h // 2
+        panel.widgets.inp.mouse_pressed = True; panel.widgets.inp.mouse_down = True
+        panel._draw_new_chat_task_settings(velox.Rect(0, 0, 1000, 700))
+        self.assertFalse(velox.ChatStore(self.storage).load_chat(self.cid)["features"][velox.LIBRARY_FEATURE_KEY])
+        self.chats.append_turn(velox.APP_SCOPE_ID, self.cid, velox.make_turn(self.cid, "user", "Begin"))
+        with self.assertRaisesRegex(ValueError, "locked"):
+            self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, velox.LIBRARY_FEATURE_KEY, True)
+
+    def test_narrow_settings_preserve_full_library_and_pc_control_labels(self) -> None:
+        for width in (400, 560, 1000):
+            with self.subTest(width=width):
+                panel = object.__new__(velox.Panels); panel.widgets = ChecklistRenderingTests.widgets(); panel.state = panel.widgets.state
+                panel.state.active_chat_id = self.cid; panel.services = SimpleNamespace(storage=self.storage, chats=self.chats)
+                calls = []; cards = []; toggle = panel.widgets.toggle; draw_card = panel.r.draw_card
+                def observe(key: str, rect: Any, label: str, value: bool, **kwargs: Any) -> bool:
+                    calls.append((key, rect, label)); return toggle(key, rect, label, value, **kwargs)
+                def card(rect: Any, *args: Any, **kwargs: Any) -> Any:
+                    cards.append(rect); return draw_card(rect, *args, **kwargs)
+                with mock.patch.object(panel.widgets, "toggle", side_effect=observe), mock.patch.object(panel.r, "draw_card", side_effect=card):
+                    panel._draw_new_chat_task_settings(velox.Rect(0, 0, width, 700))
+                relevant = [row for row in calls if row[0].endswith(("local_library_enabled", "computer_use_enabled"))]
+                self.assertEqual(len(relevant), 2)
+                for key, rect, label in relevant:
+                    self.assertGreaterEqual(rect.w - 70, panel.widgets._text_width(label), (key, width))
+                    self.assertLessEqual(rect.y + rect.h, cards[0].y + cards[0].h - 18)
+                pc, library = relevant
+                if width <= 560:
+                    self.assertGreater(library[1].y, pc[1].y)
+                else:
+                    self.assertEqual(library[1].y, pc[1].y)
+
+    def test_registry_timeout_and_user_cancel_report_incomplete(self) -> None:
+        self.put("sample.txt", "needle\n")
+        registry = velox.ToolRegistry(self.storage)
+        def call(identifier: str) -> Any:
+            return registry.convert_openai_tool_call(_make_test_provider_call(identifier, "library_search", {
+                "query": "needle", "max_results": 10, "timeout_in_seconds": 0.1}))
+        original = registry.library_tools._text_path
+        def slow(*args: Any) -> Path:
+            time.sleep(0.12); return original(*args)
+        with mock.patch.object(registry.library_tools, "_text_path", side_effect=slow):
+            result = asyncio.run(registry.execute_tool_call(velox.APP_SCOPE_ID, call("library-timeout"), chat_id=self.cid))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"]["reasons"], ["timeout"])
+        self.assertTrue(result["result"]["incomplete"])
+        started = threading.Event(); stopped = threading.Event()
+        def waiting(ctx: Any, args: Any) -> dict[str, Any]:
+            started.set()
+            try:
+                while not ctx.is_cancelled(): time.sleep(0.005)
+                return {"results": [], "incomplete": True, "reasons": ["cancelled"]}
+            finally:
+                stopped.set()
+        async def scenario() -> dict[str, Any]:
+            task = asyncio.create_task(registry.execute_tool_call(velox.APP_SCOPE_ID, call("library-cancel"), chat_id=self.cid, tool_call_id="library-cancel"))
+            for _ in range(400):
+                if started.is_set(): break
+                await asyncio.sleep(0.005)
+            self.assertTrue(started.is_set())
+            self.assertTrue(registry.cancel_tool_call("library-cancel"))
+            return await task
+        with mock.patch.object(registry.library_tools, "_search_sync", side_effect=waiting):
+            cancelled = asyncio.run(scenario())
+        self.assertTrue(stopped.wait(2))
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertTrue(cancelled["result"]["incomplete"])
+        self.assertEqual(cancelled["result"]["reasons"], ["cancelled"])
+        self.assertEqual(registry._timeout_for_tool("library_search", {"timeout_in_seconds": 120}), 125)
 
 
 def main() -> None:
