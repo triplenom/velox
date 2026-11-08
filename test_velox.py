@@ -48600,11 +48600,15 @@ class Release316PresentationTests(_StorageFixture):
             with mock.patch.object(panel, '_draw_agent_metric_card', side_effect=record):
                 panel._draw_agent_summary_cards(velox.Rect(0, 0, width, 1600), {})
             ordered = sorted(cards, key=lambda pair: (pair[0].y, pair[0].x))
-            self.assertEqual([title for _, title in ordered], ['Task status', 'Task outcomes', 'Token usage', 'Costs'])
+            # v330 added the Cost history card after Costs (mockup order).
+            self.assertEqual([title for _, title in ordered],
+                             ['Task status', 'Task outcomes', 'Token usage', 'Costs', 'Cost history'])
             self.assertEqual(len({r.h for r, _ in cards}), 1)
             if width >= 1920:
                 rects = dict((title, r) for r, title in cards)
+                self.assertEqual(len({r.y for r in rects.values()}), 1, "wide layouts keep all five cards on one row")
                 self.assertAlmostEqual(rects['Token usage'].w, 1.18 * rects['Task outcomes'].w, delta=2)
+                self.assertAlmostEqual(rects['Cost history'].w, 1.07 * rects['Task outcomes'].w, delta=2)
 
     def test_endpoint_cost_labels_fit_measured_widths_and_keep_usd_in_tooltips(self) -> None:
         for line_h, char_w, width in ((20, 8, 1920), (32, 16, 1280), (38, 19, 1920)):

@@ -96,7 +96,7 @@ Follow progress on the dashboard and open a task to inspect its checklist, agent
 
 ### Dashboard
 
-The dashboard keeps the existing native layout: four summary cards, Chat/Agent/Image tasks, and a separate System Tasks table. Task actions remain on the row's right-click menu.
+The dashboard keeps the existing native layout: five summary cards (Task status, Task outcomes, Token usage, Costs, Cost history), Chat/Agent/Image tasks, and a separate System Tasks table. Task actions remain on the row's right-click menu.
 
 - Search titles, numeric IDs or full Task IDs. Combine Status, Type, Endpoint and Priority filters; **Clear** resets them. Filters are session-only; there are no saved views.
 - Priority reflects the actual inference scheduler: **Pinned**, **Queued** (a queue position), or **Not queued**, rather than inventing High/Normal/Low task metadata.

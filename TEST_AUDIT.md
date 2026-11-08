@@ -1,3 +1,7 @@
+# Unit test audit — release 336 (Dashboard card test)
+
+`Release316PresentationTests.test_card_order_and_compact_mockup_weights_are_consistent` had failed since release 330 on local Windows and in GitHub Actions. Release 330 deliberately added a fifth Dashboard summary card, **Cost history**, after **Costs**, but the test still expected four. It now expects all five titles in order. It also checks that wide layouts keep the five cards in one row, and that Cost history uses its 1.07 width weight alongside the existing equal-height and Token usage 1.18 checks. No production code changed.
+
 # Unit test audit — release 335 (PC Control label, real-desktop validation)
 
 The NEW CHAT SETTINGS toggle for Computer Use now reads **PC Control**. Only that visible label changed; the `computer_use_enabled` key, prompts, tool summary and permission messages still say Computer Use. `ComputerUsePolicyTests.test_new_chat_settings_draws_computer_use_toggle_inside_card_and_click_persists` now expects "PC Control".
