@@ -1676,25 +1676,14 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 self.assertTrue(all(value == 0 for value in mask[index]), (name, "row", index))
                 self.assertTrue(all(row[index] == 0 for row in mask), (name, "column", index))
             self.assertEqual(velox.embedded_icon_native_size(name), 32)
-        # Summary and compact use true one-pixel strokes: no filled 2x2 block.
-        for name in ("chat_summary", "chat_compact"):
-            mask = velox.EMBEDDED_ICON_GRAYSCALE_32[name]
-            self.assertFalse(any(
-                all(mask[y + dy][x + dx] > 0 for dy in (0, 1) for dx in (0, 1))
-                for y in range(31) for x in range(31)
-            ), name)
-        compact = velox.EMBEDDED_ICON_GRAYSCALE_32["chat_compact"]
-        for x, y in ((5, 16), (13, 16), (19, 16), (27, 16), (16, 7), (16, 25), (10, 13), (22, 19)):
-            self.assertGreater(compact[y][x], 0, (x, y))
-        raw_copy = velox.EMBEDDED_ICON_GRAYSCALE_32["debug_export"]
-        for x, y in ((5, 4), (5, 27), (25, 9), (19, 18), (28, 9), (28, 14)):
-            self.assertGreater(raw_copy[y][x], 0, (x, y))
-        rename = velox.EMBEDDED_ICON_GRAYSCALE_32["rename"]
-        for x, y in ((21, 8), (24, 11), (9, 20), (12, 23), (6, 27), (16, 15)):
-            self.assertGreater(rename[y][x], 0, (x, y))
-        workspace = velox.EMBEDDED_ICON_GRAYSCALE_32["workspace"]
-        for x, y in ((4, 9), (13, 9), (16, 12), (27, 12), (4, 26), (27, 26)):
-            self.assertGreater(workspace[y][x], 0, (x, y))
+            pixels = bytes(p for row in mask for p in row)
+            self.assertEqual(pixels, velox.embedded_icon_mask(name, 32))
+            self.assertTrue(any(0 < p < 255 for p in pixels), name)
+            self.assertTrue(any(p == 255 for p in pixels), name)
+        # Semantic icons must remain distinct, but their precise pixels are design
+        # assets, not behavioural contracts. No one-pixel-stroke snapshot assertions.
+        names = ("chat_summary", "chat_compact", "debug_export", "rename", "workspace", "terminal")
+        self.assertEqual(len({velox.embedded_icon_mask(name, 32) for name in names}), len(names))
 
 
     def test_history_context_limit_default_and_clamping(self) -> None:
@@ -2060,7 +2049,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertIn('(\"agents\", \"DASHBOARD\")', nav)
         self.assertNotIn('(\"agents\", \"AGENTS\")', nav)
         self.assertIn('(\"context\", \"CONTEXT\")', nav)
-        self.assertIn('draw_text_run_font(brand_font, \"VELOX\"', nav)
+        self.assertIn("self.draw_velox_logo(logo_rect)", nav)
         self.assertIn('draw_font = self.bold_font', self._method_source(velox.Widgets, "global_nav_button"))
         dashboard = self._method_source(velox.Panels, "_draw_dashboard_content")
         self.assertIn("self.services.monitor.statistics(include_costs=False)", dashboard)
@@ -6550,7 +6539,9 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
         self.assertNotIn("Palette.warn", icon_toggle)
         self.assertNotIn("lightbulb_on", icon_toggle + icon_shape)
         self.assertNotIn("lightbulb_off", icon_toggle + icon_shape)
-        self.assertIn('kind == "lightbulb"', icon_shape)
+        self.assertTrue(velox.has_embedded_icon('lightbulb'))
+        self.assertIn('draw_embedded_icon', icon_shape)
+        self.assertIn('color=color', icon_shape)
         self.assertNotIn("ray_top", icon_shape)
         self.assertIn('"Automatic chat compaction"', global_compaction)
         self.assertIn("settings.general.chat_auto_compaction_enabled", global_compaction)
@@ -14415,18 +14406,12 @@ class CompletionVerificationTests(_DataRootsIsolatedTestMixin, unittest.TestCase
     def test_statistics_icon_frame_and_compact_numeric_columns(self) -> None:
         statistics = velox.EMBEDDED_ICON_GRAYSCALE_32["statistics"]
         terminal = velox.EMBEDDED_ICON_GRAYSCALE_32["terminal"]
-        outline_points = (
-            [(x, 6) for x in range(4, 28)]
-            + [(x, 26) for x in range(4, 28)]
-            + [(4, y) for y in range(6, 27)]
-            + [(27, y) for y in range(6, 27)]
-        )
-        for x, y in outline_points:
-            self.assertEqual(statistics[y][x], 255)
-            self.assertEqual(statistics[y][x], terminal[y][x])
-        self.assertEqual(statistics[22][9], 255)
-        self.assertEqual(statistics[13][15], 255)
-        self.assertEqual(statistics[9][21], 255)
+        for name, mask in (("statistics", statistics), ("terminal", terminal)):
+            self.assertEqual(len(mask), 32)
+            self.assertTrue(all(len(row) == 32 for row in mask))
+            self.assertEqual(bytes(p for row in mask for p in row), velox.embedded_icon_mask(name, 32))
+            self.assertTrue(any(0 < p < 255 for row in mask for p in row))
+        self.assertNotEqual(statistics, terminal)
         modal = inspect.getsource(velox.Panels.draw_modals)
         self.assertIn('{"key": "tool", "title": "Tool", "preferred_width": 440, "min_width": 240, "weight": 1.0}', modal)
         self.assertIn('{"key": "total", "title": "Total", "sort_type": "number", "align": "right", "width": 110, "min_width": 84}', modal)
@@ -40346,8 +40331,10 @@ class ChecklistRenderingTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
                 with mock.patch.object(w, 'clipped_text', wraps=w.clipped_text) as text:
                     w.table_view('checklist', velox.Rect(0, 0, 830, 240), velox.Panels._expert_mode_table_columns(), self.rows(state))
                 self.assertFalse(any(call.args[1] in ('\u2713', '\u25cf') for call in text.call_args_list))
-                strokes = [args for name, args, _kwargs in w.renderer.drawn if name == 'draw_line' and args[4] == color]
-                self.assertEqual(len(strokes), 8)  # two 2-pixel strokes on each row
+                masks = [(args, kwargs) for name, args, kwargs in w.renderer.drawn
+                         if name == 'draw_embedded_icon' and args[0] == 'check']
+                self.assertEqual(len(masks), 2)
+                self.assertTrue(all(kwargs.get('color') == color for args, kwargs in masks))
                 for row in self.rows(state):
                     self.assertEqual(row['status']['type'], 'status_icon')
                     self.assertEqual(row['status']['icon'], 'check')
@@ -40355,9 +40342,11 @@ class ChecklistRenderingTests(_WriterDataRootsIsolatedTestMixin, unittest.TestCa
     def test_in_progress_parent_and_step_draw_vector_dots(self) -> None:
         w = self.widgets()
         w.table_view('checklist', velox.Rect(0, 0, 830, 240), velox.Panels._expert_mode_table_columns(), self.rows('in_progress'))
-        dots = [args for name, args, _kwargs in w.renderer.drawn if name == 'draw_round_rect' and args[2] == velox.Palette.white]
+        dots = [(args, kwargs) for name, args, kwargs in w.renderer.drawn
+                if name == 'draw_embedded_icon' and args[0] == 'dot']
         self.assertEqual(len(dots), 2)
-        self.assertTrue(all(args[0].w == args[0].h and args[0].w >= 3 for args in dots))
+        self.assertTrue(all(args[1].w == args[1].h and args[1].w >= 3 for args, kwargs in dots))
+        self.assertTrue(all(kwargs.get('color') == velox.Palette.white for args, kwargs in dots))
 
     def test_not_started_has_no_false_completion_icon(self) -> None:
         w = self.widgets()
@@ -41626,7 +41615,7 @@ class DashboardCostStatsAsyncTests(_AsyncRuntimeFixture):
 
     async def test_idle_frames_use_one_background_read(self) -> None:
         panel = self.panel(); entered = threading.Event(); release = threading.Event(); calls = []; main = threading.get_ident()
-        def slow(reader: Any) -> dict[str, Any]:
+        def slow(reader: Any, **kwargs: Any) -> dict[str, Any]:
             calls.append(threading.get_ident()); entered.set()
             if not release.wait(3): raise TimeoutError("stats fixture")
             return {"status": "ready", "total_usd": 7}
@@ -47518,15 +47507,18 @@ class ChecklistTreeAlignmentTests(unittest.TestCase):
     def test_step_marks_are_shifted_exactly_ten_pixels_and_stay_in_status_column(self) -> None:
         w, branches, marks, texts = self.render()
         self.assertEqual([c.args[3] for c in marks], [0, 10, 10, 10, 0, 10])
-        lines = [a for n, a, k in w.renderer.drawn if n == 'draw_line' and a[-1] == velox.Palette.ok]
-        self.assertEqual(lines[4][0] - lines[0][0], 10)
+        masks = [a for n, a, k in w.renderer.drawn
+                 if n == 'draw_embedded_icon' and a[0] == 'check' and k.get('color') == velox.Palette.ok]
+        self.assertEqual(masks[1][1].x - masks[0][1].x, 10)
         for call in marks:
             cell = call.args[0]
-            strokes = [a for a in lines if cell.y <= a[1] < cell.y + cell.h]
-            self.assertEqual(len(strokes), 4)
-            for x0, y0, x1, y1, color in strokes:
-                self.assertGreaterEqual(min(x0, x1), cell.x)
-                self.assertLess(max(x0, x1), cell.x + cell.w)
+            row_masks = [a for a in masks if cell.y <= a[1].y < cell.y + cell.h]
+            self.assertEqual(len(row_masks), 1)
+            bounds = row_masks[0][1]
+            pixels = velox.embedded_icon_mask('check', bounds.w)
+            visible_x = [index % bounds.w for index, alpha in enumerate(pixels) if alpha]
+            self.assertGreaterEqual(bounds.x + min(visible_x), cell.x)
+            self.assertLess(bounds.x + max(visible_x), cell.x + cell.w)
 
     def test_connector_gray_matches_step_ids_not_brighter_parent(self) -> None:
         w, branches, marks, texts = self.render()
@@ -47827,8 +47819,8 @@ class DashboardCostBarRenderingTests(_StorageFixture):
     def test_wide_card_proportions_follow_dashboard_mockup(self) -> None:
         for width in (1450,1920,2048,3840):
             rect=velox.Rect(9,13,width,500);rows=velox.Panels._dashboard_summary_card_rects(rect,250)
-            standard=(width-36)/5
-            for row,weight in zip(rows,(.65,1,1.18,2.17)):
+            standard=(width-48)/5
+            for row,weight in zip(rows,(.65,1,1.18,1.1,1.07)):
                 self.assertAlmostEqual(row.w,standard*weight,delta=1)
             self.assertEqual(rows[-1].x+rows[-1].w,rect.x+rect.w)
             self.assertTrue(all(a.x+a.w+12==b.x for a,b in zip(rows,rows[1:])))
@@ -47836,17 +47828,17 @@ class DashboardCostBarRenderingTests(_StorageFixture):
     def test_responsive_card_rows_never_overlap_or_exceed_viewport(self) -> None:
         for width in (320,620,759,760,960,1200,1449,1450,1920):
             rows=velox.Panels._dashboard_summary_card_rects(velox.Rect(5,7,width,3000),250)
-            self.assertEqual(len(rows),4)
+            self.assertEqual(len(rows),5)
             for row in rows:self.assertTrue(5 <= row.x < row.x+row.w <= width+5)
             for i,a in enumerate(rows):
                 for b in rows[i+1:]:self.assertFalse(velox.rects_intersect_fast(a.x,a.y,a.w,a.h,b.x,b.y,b.w,b.h))
 
-    def test_card_inventory_has_four_cards_and_no_checklist_card(self) -> None:
+    def test_card_inventory_has_five_cards_and_no_checklist_card(self) -> None:
         panel=self.panel();names=[];old=panel._draw_agent_metric_card
         def card(rect,title):names.append(title);return old(rect,title)
         with mock.patch.object(panel,'_draw_agent_metric_card',side_effect=card):
             panel._draw_agent_summary_cards(velox.Rect(0,0,1920,900),{'costs':self.costs()})
-        self.assertEqual(names,['Task status','Task outcomes','Token usage','Costs'])
+        self.assertEqual(names,['Task status','Task outcomes','Token usage','Costs','Cost history'])
 
     def test_period_picker_values_and_default_are_exact(self) -> None:
         panel=self.panel()
@@ -47952,7 +47944,7 @@ class CostPeriodAsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_changed_period_waits_for_one_reader_and_never_labels_old_total_as_new(self) -> None:
         entered=threading.Event();release=threading.Event();calls=[]
-        def read(seconds):
+        def read(seconds, **kwargs):
             calls.append(seconds);entered.set()
             if not release.wait(5):raise TimeoutError('fixture released late')
             return {'total_usd':seconds,'window_seconds':seconds}
@@ -47974,7 +47966,7 @@ class CostPeriodAsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             if task is not None:await asyncio.gather(task,return_exceptions=True)
 
     async def test_completed_query_refresh_is_rate_limited(self) -> None:
-        calls=[];panel=self.panel(lambda seconds:(calls.append(seconds) or {'total_usd':3}))
+        calls=[];panel=self.panel(lambda seconds, **kwargs:(calls.append(seconds) or {'total_usd':3}))
         panel._dashboard_cost_statistics();await panel._dashboard_cost_entry['task']
         panel._dashboard_cost_statistics()
         for _ in range(100):self.assertEqual(panel._dashboard_cost_statistics()['total_usd'],3)
@@ -48244,7 +48236,7 @@ class DashboardCompactLayoutTests(_StorageFixture):
             with mock.patch.object(panel, "_draw_agent_metric_card", side_effect=card):
                 panel._draw_agent_summary_cards(velox.Rect(0, 0, 3840, 1600), {})
             expected = max(206, height + 56 + 4 * max(29, height + 6))
-            self.assertEqual([r.h for r, _ in cards], [expected] * 4)
+            self.assertEqual([r.h for r, _ in cards], [expected] * 5)
 
     def test_changing_width_does_not_change_card_height(self) -> None:
         panel = self.panel(); heights = []
@@ -50204,7 +50196,7 @@ class DashboardMockupTests(unittest.TestCase):
         for c in table.call_args_list:
             self.assertGreater(c.args[1].h,100)
 
-    def test_new_marks_are_vectors_and_cache_badge_distinguishes_missing(self) -> None:
+    def test_endpoint_marks_are_absent_and_cache_badge_distinguishes_missing(self) -> None:
         panel=self.panel(); w=panel.widgets
         with mock.patch.object(w,'clipped_text') as text:
             for provider in ('DeepSeek','OpenAI','Anthropic','Custom'):
@@ -50311,6 +50303,634 @@ class DashboardRollingSummaryTests(_StorageFixture):
         self.assertEqual(data['window_label'],'24h'); self.assertEqual(data['input_tokens'],123)
         self.assertEqual(data['counts']['running'],3); self.assertEqual(data['counts']['completed'],2)
         self.assertEqual(data['counts']['failed'],0)
+
+
+
+# Embedded-mask rendering regressions; Pillow is already an application requirement.
+from PIL import Image as _IconTestImage
+
+class _IconAtlasTestSDL:
+    class SDL_FRect(ctypes.Structure):
+        _fields_=[('x',ctypes.c_float),('y',ctypes.c_float),('w',ctypes.c_float),('h',ctypes.c_float)]
+    SDL_PIXELFORMAT_RGBA32=1
+    SDL_BLENDMODE_BLEND=1
+    SDL_SCALEMODE_LINEAR=1
+    def __init__(self):
+        self.surfaces=[];self.textures=[];self.draws=[];self.raise_draw=False
+    def SDL_CreateSurfaceFrom(self,w,h,fmt,p,pitch):
+        obj=SimpleNamespace(w=w,h=h,rgba=ctypes.string_at(p,h*pitch))
+        self.surfaces.append(obj);return obj
+    def SDL_SetSurfaceBlendMode(self,s,b): return True
+    def SDL_CreateTextureFromSurface(self,r,s):
+        obj=SimpleNamespace(w=s.w,h=s.h,rgba=s.rgba,rgb=(255,255,255),alpha=255)
+        self.textures.append(obj);return obj
+    def SDL_DestroySurface(self,s): s.destroyed=True
+    def SDL_SetTextureBlendMode(self,t,b): t.blend=b;return True
+    def SDL_SetTextureScaleMode(self,t,b): t.scale=b;return True
+    def SDL_SetTextureColorMod(self,t,r,g,b): t.rgb=(r,g,b);return True
+    def SDL_SetTextureAlphaMod(self,t,a): t.alpha=a;return True
+    def SDL_RenderTexture(self,r,t,src,dst):
+        a=ctypes.cast(src,ctypes.POINTER(self.SDL_FRect)).contents
+        b=ctypes.cast(dst,ctypes.POINTER(self.SDL_FRect)).contents
+        self.draws.append((t,tuple(getattr(a,k) for k in ('x','y','w','h')),tuple(getattr(b,k) for k in ('x','y','w','h')),t.rgb,t.alpha))
+        if self.raise_draw: raise RuntimeError('test render failure')
+        return True
+
+def _icon_test_renderer():return velox.Renderer(SimpleNamespace(renderer=object(),width=1200,height=800))
+
+class EmbeddedMaskAtlasTests(unittest.TestCase):
+    def test_atlas_is_a_single_l8_png(self):
+        raw=base64.b64decode(velox.EMBEDDED_MASK_ICON_PNG_BASE64)
+        image=_IconTestImage.open(io.BytesIO(raw))
+        self.assertEqual(image.mode,'L');self.assertEqual(image.size,velox.EMBEDDED_MASK_ICON_ATLAS_SIZE)
+        self.assertEqual(image.tobytes(),velox._embedded_icon_atlas_pixels())
+    def test_all_945_square_masks_exist_at_exact_native_sizes(self):
+        for name in velox.EMBEDDED_MASK_ICON_NAMES:
+            for size in velox.EMBEDDED_MASK_ICON_SIZES:
+                with self.subTest(name=name,size=size):
+                    b=velox.embedded_icon_mask(name,size)
+                    self.assertEqual(len(b),size*size);self.assertEqual(min(b),0);self.assertGreater(max(b),100)
+                    self.assertTrue(any(0 < p < 255 for p in b))
+    def test_all_tiles_are_within_atlas_and_have_transparent_gutters(self):
+        image=_IconTestImage.open(io.BytesIO(base64.b64decode(velox.EMBEDDED_MASK_ICON_PNG_BASE64)))
+        for name in velox.EMBEDDED_MASK_ICON_NAMES:
+            for size in velox.EMBEDDED_MASK_ICON_SIZES:
+                x,y,w,h=velox._embedded_icon_region(name,size,size)
+                self.assertTrue(0<x<x+w<image.width and 0<y<y+h<image.height)
+                self.assertIsNone(image.crop((x-1,y-1,x+w+1,y)).getbbox())
+                self.assertIsNone(image.crop((x-1,y+h,x+w+1,y+h+1)).getbbox())
+    def test_eight_small_rectangular_chevrons_are_native(self):
+        for (name,w,h),(x,y,rw,rh) in velox.EMBEDDED_MASK_ICON_RECTANGLES.items():
+            self.assertEqual(velox._embedded_icon_region(name,w,h),(x,y,w,h))
+            self.assertEqual((w,h),(rw,rh))
+    def test_aliases_reference_identical_artwork(self):
+        for alias,name in velox.EMBEDDED_MASK_ICON_ALIASES.items():
+            self.assertTrue(velox.has_embedded_icon(alias));self.assertEqual(velox.embedded_icon_mask(alias),velox.embedded_icon_mask(name))
+    def test_compatibility_views_contain_new_masks_and_old_membership(self):
+        self.assertEqual(len(velox.EMBEDDED_ICON_GRAYSCALE_32),9);self.assertEqual(len(velox.EMBEDDED_ICON_PNG_BASE64),12)
+        for name,rows in velox.EMBEDDED_ICON_GRAYSCALE_32.items():
+            self.assertEqual(bytes(p for row in rows for p in row),velox.embedded_icon_mask(name,32))
+        for name,data in velox.EMBEDDED_ICON_PNG_BASE64.items():
+            image=_IconTestImage.open(io.BytesIO(base64.b64decode(data)))
+            self.assertEqual(image.getchannel('A').tobytes(),velox.embedded_icon_mask(name,32))
+    def test_export_pngs_have_white_rgb_and_real_alpha(self):
+        for name in velox.EMBEDDED_MASK_ICON_NAMES:
+            image=_IconTestImage.open(io.BytesIO(velox.decode_embedded_icon_alpha_map(name)))
+            self.assertEqual(image.mode,'RGBA')
+            self.assertEqual(image.getextrema()[:3],((255,255),(255,255),(255,255)))
+            self.assertEqual(image.getchannel('A').tobytes(),velox.embedded_icon_mask(name,velox.embedded_icon_native_size(name)))
+    def test_native_button_sizes_unchanged(self):
+        for name in velox._EMBEDDED_ICON_PNG_NAMES+velox._EMBEDDED_ICON_ARRAY_NAMES:
+            self.assertEqual(velox.embedded_icon_native_size(name),32)
+        for name in ('lightbulb','folder','page','select_all','clear_selection','refresh'):
+            self.assertEqual(velox.embedded_icon_native_size(name),24)
+    def test_unknown_and_invalid_input_are_not_an_icon(self):
+        for name in ('','no_such_icon',None):
+            self.assertFalse(velox.has_embedded_icon(name));self.assertEqual(velox.decode_embedded_icon_alpha_map(name),b'')
+            self.assertIsNone(velox._embedded_icon_region(name,32,32))
+        for size in (0,1,13,96):
+            with self.assertRaises(ValueError): velox.embedded_icon_mask('chat',size)
+        self.assertIsNone(velox._embedded_icon_region('chat',0,32))
+    def test_atlas_decode_is_cached_and_no_files_are_written(self):
+        with mock.patch.object(Path,'write_bytes',side_effect=AssertionError('No disk assets')):
+            a=velox._embedded_icon_atlas_pixels();b=velox._embedded_icon_atlas_pixels()
+            velox.decode_embedded_icon_alpha_map('new_chat')
+        self.assertIs(a,b)
+    def test_damaged_atlas_fails_clearly(self):
+        raw=bytearray(base64.b64decode(velox.EMBEDDED_MASK_ICON_PNG_BASE64));raw[45]^=1
+        with mock.patch.object(velox,'_EMBEDDED_MASK_ATLAS_PIXELS',None),mock.patch.object(velox,'EMBEDDED_MASK_ICON_PNG_BASE64',base64.b64encode(raw).decode()):
+            with self.assertRaisesRegex(ValueError,'checksum'):velox._embedded_icon_atlas_pixels()
+    def test_every_literal_icon_use_has_artwork(self):
+        tree=ast.parse(Path(__file__).with_name('velox.py').read_text(encoding='utf-8'))
+        for n in ast.walk(tree):
+            if not isinstance(n,ast.Call) or not isinstance(n.func,ast.Attribute): continue
+            expressions=[]
+            if n.func.attr in ('_draw_icon','_draw_shape','draw_embedded_icon') and n.args:expressions.append(n.args[0])
+            if n.func.attr=='button':expressions.extend(k.value for k in n.keywords if k.arg=='icon')
+            for expr in expressions:
+                values = [expr.body, expr.orelse] if isinstance(expr, ast.IfExp) else [expr]
+                for part in values:
+                    if isinstance(part,ast.Constant) and isinstance(part.value,str) and part.value:
+                        self.assertTrue(velox.has_embedded_icon(part.value),(n.lineno,part.value))
+    def test_icon_updates_preserve_config_compatibility(self):
+        self.assertGreaterEqual(velox.CURRENT_VERSION,333)
+        self.assertEqual(velox.BACKWARD_COMPATIBLE_VERSION,316)
+
+
+class EmbeddedMaskRendererTests(unittest.TestCase):
+    def test_commands_store_per_draw_tint_and_overlay_order(self):
+        r=_icon_test_renderer();a=velox.Color(255,0,130,128);b=velox.Color(0,170,255)
+        r.draw_embedded_icon('copy',velox.Rect(1,2,32,32),color=a)
+        r.draw_embedded_icon('copy',velox.Rect(40,2,32,32),color=b,overlay=True)
+        self.assertEqual(r.commands[0].args[2],a);self.assertEqual(r.overlay_commands[0].args[2],b)
+    def test_invalid_or_offscreen_icons_are_culled(self):
+        r=_icon_test_renderer()
+        for name,rect in [('bad',velox.Rect(0,0,32,32)),('chat',velox.Rect(0,0,0,32)),('chat',velox.Rect(1500,0,32,32))]:r.draw_embedded_icon(name,rect)
+        self.assertFalse(r.commands)
+        r.push_clip(velox.Rect(0,0,20,20));r.draw_embedded_icon('chat',velox.Rect(30,30,20,20));r.pop_clip()
+        self.assertEqual([c.kind for c in r.commands],['clip_push','clip_pop'])
+    def test_one_gpu_texture_serves_different_icons_sizes_and_tints(self):
+        fake=_IconAtlasTestSDL();r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):
+            for name,size,tint in [('chat',32,velox.Color(255,0,125)),('check',18,velox.Color(0,240,80)),('tool',16,velox.Color(100,100,100,64))]:
+                r._render_embedded_icon(name,velox.Rect(0,0,size,size),tint)
+        self.assertEqual(len(fake.textures),1);self.assertEqual(len(fake.draws),3);self.assertTrue(fake.surfaces[0].destroyed)
+        self.assertEqual(fake.draws[0][3:],((255,0,125),255));self.assertEqual(fake.draws[2][3:],((100,100,100),64))
+        self.assertEqual(fake.textures[0].rgb,(255,255,255));self.assertEqual(fake.textures[0].alpha,255)
+    def test_texture_alpha_is_identical_to_atlas_and_rgb_is_white(self):
+        fake=_IconAtlasTestSDL();r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):r._render_embedded_icon('copy',velox.Rect(0,0,32,32))
+        pixels=fake.textures[0].rgba
+        self.assertEqual(pixels[3::4],velox._embedded_icon_atlas_pixels())
+        self.assertEqual(set(pixels[0::4]),{255});self.assertEqual(set(pixels[1::4]),{255});self.assertEqual(set(pixels[2::4]),{255})
+    def test_each_native_tile_is_rendered_without_resizing(self):
+        fake=_IconAtlasTestSDL();r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):
+            for name in velox.EMBEDDED_MASK_ICON_NAMES:
+                for size in velox.EMBEDDED_MASK_ICON_SIZES:r._render_embedded_icon(name,velox.Rect(10,10,size,size),velox.Color(20,30,40))
+        for _,src,dst,_,_ in fake.draws:self.assertEqual(src[2:],dst[2:])
+    def test_rectangular_chevrons_have_exact_footprints(self):
+        fake=_IconAtlasTestSDL();r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):
+            for name,w,h in velox.EMBEDDED_MASK_ICON_RECTANGLES:r._render_embedded_icon(name,velox.Rect(20,20,w,h))
+        for _,src,dst,_,_ in fake.draws:self.assertEqual(src[2:],dst[2:])
+    def test_non_square_placeholders_do_not_distort(self):
+        fake=_IconAtlasTestSDL();r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):r._render_embedded_icon('page',velox.Rect(100,100,40,30))
+        self.assertEqual(fake.draws[0][2],(105,100,30,30))
+    def test_tint_is_reset_even_if_the_draw_fails(self):
+        fake=_IconAtlasTestSDL();fake.raise_draw=True;r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):
+            with self.assertRaises(RuntimeError):r._render_embedded_icon('copy',velox.Rect(0,0,32,32),velox.Color(4,5,6,7))
+        self.assertEqual(fake.textures[0].rgb,(255,255,255));self.assertEqual(fake.textures[0].alpha,255)
+    def test_separate_renderers_do_not_share_gpu_handles(self):
+        fake=_IconAtlasTestSDL();a=_icon_test_renderer();b=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):
+            a._render_embedded_icon('chat',velox.Rect(0,0,32,32));b._render_embedded_icon('chat',velox.Rect(0,0,32,32))
+        self.assertEqual(len(fake.textures),2);self.assertIsNot(next(iter(a.textures.values())),next(iter(b.textures.values())))
+    def test_widget_routes_keep_tint_and_no_vector_overdraw(self):
+        w=velox.Widgets.__new__(velox.Widgets);w.renderer=mock.Mock();color=velox.Color(220,50,150,100);rect=velox.Rect(0,0,24,24)
+        for name in ('lightbulb','select_all','folder','cross','delete'):
+            w.renderer.reset_mock();w._draw_shape(name,rect,color,overlay=True)
+            w.renderer.draw_embedded_icon.assert_called_once_with(name,rect,color=color,overlay=True)
+            w.renderer.draw_line.assert_not_called()
+    def test_dashboard_states_use_distinct_tinted_masks(self):
+        w=velox.Widgets.__new__(velox.Widgets);w.renderer=mock.Mock();rect=velox.Rect(0,0,18,18)
+        for status,icon in {'running':'play','using tools':'tool','completed':'check_circle','failed':'x_circle','cancelled':'slash_circle','paused':'pause','sleeping':'sleep','queued':'clock'}.items():
+            w.renderer.reset_mock();w._draw_dashboard_cell_icon(rect,'task:'+status,velox.Palette.ok)
+            w.renderer.draw_embedded_icon.assert_called_once_with(icon,rect,color=velox.Palette.ok)
+    def test_checklist_masks_remain_clipped_and_tinted(self):
+        w=velox.Widgets.__new__(velox.Widgets);w.renderer=mock.Mock()
+        for width,height in ((6,6),(12,12),(34,32),(60,80)):
+            for name in ('check','dot'):
+                cell=velox.Rect(100,100,width,height);w.renderer.reset_mock()
+                w._draw_table_status_icon(cell,name,velox.Palette.ok,10)
+                w.renderer.push_clip.assert_called_once_with(cell);w.renderer.pop_clip.assert_called_once()
+                self.assertEqual(w.renderer.draw_embedded_icon.call_args.kwargs['color'],velox.Palette.ok)
+    def test_no_sdl_is_safe(self):
+        r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',None):r._render_embedded_icon('copy',velox.Rect(0,0,32,32))
+        self.assertFalse(r.textures)
+
+
+class VeloxBrandV332Tests(unittest.TestCase):
+    def test_embedded_brand_is_rgba_transparent_and_hot_pink(self):
+        pixels=velox.embedded_velox_brand_rgba(); w,h=velox.VELOX_BRAND_SIZE
+        self.assertEqual(len(pixels),w*h*4)
+        image=_IconTestImage.frombytes('RGBA',(w,h),pixels)
+        self.assertEqual(image.getchannel('A').getextrema(),(0,255))
+        counts=collections.Counter(image.getdata())
+        self.assertGreater(counts[(255,0,110,255)],w*h*.1)
+        self.assertTrue(any(0<a<255 for a in pixels[3::4]))
+        self.assertGreater(w/h,4.8);self.assertLess(w/h,5.3)
+
+    def test_brand_decode_is_cached_and_requires_no_file(self):
+        with mock.patch.object(Path,'write_bytes',side_effect=AssertionError('No separate assets')):
+            self.assertIs(velox.embedded_velox_brand_rgba(),velox.embedded_velox_brand_rgba())
+
+    def test_brand_draws_one_original_colour_texture(self):
+        fake=_IconAtlasTestSDL(); r=_icon_test_renderer()
+        with mock.patch.object(velox,'sdl',fake):
+            for rect in (velox.Rect(8,8,128,25),velox.Rect(8,48,154,30)):
+                r._render_velox_brand(rect)
+        self.assertEqual(len(fake.textures),1); self.assertEqual(len(fake.draws),2)
+        self.assertEqual(fake.textures[0].rgba,velox.embedded_velox_brand_rgba())
+        self.assertTrue(fake.surfaces[0].destroyed)
+        for row in fake.draws:
+            self.assertEqual(row[3:],((255,255,255),255))
+            self.assertAlmostEqual(row[2][2]/row[2][3],velox.VELOX_BRAND_SIZE[0]/velox.VELOX_BRAND_SIZE[1],delta=.1)
+
+    def test_navigation_uses_approved_lockup_without_duplicate_wordmark(self):
+        panel=DashboardMockupTests.panel()
+        panel.draw_application_navigation(velox.Rect(0,0,1280,54))
+        images=[args for kind,args,kwargs in panel.r.drawn if kind=='draw_velox_brand']
+        self.assertEqual(len(images),1)
+        box=images[0][0]; self.assertGreater(box.w,box.h*4)
+        self.assertLessEqual(box.y+box.h,54)
+        text=[args for kind,args,kwargs in panel.r.drawn if kind=='draw_text_run_font']
+        self.assertFalse(any(len(args)>1 and args[1] in ('VELOX','Velox') for args in text))
+
+    def test_brand_recording_clipping_and_no_sdl(self):
+        r=_icon_test_renderer(); r.draw_velox_brand(velox.Rect(0,0,120,24))
+        self.assertEqual(r.commands[-1].kind,'velox_brand')
+        r.draw_velox_brand(velox.Rect(1500,0,120,24))
+        self.assertEqual(len(r.commands),1)
+        with mock.patch.object(velox,'sdl',None):r._render_velox_brand(velox.Rect(0,0,120,24))
+        self.assertFalse(r.textures)
+
+
+class CostHistoryV332Tests(unittest.TestCase):
+    @staticmethod
+    def event(key,epoch,amount=1.):
+        return {'schema':velox.data_schema('token_cost'),'event_id':key,'epoch':epoch,
+                'pricing':{'endpoint_type':'openai:model','type_label':'OpenAI / Model'},
+                'cost':{**dict.fromkeys(velox.TOKEN_COST_SUM_FIELDS,0),'total_usd':amount}}
+
+    def test_exact_picker_choices_and_independent_defaults(self):
+        state=velox.UIState()
+        self.assertEqual(velox.DASHBOARD_TREND_PERIODS,('8 hours','7 days','6 months'))
+        self.assertEqual(state.dashboard_cost_period,'24 hours')
+        self.assertEqual(state.dashboard_cost_trend_period,'7 days')
+
+    def test_hourly_and_daily_ranges_are_contiguous(self):
+        now=datetime(2026,11,7,8,37,24).timestamp()
+        hours=velox.dashboard_cost_trend_ranges('8 hours',now)
+        hour=datetime.fromtimestamp(now).replace(minute=0,second=0,microsecond=0).timestamp()
+        self.assertEqual(len(hours),8)
+        self.assertEqual(hours[0][0],hour-7*3600)
+        self.assertEqual(hours[-1],(hour,now))
+        self.assertTrue(all(b-a==3600 for a,b in hours[:-1]))
+        self.assertTrue(all(a[1]==b[0] for a,b in zip(hours,hours[1:])))
+        days=velox.dashboard_cost_trend_ranges('7 days',now)
+        self.assertEqual(len(days),7);self.assertEqual(days[-1][1],now)
+        self.assertEqual(days[0][0],now-7*86400)
+        self.assertTrue(all(b-a==86400 for a,b in days))
+
+    def test_six_months_cross_year_and_handle_leap_february(self):
+        now=datetime(2024,3,15,12).timestamp()
+        rows=velox.dashboard_cost_trend_ranges('6 months',now)
+        self.assertEqual(len(rows),6)
+        self.assertEqual([(datetime.fromtimestamp(a).year,datetime.fromtimestamp(a).month) for a,b in rows],
+                         [(2023,10),(2023,11),(2023,12),(2024,1),(2024,2),(2024,3)])
+        self.assertEqual(rows[-1][1],now)
+        self.assertEqual((datetime.fromtimestamp(rows[4][1])-datetime.fromtimestamp(rows[4][0])).days,29)
+
+    def test_invalid_period_and_time_are_rejected(self):
+        for period,now in [('bad',1800000000.),('7 days',float('nan')),('6 months',float('inf'))]:
+            with self.assertRaises(ValueError):velox.dashboard_cost_trend_ranges(period,now)
+
+    def test_one_request_at_boundary_is_not_counted_twice(self):
+        now=datetime(2026,11,7,8,37,24).timestamp()
+        hour=datetime.fromtimestamp(now).replace(minute=0,second=0,microsecond=0).timestamp()
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root))
+            for key,epoch,amount in [('old',hour-7*3600-1,99),('edge',hour-3600,2),('end',now,3),('future',now+1,99)]:
+                ledger.record(self.event(key,epoch,amount))
+            data=ledger.dashboard_summary(now=now,trend_period='8 hours')
+            self.assertEqual(len(data['trend']),8)
+            self.assertEqual([r['total_usd'] for r in data['trend']][-2:],[2,3])
+            self.assertEqual(sum(r['total_usd'] for r in data['trend']),5)
+
+    def test_history_window_changes_do_not_change_provider_totals_or_24h_stats(self):
+        now=datetime(2026,11,7,22).timestamp()
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root))
+            for i,hours in enumerate((1,10,40,200,1000,3000)):
+                ledger.record(self.event(str(i),now-hours*3600,i+1))
+            data=[ledger.dashboard_summary(now=now,window_seconds=86400,trend_period=p)
+                  for p in velox.DASHBOARD_TREND_PERIODS]
+            self.assertEqual([r['total_usd'] for r in data],[3,3,3])
+            self.assertEqual([r['usage_24h']['total_usd'] for r in data],[3,3,3])
+            self.assertEqual([len(r['trend']) for r in data],[8,7,6])
+            self.assertEqual([sum(b['total_usd'] for b in r['trend']) for r in data],[1,6,21])
+
+    def test_breakdown_window_changes_do_not_change_history(self):
+        now=1800000000.
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root));ledger.record(self.event('one',now-7200))
+            values=[ledger.dashboard_summary(now=now,window_seconds=w,trend_period='7 days') for w in (3600,86400,30*86400)]
+            self.assertEqual([v['total_usd'] for v in values],[0,1,1])
+            self.assertEqual(values[0]['trend'],values[1]['trend']);self.assertEqual(values[1]['trend'],values[2]['trend'])
+
+    def test_live_final_deduplication_in_monthly_history(self):
+        now=datetime(2026,11,7,22).timestamp()
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root))
+            event=self.event('same',now-10,2);ledger.record(event)
+            live=self.event('same',now-10,200)
+            result=ledger.dashboard_summary([live],now=now,trend_period='6 months')
+            self.assertEqual(sum(r['total_usd'] for r in result['trend']),2)
+
+    def test_history_card_picker_updates_only_history_and_hides_stale_bars(self):
+        panel=DashboardMockupTests.panel(); data={'status':'ready','trend':[{'total_usd':1,'start':1,'end':2}]}
+        with mock.patch.object(panel.widgets,'dropdown',return_value='8 hours') as picker,\
+             mock.patch.object(panel,'_draw_dashboard_cost_trend') as plot,\
+             mock.patch.object(panel.widgets,'clipped_text') as text:
+            panel._draw_dashboard_cost_history_card(velox.Rect(0,0,400,240),data)
+        self.assertEqual(panel.state.dashboard_cost_trend_period,'8 hours')
+        self.assertEqual(panel.state.dashboard_cost_period,'24 hours')
+        self.assertEqual(picker.call_args.args[3],list(velox.DASHBOARD_TREND_PERIODS))
+        plot.assert_not_called()
+        self.assertIn('Loading history...',[c.args[1] for c in text.call_args_list])
+
+    def test_breakdown_no_longer_draws_history(self):
+        panel=DashboardMockupTests.panel(); data={'status':'ready','total_usd':1,'trend':[{'total_usd':1}]}
+        with mock.patch.object(panel,'_draw_dashboard_cost_trend') as plot:
+            panel._draw_dashboard_cost_card(velox.Rect(0,0,1200,250),data)
+        plot.assert_not_called()
+
+    def test_chart_labels_change_with_period_and_no_floating_header(self):
+        now=datetime(2026,11,7,22).timestamp();panel=DashboardMockupTests.panel()
+        for period in velox.DASHBOARD_TREND_PERIODS:
+            rows=[{'start':a,'end':b,'total_usd':1} for a,b in velox.dashboard_cost_trend_ranges(period,now)]
+            with mock.patch.object(panel.widgets,'clipped_text') as text:
+                panel._draw_dashboard_cost_trend(velox.Rect(0,0,600,150),{'trend':rows,'trend_period':period})
+            labels=[c.args[1] for c in text.call_args_list]
+            self.assertNotIn('Last 7 days',labels);self.assertNotIn('Selected period',labels)
+            if period=='8 hours':self.assertTrue(any(':' in x for x in labels))
+            if period=='6 months':self.assertIn('Jun',labels);self.assertIn('Nov',labels)
+
+    def test_five_card_layout_stays_inside_view_at_all_scales(self):
+        for width in (320,620,760,1024,1280,1450,1920,2560):
+            cards=velox.Panels._dashboard_summary_card_rects(velox.Rect(0,0,width,2500),250,min_standard_width=300)
+            self.assertEqual(len(cards),5)
+            for r in cards:self.assertTrue(0<=r.x<r.x+r.w<=width)
+            for i,a in enumerate(cards):
+                for b in cards[i+1:]:self.assertFalse(velox.rects_intersect_fast(a.x,a.y,a.w,a.h,b.x,b.y,b.w,b.h))
+
+    def test_zero_history_still_has_correct_number_of_bins(self):
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root))
+            for period,count in [('8 hours',8),('7 days',7),('6 months',6)]:
+                data=ledger.dashboard_summary(now=1800000000.,trend_period=period)
+                self.assertEqual(len(data['trend']),count)
+                self.assertTrue(all(r['total_usd']==0 for r in data['trend']))
+
+
+class CostHistoryAsyncV332Tests(unittest.IsolatedAsyncioTestCase):
+    async def test_trend_change_uses_same_single_reader_without_stale_relabelling(self):
+        calls=[]; entered=threading.Event(); release=threading.Event()
+        def read(seconds,*,trend_period=None):
+            calls.append((seconds,trend_period));entered.set()
+            if not release.wait(5):raise TimeoutError('fixture')
+            return {'total_usd':2,'trend_period':trend_period}
+        panel=CostPeriodAsyncRegressionTests.panel(self,read)
+        try:
+            panel._dashboard_cost_statistics();self.assertTrue(await asyncio.to_thread(entered.wait,3))
+            panel.state.dashboard_cost_trend_period='6 months'
+            for _ in range(10):self.assertEqual(panel._dashboard_cost_statistics(),{'status':'loading'})
+            self.assertEqual(len(calls),1);release.set();await panel._dashboard_cost_entry['task']
+            self.assertEqual(panel._dashboard_cost_statistics(),{'status':'loading'})
+            await panel._dashboard_cost_entry['task']
+            result=panel._dashboard_cost_statistics()
+            self.assertEqual(result['trend_period'],'6 months')
+            self.assertEqual(calls,[(86400,'7 days'),(86400,'6 months')])
+        finally:
+            release.set()
+            task=panel._dashboard_cost_entry['task']
+            if task:await asyncio.gather(task,return_exceptions=True)
+
+
+class _NativeIconSDLV333:
+    """SDL-owned, padded RGBA surfaces with observable native-icon calls."""
+    SDL_PIXELFORMAT_RGBA32 = 1
+    def __init__(self, fail_size=None, fail_install=False, fail_alternate=False):
+        self.surfaces = []
+        self.installed = []
+        self.fail_size = fail_size
+        self.fail_install = fail_install
+        self.fail_alternate = fail_alternate
+    def SDL_CreateSurface(self, w, h, fmt):
+        if w == self.fail_size:
+            return None
+        pitch = w * 4 + 8
+        buffer = ctypes.create_string_buffer(b'\xcd' * (pitch * h))
+        obj = SimpleNamespace(contents=SimpleNamespace(pixels=ctypes.addressof(buffer), pitch=pitch),
+                              buffer=buffer, w=w, h=h, alternates=[], destroyed=False)
+        self.surfaces.append(obj)
+        return obj
+    def SDL_AddSurfaceAlternateImage(self, surface, alternate):
+        if self.fail_alternate:
+            raise RuntimeError('test alternate failure')
+        surface.alternates.append(alternate)
+        return True
+    def SDL_SetWindowIcon(self, window, primary):
+        if self.fail_install:
+            raise RuntimeError('test native failure')
+        images={}
+        for surface in [primary]+primary.alternates:
+            if surface.destroyed:
+                raise AssertionError('Surface freed before icon installation')
+            images[surface.w]=b''.join(ctypes.string_at(surface.contents.pixels+y*surface.contents.pitch,
+                                                       surface.w*4) for y in range(surface.h))
+        self.installed.append((window, primary.w, images))
+        return True
+    def SDL_DestroySurface(self, surface):
+        if surface.destroyed:
+            raise AssertionError('Surface released twice')
+        surface.destroyed=True
+
+
+class NativeBrandIconV333Tests(unittest.TestCase):
+    def setUp(self):
+        self.host=velox.SDLHost({})
+        self.host.window=object()
+    def test_exact_native_sizes_have_transparency_and_original_colours(self):
+        self.assertEqual(tuple(velox.VELOX_WINDOW_ICON_REGIONS),(16,24,32,48,64,96,128,256))
+        for size in velox.VELOX_WINDOW_ICON_REGIONS:
+            rgba=velox.embedded_velox_window_icon_rgba(size)
+            self.assertEqual(len(rgba),size*size*4)
+            image=_IconTestImage.frombytes('RGBA',(size,size),rgba)
+            self.assertEqual(image.getchannel('A').getextrema(),(0,255))
+            visible=[p for p in image.getdata() if p[3]>200]
+            self.assertTrue(any(b>r+100 and g>90 for r,g,b,a in visible))
+            self.assertTrue(any(b>r+100 and g<80 for r,g,b,a in visible))
+            self.assertNotIn((*velox.VELOX_BRAND_WORDMARK_RGB,255),visible)
+            self.assertTrue(all(image.getpixel((x,0))[3]==0 for x in range(size)))
+    def test_native_artwork_is_the_approved_mark_not_a_redraw(self):
+        brand=_IconTestImage.frombytes('RGBA',velox.VELOX_BRAND_SIZE,velox.embedded_velox_brand_rgba())
+        mark=brand.crop((0,0,254,brand.height))
+        mark=mark.crop(mark.getchannel('A').getbbox())
+        for size in (16,32,64,256):
+            margin=max(1,round(size/16));width=size-2*margin
+            height=max(1,round(width*mark.height/mark.width))
+            scaled=mark.convert('RGBa').resize((width,height),_IconTestImage.Resampling.LANCZOS).convert('RGBA')
+            expected=_IconTestImage.new('RGBA',(size,size))
+            expected.paste(scaled,((size-width)//2,(size-height)//2))
+            self.assertEqual(expected.tobytes(),velox.embedded_velox_window_icon_rgba(size))
+    def test_unsupported_sizes_are_rejected(self):
+        for size in (0,-1,17,True,'32',32.0):
+            with self.assertRaises(ValueError):velox.embedded_velox_window_icon_rgba(size)
+    def test_all_sizes_install_from_memory_and_surfaces_are_released(self):
+        fake=_NativeIconSDLV333()
+        with mock.patch.object(velox,'sdl',fake),mock.patch.object(Path,'open',side_effect=AssertionError('No assets on disk')):
+            self.host._set_window_icon()
+        self.assertEqual(len(fake.installed),1)
+        window,primary,images=fake.installed[0]
+        self.assertIs(window,self.host.window);self.assertEqual(primary,32)
+        self.assertEqual(set(images),set(velox.VELOX_WINDOW_ICON_REGIONS))
+        for size,pixels in images.items():self.assertEqual(pixels,velox.embedded_velox_window_icon_rgba(size))
+        self.assertTrue(all(s.destroyed for s in fake.surfaces))
+    def test_padded_surface_rows_are_not_corrupted(self):
+        fake=_NativeIconSDLV333()
+        with mock.patch.object(velox,'sdl',fake):surface=self.host._create_velox_icon_surface(16)
+        for y in range(16):
+            self.assertEqual(ctypes.string_at(surface.contents.pixels+y*surface.contents.pitch+64,8),b'\xcd'*8)
+        fake.SDL_DestroySurface(surface)
+    def test_missing_alternate_api_uses_high_resolution_fallback(self):
+        fake=_NativeIconSDLV333();fake.SDL_AddSurfaceAlternateImage=None
+        with mock.patch.object(velox,'sdl',fake):self.host._set_window_icon()
+        self.assertEqual(fake.installed[0][1],64)
+        self.assertEqual(set(fake.installed[0][2]),{64})
+        self.assertTrue(all(s.destroyed for s in fake.surfaces))
+    def test_one_unavailable_size_does_not_prevent_icon_installation(self):
+        fake=_NativeIconSDLV333(fail_size=48)
+        with mock.patch.object(velox,'sdl',fake):self.host._set_window_icon()
+        self.assertEqual(len(fake.installed),1)
+        self.assertNotIn(48,fake.installed[0][2])
+        self.assertTrue(all(s.destroyed for s in fake.surfaces))
+    def test_failed_base_surface_is_safe(self):
+        fake=_NativeIconSDLV333(fail_size=32)
+        with mock.patch.object(velox,'sdl',fake):self.host._set_window_icon()
+        self.assertEqual(fake.installed,[]);self.assertEqual(fake.surfaces,[])
+    def test_native_failure_releases_all_surfaces_without_crashing(self):
+        for fake in (_NativeIconSDLV333(fail_install=True),_NativeIconSDLV333(fail_alternate=True)):
+            with mock.patch.object(velox,'sdl',fake):self.host._set_window_icon()
+            self.assertTrue(fake.surfaces)
+            self.assertTrue(all(s.destroyed for s in fake.surfaces))
+    def test_missing_sdl_or_window_is_safe(self):
+        for fake in (None,SimpleNamespace()):
+            with mock.patch.object(velox,'sdl',fake):self.host._set_window_icon()
+        fake=_NativeIconSDLV333();self.host.window=None
+        with mock.patch.object(velox,'sdl',fake):self.host._set_window_icon()
+        self.assertEqual(fake.surfaces,[])
+    def test_invalid_surface_pitch_is_released(self):
+        fake=_NativeIconSDLV333();create=fake.SDL_CreateSurface
+        def invalid(*args):
+            result=create(*args);result.contents.pitch=1;return result
+        fake.SDL_CreateSurface=invalid
+        with mock.patch.object(velox,'sdl',fake):self.host._set_window_icon()
+        self.assertEqual(fake.installed,[])
+        self.assertTrue(all(s.destroyed for s in fake.surfaces))
+
+
+class EndpointTextOnlyV333Tests(unittest.TestCase):
+    def test_dashboard_endpoint_cells_are_text_only(self):
+        panel=DashboardMockupTests.panel()
+        for record in DashboardMockupTests.records():
+            row=panel._dashboard_live_task_row(record)
+            self.assertEqual(row['endpoint'],{'label':record['endpoint_name']})
+            self.assertTrue(row['status']['icon'].startswith('task:'))
+    def test_no_provider_symbols_are_drawn_for_any_endpoint(self):
+        panel=DashboardMockupTests.panel();before=len(panel.r.drawn)
+        for name in ('OpenAI','GPT-6.1 Sol','Anthropic','Claude Opus','DeepSeek','Novita','Baseten','Custom',''):
+            panel.widgets._draw_dashboard_cell_icon(velox.Rect(0,0,18,18),'endpoint',velox.Palette.text,name)
+        self.assertEqual(len(panel.r.drawn),before)
+    def test_status_masks_are_retained(self):
+        panel=DashboardMockupTests.panel()
+        with mock.patch.object(panel.r,'draw_embedded_icon') as draw:
+            panel.widgets._draw_dashboard_cell_icon(velox.Rect(0,0,18,18),'task:completed',velox.Palette.text)
+        self.assertEqual(draw.call_args.args[0],'check_circle')
+    def test_legacy_endpoint_cells_do_not_reserve_a_logo_gutter(self):
+        panel=DashboardMockupTests.panel();positions=[]
+        for endpoint in ({'label':'OpenAI'}, {'label':'OpenAI','icon':'endpoint','icon_key':'OpenAI'}):
+            with mock.patch.object(panel.widgets,'clipped_text',wraps=panel.widgets.clipped_text) as text,\
+                 mock.patch.object(panel.widgets,'_draw_dashboard_cell_icon') as icon:
+                panel.widgets.table_view('test.endpoint',velox.Rect(0,0,600,150),
+                    [{'key':'endpoint','title':'Endpoint','width':400}],
+                    [{'id':'one','endpoint':endpoint}])
+            positions.append(next(c.args[0].x for c in text.call_args_list if c.args[1]=='OpenAI'))
+            icon.assert_not_called()
+        self.assertEqual(positions[0],positions[1])
+
+
+@contextlib.contextmanager
+def _test_local_timezone_v333(name):
+    previous=os.environ.get('TZ')
+    os.environ['TZ']=name
+    time.tzset()
+    try:yield
+    finally:
+        if previous is None:os.environ.pop('TZ',None)
+        else:os.environ['TZ']=previous
+        time.tzset()
+
+
+class HourAlignedHistoryV333Tests(unittest.TestCase):
+    def test_current_hour_and_seven_preceding_hours(self):
+        now=datetime(2026,11,7,8,37,24,900000).timestamp()
+        rows=velox.dashboard_cost_trend_ranges('8 hours',now)
+        self.assertEqual([datetime.fromtimestamp(a).strftime('%H:%M') for a,b in rows],
+                         ['01:00','02:00','03:00','04:00','05:00','06:00','07:00','08:00'])
+        self.assertEqual(rows[-1][1],now)
+        self.assertTrue(all(datetime.fromtimestamp(a).second==0 for a,b in rows))
+        self.assertTrue(all(datetime.fromtimestamp(a).microsecond==0 for a,b in rows))
+    def test_midnight_and_date_rollover(self):
+        now=datetime(2026,1,1,0,12).timestamp()
+        rows=velox.dashboard_cost_trend_ranges('8 hours',now)
+        self.assertEqual(datetime.fromtimestamp(rows[0][0]),datetime(2025,12,31,17))
+        self.assertEqual(datetime.fromtimestamp(rows[-1][0]),datetime(2026,1,1))
+        self.assertEqual(len(rows),8)
+    def test_hour_boundaries_are_inclusive_only_in_the_new_hour(self):
+        now=datetime(2026,11,7,8,30).timestamp()
+        rows=velox.dashboard_cost_trend_ranges('8 hours',now)
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root))
+            for i,(start,end) in enumerate(rows):ledger.record(CostHistoryV332Tests.event(str(i),start,i+1))
+            ledger.record(CostHistoryV332Tests.event('too-old',rows[0][0]-.001,1000))
+            ledger.record(CostHistoryV332Tests.event('before-now',now-.001,20))
+            ledger.record(CostHistoryV332Tests.event('now',now,30))
+            ledger.record(CostHistoryV332Tests.event('future',now+.001,1000))
+            data=ledger.dashboard_summary(now=now,trend_period='8 hours')
+            self.assertEqual([r['total_usd'] for r in data['trend']],[1,2,3,4,5,6,7,58])
+    def test_exact_hour_includes_event_now_in_zero_duration_current_bucket(self):
+        now=datetime(2026,11,7,8).timestamp()
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root))
+            for key,stamp,amount in [('last',now-.001,2),('current',now,3),('future',now+.001,99)]:
+                ledger.record(CostHistoryV332Tests.event(key,stamp,amount))
+            data=ledger.dashboard_summary(now=now,trend_period='8 hours')
+            self.assertEqual(data['trend'][-1]['start'],now)
+            self.assertEqual(data['trend'][-1]['end'],now)
+            self.assertEqual([r['total_usd'] for r in data['trend']][-2:],[2,3])
+    def test_day_boundary_events_are_not_lost_or_duplicated(self):
+        now=datetime(2026,11,8,2,10).timestamp()
+        with tempfile.TemporaryDirectory() as root:
+            ledger=velox.TokenCostLedger(Path(root))
+            for i,hour in enumerate((datetime(2026,11,7,23),datetime(2026,11,8,0),datetime(2026,11,8,1))):
+                ledger.record(CostHistoryV332Tests.event(str(i),hour.timestamp(),i+1))
+            data=ledger.dashboard_summary(now=now,trend_period='8 hours')
+            by_hour={datetime.fromtimestamp(r['start']).hour:r['total_usd'] for r in data['trend']}
+            self.assertEqual([by_hour[h] for h in (23,0,1,2)],[1,2,3,0])
+            self.assertEqual(sum(by_hour.values()),6)
+    def test_chart_uses_start_labels_not_partial_current_hour_end(self):
+        now=datetime(2026,11,7,8,37).timestamp();panel=DashboardMockupTests.panel()
+        rows=[{'start':a,'end':b,'total_usd':1} for a,b in velox.dashboard_cost_trend_ranges('8 hours',now)]
+        with mock.patch.object(panel.widgets,'clipped_text') as text:
+            panel._draw_dashboard_cost_trend(velox.Rect(0,0,1200,180),{'trend':rows,'trend_period':'8 hours'})
+        labels=[c.args[1] for c in text.call_args_list if ':' in c.args[1]]
+        self.assertEqual(labels,['01:00','02:00','03:00','04:00','05:00','06:00','07:00','08:00'])
+    @unittest.skipUnless(hasattr(time,'tzset'),'Timezone control is not available on this platform')
+    def test_fractional_utc_offset_still_uses_local_whole_hours(self):
+        with _test_local_timezone_v333('Asia/Kolkata'):
+            now=datetime(2026,11,7,8,37).timestamp()
+            rows=velox.dashboard_cost_trend_ranges('8 hours',now)
+            self.assertEqual(datetime.fromtimestamp(rows[-1][0]).strftime('%H:%M'),'08:00')
+            self.assertTrue(all(datetime.fromtimestamp(a).minute==0 for a,b in rows))
+    @unittest.skipUnless(hasattr(time,'tzset'),'Timezone control is not available on this platform')
+    def test_toronto_dst_folds_and_spring_gap_preserve_eight_real_hours(self):
+        with _test_local_timezone_v333('America/Toronto'):
+            cases=[(datetime(2026,11,1,1,30,fold=0),'01:00'),
+                   (datetime(2026,11,1,1,30,fold=1),'01:00'),
+                   (datetime(2026,3,8,4,30),'04:00')]
+            for local,expected in cases:
+                now=local.timestamp();rows=velox.dashboard_cost_trend_ranges('8 hours',now)
+                self.assertEqual(len(rows),8)
+                self.assertEqual(datetime.fromtimestamp(rows[-1][0]).strftime('%H:%M'),expected)
+                self.assertEqual(datetime.fromtimestamp(rows[-1][0]).fold,local.fold)
+                self.assertTrue(all(b-a==3600 for a,b in rows[:-1]))
+                self.assertTrue(all(datetime.fromtimestamp(a).minute==0 for a,b in rows))
+                self.assertAlmostEqual(rows[-1][1]-rows[-1][0],1800)
 
 
 def main() -> None:
