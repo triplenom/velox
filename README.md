@@ -12,7 +12,7 @@ The runtime is model-agnostic across configured local and hosted endpoints. Conv
 
 - **Agentic orchestration.** Chats can delegate bounded work to background agents with distinct Reader, Planner, Implementer and Reviewer roles. Primary and subagent inference endpoints are configured independently, allowing different models to be used for reasoning, execution and verification.
 - **Durable task contracts and independent review.** Each task can maintain one active checklist with fixed acceptance requirements and optional one-level implementation steps. Progress and factual comments persist across execution. Completion is not self-certified: a separate Reviewer evaluates the full contract, and failed requirements remain open for repair.
-- **Native tool execution.** The tool registry exposes file/document operations, Python, shell commands, persistent terminals, web research, Chromium diagnostics/playback and image analysis under explicit tool policies. Optional ComfyUI workflows and Meshy jobs extend the same execution model to generated media and 3D assets.
+- **Native tool execution.** The tool registry exposes file/document operations, Python, shell commands, persistent terminals, web research, Chromium diagnostics/playback and image analysis under explicit tool policies. Opt-in, per-chat **Computer Use** adds window, screenshot, mouse and keyboard tools behind a global **Ctrl+P+End** circuit breaker. Optional ComfyUI workflows and Meshy jobs extend the same execution model to generated media and 3D assets.
 - **Long-running agent runtime.** Endpoint concurrency, request limits, progress-aware timeouts, transient-error recovery and context fitting/compaction are configurable. Inference slots are released while agents are waiting on tools or other external work. Recorded tool results and durable checkpoints support replay without intentionally repeating completed side effects.
 - **Context and skill injection.** Reusable Skills, Context Docs, Calendar Events, local Items and an optional user profile provide persistent context without hard-coding it into the application. Skill loading can be global, on-demand or disabled.
 - **Scheduled and ongoing work.** Local scheduled tasks and the optional Personal Assistant use the same agent/runtime machinery as interactive work, so recurring workflows share the same tools, model configuration, persistence and inspection surfaces.
@@ -67,6 +67,8 @@ The interface uses the pinned [PySDL3](https://pysdl3.readthedocs.io/en/latest/i
 
 **Every commit must bump `CURRENT_VERSION`, no exceptions.** Compatible changes increment the application version only. Change `BACKWARD_COMPATIBLE_VERSION` as well only when the data format actually breaks compatibility, and update the relevant tests/documentation.
 
+For example, release 334 added a `computer_use_enabled` flag to chat `features` and agent `tool_features`. Records written by earlier releases omit it, and it is read as off, so the data generation did not change. Earlier releases do not know the flag and reject chats or agents written by 334 or later.
+
 `config.json` follows a separate, deliberately tolerant contract so that every future release can read it:
 
 - It carries its own `config_version` (`CONFIG_FILE_VERSION`), independent of both version constants above. The data-generation tags are never written into it.
@@ -86,7 +88,7 @@ Select the appropriate **Chat Completions**, **Responses**, or **Anthropic Messa
 
 Anthropic manages the cache remotely; actual hits depend on identical prefixes, model minimum prompt lengths and TTL. Cache reads and writes remain included in Velox's token usage and cost accounting. Enabling caching is not a guarantee that every request produces a cache hit.
 
-Create a chat, choose its main/subagent endpoints, and **enable the tools** it needs. The six policy labels are **File, System, Web, Agent, Chat and Checklists**. New chats start with **Agent, Chat and Checklists off**; File, System and Web remain on. Saved per-chat choices are not changed. Endpoint/tool choices lock when the first real message is sent. Point coding/file work at a disposable workspace and state any write boundaries explicitly. For example:
+Create a chat, choose its main/subagent endpoints, and **enable the tools** it needs. The seven policy labels are **File, System, Web, Agent, Chat, Checklists and Computer Use**. New chats start with **Agent, Chat, Checklists and Computer Use off**; File, System and Web remain on. Saved per-chat choices are not changed. Endpoint/tool choices lock when the first real message is sent. Point coding/file work at a disposable workspace and state any write boundaries explicitly. For example:
 
 > Build a local tool for exploring CSV files. Let me import a file, inspect its columns, filter rows and export the result. Pick a suitable stack, add tests and run them. Work only in the workspace I specify.
 
@@ -102,6 +104,30 @@ The dashboard keeps the existing native layout: four summary cards, Chat/Agent/I
 - Outcome and token/cache cards show **24 hours**, independent of the cost picker. Tokens are counted at request time, not from a recently active Chat's lifetime total. While the first background snapshot loads, the existing counters remain explicitly labelled **All time**. Cached input is a subset of input, never an extra token-ring segment; an asterisk on the cache-hit badge indicates partial reporting.
 - **Costs** offers the existing rolling periods, a preceding-period comparison, provider shares and seven history bars. For periods up to 24 hours, the bars show the last seven days; longer selections divide the chosen period into seven intervals. Hover for exact intervals and accounting details. No previous spend means no fabricated percentage change.
 - Short windows scroll the dashboard as a page, while each table retains its own scrolling. Page Up/Down works when an editor is not focused. Larger text wraps the summary cards and filters instead of hiding task controls.
+
+### Computer Use
+
+**Computer Use** is a per-chat toggle in **NEW CHAT SETTINGS**. It is off by default, is saved with the chat (copies and branches keep it), and locks with the other tool choices when the first message is sent. The composer's tool summary always shows the state: `… - Computer Use: Off`, or `Computer Use: On` in amber.
+
+- **Off:** no desktop-control tools are advertised or executable, and the system prompt tells the model to leave your mouse, keyboard, window focus and clipboard alone. That includes not using shell, Python, terminals or automation utilities to do it, and not opening visible GUI windows unless you ask. (No previously existing tool drove the mouse or keyboard; `desktop_screenshot` is a read-only capture and stays under System.)
+- **On:** nine Windows-only `computer_*` tools are available (see below), and the prompt tells the model to use only those tools for input, to capture and inspect the screen before and after acting, and to avoid sensitive dialogs unless you asked.
+- **Agents inherit it and can never broaden it.** A new agent holds Computer Use only if its source chat *and* (for a child agent) its parent agent hold it. This is enforced when the agent is created and re-checked before every Computer Use call, so even an edited `agent.json` cannot widen it. Planner subagents may only observe (list windows, take screenshots), and Reader subagents get none of these tools.
+
+| Tool | What it does |
+| --- | --- |
+| `computer_list_windows()` | Lists visible top-level windows front to back: `window_id`, title, process, bounds, minimized/foreground state, `is_velox`, plus the virtual screen and cursor position. |
+| `computer_focus_window(window_id)` | Restores a minimized window and brings it to the foreground. |
+| `computer_screenshot(window_id?)` | Captures every monitor, or one window's on-screen rectangle, to the chat's screenshots folder. Returns the PNG path and the screen/window coordinate mapping. |
+| `computer_mouse_move(x, y, window_id?)` | Moves the pointer (hover) without clicking. |
+| `computer_mouse_click(x, y, button?, clicks?, window_id?)` | Left/right/middle click, double- or triple-click. |
+| `computer_mouse_drag(start_x, start_y, end_x, end_y, button?, window_id?)` | Presses, moves smoothly and releases. |
+| `computer_mouse_scroll(x, y, amount, horizontal?, window_id?)` | Scrolls the wheel by up to 50 notches. |
+| `computer_type_text(text, window_id?)` | Types literal Unicode text (up to 10,000 characters). Newline presses Enter and tab presses Tab. |
+| `computer_key_press(keys, repeat?, window_id?)` | Presses keys or chords such as `enter`, `ctrl+s`, `alt+tab` or `ctrl+shift+t`. |
+
+Coordinates are physical screen pixels. When `window_id` is given, they are pixels of that window's `computer_screenshot`. A click on a point covered by another window is refused rather than sent to the wrong window. Keyboard tools focus `window_id` first and send nothing if focus fails. Input from all chats and agents is serialized, and held buttons or keys are always released if an action is interrupted.
+
+**Circuit breaker — Ctrl+P+End.** Hold Ctrl, P and End together, in any order, from any application. On Windows a background monitor watches the physical keys, so this works while another program has focus; inside the Velox window it also works on other platforms. It immediately aborts any in-flight Computer Use action, releasing held buttons and keys. It then requests **Pause** for every running chat and agent, and shows a notification listing what was paused. A paused chat or agent will not start new Computer Use input. Resume work as usual from the chat or the Dashboard.
 
 ### Steering active work
 

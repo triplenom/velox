@@ -4,6 +4,8 @@
 
 File, Python, shell, and terminal tools run with the permissions of the account running Velox. They are not an operating-system sandbox. Enable only the tool categories needed for a task and use a disposable workspace for unfamiliar code. Prompted write scopes and task ownership checks do not restrict general filesystem access.
 
+Computer Use is off by default for every chat. When you turn it on for a chat, that chat and the agents it starts can see your screen and send real mouse and keyboard input to whatever window has focus. With it off, the model is only *instructed* not to touch your mouse, keyboard or window focus; System tools could still do so if a model ignored that instruction. Hold Ctrl+P+End at any time to abort in-flight Computer Use input and pause every running chat and agent.
+
 ## Model connections
 
 Prompts, selected context, attachments, and tool results are sent to the configured model endpoint. A self-hosted endpoint can still be on another machine. Check the destination before using private data. Read-only account connectors can supply context to a model; read-only access does not keep that context on your computer.

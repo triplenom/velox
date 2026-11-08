@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 333
+CURRENT_VERSION = 334
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -580,6 +580,7 @@ CREDENTIAL_FILE_SCHEMA = data_schema('velox_account_credentials')
 GOOGLE_CALENDAR_CREDENTIAL_ACCOUNT = "google_calendar"
 CURRENT_PANEL_NAMES = frozenset({"chat", "calendar", "agents", "context", "vault", "settings"})
 
+COMPUTER_USE_FEATURE_KEY = "computer_use_enabled"
 CHAT_TOOL_FEATURE_KEYS: tuple[str, ...] = (
     "file_tools_enabled",
     "system_tools_enabled",
@@ -587,6 +588,7 @@ CHAT_TOOL_FEATURE_KEYS: tuple[str, ...] = (
     "agent_tools_enabled",
     "chat_history_enabled",
     "checklists_enabled",
+    COMPUTER_USE_FEATURE_KEY,
 )
 CHAT_TOOL_CATEGORY_LABELS: tuple[tuple[str, str], ...] = (
     ("file_tools_enabled", "File"),
@@ -595,7 +597,17 @@ CHAT_TOOL_CATEGORY_LABELS: tuple[tuple[str, str], ...] = (
     ("agent_tools_enabled", "Agent"),
     ("chat_history_enabled", "Chat"),
     ("checklists_enabled", "Checklists"),
+    (COMPUTER_USE_FEATURE_KEY, "Computer Use"),
 )
+# Records written before release 334 have no Computer Use flag. Its absence is
+# read as Off; it is never filled from an application default or a fallback.
+OPTIONAL_LEGACY_TOOL_FEATURE_KEYS = frozenset({COMPUTER_USE_FEATURE_KEY})
+# Every tool that inspects or drives the interactive desktop through windows,
+# focus, screen capture with input coordinates or simulated mouse/keyboard input
+# uses this prefix and belongs only to the Computer Use category.
+COMPUTER_USE_TOOL_PREFIX = "computer_"
+# The global circuit breaker: hold Ctrl, P and End together (any order).
+CIRCUIT_BREAKER_HOTKEY_LABEL = "Ctrl+P+End"
 
 FILE_TOOL_PREFIXES: tuple[str, ...] = ("fs_", "doc_")
 PARALLEL_IMAGE_ANALYSIS_TOOL_NAMES = frozenset({
@@ -696,23 +708,49 @@ def normalize_tool_feature_flags(
     values: Any,
     defaults: dict[str, bool] | None = None,
 ) -> dict[str, bool]:
-    """Return the exact six per-Task capability flags (including Checklists)."""
+    """Return the exact seven per-Task capability flags (including Checklists).
+
+    Computer Use fails closed: only an explicit stored ``True`` enables it. A
+    missing value (older record, partial dict or application default) is Off,
+    regardless of ``defaults``, so no fallback path can broaden desktop control.
+    """
     raw = values if isinstance(values, dict) else {}
     fallback = defaults if isinstance(defaults, dict) else {}
     return {
-        key: bool(raw.get(key, fallback.get(key, True)))
+        key: (
+            raw.get(key) is True
+            if key == COMPUTER_USE_FEATURE_KEY
+            else bool(raw.get(key, fallback.get(key, True)))
+        )
         for key in CHAT_TOOL_FEATURE_KEYS
     }
 
 
+def computer_use_enabled_in(features: Any) -> bool:
+    """Return the fail-closed Computer Use permission from one feature mapping."""
+    return isinstance(features, dict) and features.get(COMPUTER_USE_FEATURE_KEY) is True
+
+
 def chat_task_settings_label(endpoint_name: Any, features: Any) -> str:
-    """Return the immutable composer label for one Chat Task configuration."""
+    """Return the immutable composer label for one Chat Task configuration.
+
+    Computer Use is reported explicitly in both states because it controls
+    whether the Task may touch the user's mouse, keyboard and window focus.
+    """
     endpoint = str(endpoint_name or "No endpoint").strip() or "No endpoint"
     normalized = normalize_tool_feature_flags(features)
-    enabled = [label for key, label in CHAT_TOOL_CATEGORY_LABELS if normalized.get(key, False)]
+    computer_use = bool(normalized.get(COMPUTER_USE_FEATURE_KEY))
+    enabled = [
+        label for key, label in CHAT_TOOL_CATEGORY_LABELS
+        if key != COMPUTER_USE_FEATURE_KEY and normalized.get(key, False)
+    ]
+    parts = [endpoint]
     if enabled:
-        return f"{endpoint} - Tools [{', '.join(enabled)}]"
-    return f"{endpoint} - No Tools"
+        parts.append(f"Tools [{', '.join(enabled)}]")
+    elif not computer_use:
+        parts.append("No Tools")
+    parts.append("Computer Use: On" if computer_use else "Computer Use: Off")
+    return " - ".join(parts)
 
 
 def force_pdf_images_from_config(config: dict[str, Any]) -> bool:
@@ -16718,6 +16756,7 @@ def default_chat(
             "agent_tools_enabled": False,
             "chat_history_enabled": False,
             "checklists_enabled": False,
+            COMPUTER_USE_FEATURE_KEY: False,
             "show_reasoning_content": True,
         },
     }
@@ -17011,11 +17050,14 @@ def validate_chat_record(obj: Any, *, expected_chat_id: str | None = None, locat
         raise ValueError(f"Missing chat features in {location}")
     expected_feature_fields = {
         "file_tools_enabled", "system_tools_enabled", "web_tools_enabled", "agent_tools_enabled", "chat_history_enabled",
-        "checklists_enabled", "show_reasoning_content",
+        "checklists_enabled", COMPUTER_USE_FEATURE_KEY, "show_reasoning_content",
     }
-    if set(features) != expected_feature_fields:
+    # Compatible addition: chats saved before Computer Use existed omit the flag
+    # (read as Off). Every other field remains exact.
+    required_feature_fields = expected_feature_fields - OPTIONAL_LEGACY_TOOL_FEATURE_KEYS
+    if not required_feature_fields <= set(features) <= expected_feature_fields:
         raise UnsupportedDataVersionError(f"Chat features do not match the current data model in {location}")
-    for key in expected_feature_fields:
+    for key in features:
         if not isinstance(features.get(key), bool):
             raise ValueError(f"Invalid chat feature {key} in {location}")
     if isinstance(obj.get("tool_failure_count"), bool) or not isinstance(obj.get("tool_failure_count"), int) or int(obj.get("tool_failure_count")) < 0:
@@ -17196,9 +17238,14 @@ def validate_agent_record(obj: Any, *, expected_agent_id: str | None = None, loc
     if not isinstance(obj.get("endpoint_profile_id"), str) or not str(obj.get("endpoint_profile_id") or "").strip():
         raise ValueError(f"Invalid agent endpoint profile in {location}")
     tool_features = obj.get("tool_features")
-    if not isinstance(tool_features, dict) or set(tool_features) != set(CHAT_TOOL_FEATURE_KEYS):
+    # Agents saved before Computer Use existed omit the flag; it then reads as Off.
+    if (
+        not isinstance(tool_features, dict)
+        or not set(tool_features) <= set(CHAT_TOOL_FEATURE_KEYS)
+        or set(CHAT_TOOL_FEATURE_KEYS) - set(tool_features) - OPTIONAL_LEGACY_TOOL_FEATURE_KEYS
+    ):
         raise UnsupportedDataVersionError(f"Agent tool features do not match the current data model in {location}")
-    for key in CHAT_TOOL_FEATURE_KEYS:
+    for key in tool_features:
         if not isinstance(tool_features.get(key), bool):
             raise ValueError(f"Invalid agent tool feature {key} in {location}")
     for counter_name in ("tool_failure_count", "malformed_tool_call_streak"):
@@ -19837,6 +19884,9 @@ class ChatStore:
             "agent_tools_enabled": bool(features.get("agent_tools_enabled", False)),
             "chat_history_enabled": bool(features.get("chat_history_enabled", False)),
             "checklists_enabled": False,
+            # Computer Use is a deliberate per-chat opt-in; there is no global
+            # default that can turn it on for new or older chats.
+            COMPUTER_USE_FEATURE_KEY: False,
             "show_reasoning_content": bool(features.get("default_show_reasoning_content", True)),
         }
 
@@ -19845,7 +19895,7 @@ class ChatStore:
         defaults = self._default_chat_features_from_config()
         boolean_keys = {
             "file_tools_enabled", "system_tools_enabled", "web_tools_enabled", "agent_tools_enabled", "chat_history_enabled",
-            "checklists_enabled", "show_reasoning_content",
+            "checklists_enabled", COMPUTER_USE_FEATURE_KEY, "show_reasoning_content",
         }
         features = {
             key: bool(raw.get(key, default)) if key in boolean_keys else str(raw.get(key) or default)
@@ -20105,6 +20155,7 @@ class ChatStore:
             "agent_tools_enabled",
             "chat_history_enabled",
             "checklists_enabled",
+            COMPUTER_USE_FEATURE_KEY,
             "show_reasoning_content",
         }
         feature_name = str(feature_name or "").strip()
@@ -26310,6 +26361,11 @@ class AgentStore:
             task = redact_durable_secret_text(task)
             context = redact_durable_secret_text(context)
             title = redact_durable_secret_text(title)
+        source_chat_features = ChatStore(self.storage).get_chat_tool_features(chat_id)
+        requested_features = normalize_tool_feature_flags(tool_features, source_chat_features)
+        if not isinstance(tool_features, dict):
+            # No explicit policy means "inherit the source Chat" for every flag.
+            requested_features[COMPUTER_USE_FEATURE_KEY] = computer_use_enabled_in(source_chat_features)
         agent = default_agent(
             chat_id, task, title=title, endpoint_profile_id=endpoint_profile_id, context=context, timeout_minutes=timeout_minutes,
             auto_compaction_enabled=auto_compaction_enabled,
@@ -26317,9 +26373,14 @@ class AgentStore:
             max_output_tokens=max_output_tokens,
             agent_kind=agent_kind,
             pa_date=pa_date,
-            tool_features=normalize_tool_feature_flags(
-                tool_features, ChatStore(self.storage).get_chat_tool_features(chat_id),
-            ),
+            tool_features=requested_features,
+        )
+        # Computer Use is inherited, never granted here: a new Agent may hold it
+        # only when its request, its source Chat and (for a child) its parent
+        # Agent all hold it. No caller can broaden desktop control.
+        computer_use_allowed = (
+            computer_use_enabled_in(agent["tool_features"])
+            and computer_use_enabled_in(source_chat_features)
         )
         if parent_agent_id:
             parent = self.load_agent(parent_agent_id)
@@ -26328,8 +26389,10 @@ class AgentStore:
                 raise PermissionError("The originating Agent run is not active or belongs to another Chat")
             agent["parent_agent_id"] = parent_agent_id
             agent["parent_task_run_id"] = parent_task_run_id
+            computer_use_allowed = computer_use_allowed and computer_use_enabled_in(parent.get("tool_features"))
         elif parent_task_run_id:
             raise ValueError("parent_task_run_id requires parent_agent_id")
+        agent["tool_features"][COMPUTER_USE_FEATURE_KEY] = bool(computer_use_allowed)
         agent_id = str(agent["agent_id"])
         task_run_id = TaskIdStore(self.storage).allocate(f"agent-run:{agent_id}")
         agent["task_run_id"] = task_run_id
@@ -34644,6 +34707,38 @@ class ContextAssembler:
     )
     BASE_AGENT_GUIDANCE = AGENT_GUIDANCE
 
+    # Desktop-control policy shared by Chat and Agent prompts. Off is the default
+    # and must keep the model from touching the user's mouse, keyboard, focus or
+    # windows through any other tool family.
+    COMPUTER_USE_OFF_GUIDANCE = (
+        "Computer Use is OFF. The user may be using this computer: never move or click the mouse, send keystrokes, "
+        "change window focus or the clipboard, or activate, move or close windows, whether through shell, Python, "
+        "terminals or automation tools. Do not open visible GUI windows or apps unless asked; prefer headless or "
+        "background work such as browser_run_headless. If a task needs desktop interaction, say so; it requires a "
+        "new chat with Computer Use enabled."
+    )
+    COMPUTER_USE_ON_GUIDANCE = (
+        "Computer Use is ON. The computer_* tools operate the user's real interactive desktop: computer_list_windows, "
+        "computer_focus_window, computer_screenshot, computer_mouse_move, computer_mouse_click, computer_mouse_drag, "
+        "computer_mouse_scroll, computer_type_text and computer_key_press. Use only these tools for mouse, keyboard and "
+        "window-focus actions; never synthesize input through shell, Python, terminals or automation libraries. Use "
+        "the desktop only when the task needs it and prefer files, commands and headless tools otherwise. Before acting, "
+        "list windows and capture a screenshot; after each meaningful action capture again and inspect it with image "
+        "analysis rather than assuming success. Coordinates are physical screen pixels; with window_id they are "
+        "relative to that window's screenshot, whose top-left pixel is (0,0). Focus the target window before typing, "
+        "because keystrokes go to whichever window has focus. Do not operate Velox's own window, password or credential "
+        "prompts, security/UAC dialogs, payments or purchases, account or system settings, or destructive "
+        "confirmations unless the user explicitly asked for that exact action. The user can press "
+        + CIRCUIT_BREAKER_HOTKEY_LABEL
+        + " at any time: this circuit breaker aborts in-flight input and pauses every running chat and agent. After "
+        "an interruption or resume, capture the screen again before continuing."
+    )
+
+    @classmethod
+    def computer_use_guidance(cls, enabled: bool) -> str:
+        """Return the explicit desktop-control section for one Task policy."""
+        return "COMPUTER USE\n\n" + (cls.COMPUTER_USE_ON_GUIDANCE if enabled else cls.COMPUTER_USE_OFF_GUIDANCE)
+
     @classmethod
     def agent_guidance(cls, checklists_enabled: bool = True) -> str:
         return cls.AGENT_GUIDANCE if checklists_enabled else cls.BASE_AGENT_GUIDANCE
@@ -34757,7 +34852,7 @@ Keep synthesis, decisions and the final answer here. Use direct tools for small 
         if not any_tools:
             sections.append(
                 "NO TOOLS - ALL CAPABILITIES DISABLED\n\n"
-                "File, System, Web, Agent, Chat-history and Checklist tools are disabled. Answer directly from supplied "
+                "File, System, Web, Agent, Chat-history, Checklist and Computer Use tools are disabled. Answer directly from supplied "
                 "context. Do not pretend unavailable research, file access, external verification or background work occurred."
             )
         else:
@@ -34775,6 +34870,7 @@ Keep synthesis, decisions and the final answer here. Use direct tools for small 
                     "terminal tools, or another System tool as a substitute for reading, writing, editing, "
                     "searching, importing, or deleting local files."
                 )
+            sections.append(self.computer_use_guidance(bool(tool_features.get(COMPUTER_USE_FEATURE_KEY))))
 
         if agent_tools:
             sections.append("READING-HEAVY DELEGATION\n\n" + self.READING_DELEGATION_GUIDANCE)
@@ -35505,6 +35601,29 @@ TOOL_POSITIONAL_SIGNATURES: dict[str, tuple[ToolArgumentSpec, ...]] = {
     "doc_read": (ToolArgumentSpec("path", "text"),),
     "doc_pdf_images": (ToolArgumentSpec("path", "text"),),
     "desktop_screenshot": (),
+    "computer_list_windows": (),
+    "computer_focus_window": (ToolArgumentSpec("window_id", "text"),),
+    "computer_screenshot": (ToolArgumentSpec("window_id", "text"),),
+    "computer_mouse_move": (
+        ToolArgumentSpec("x", "number"), ToolArgumentSpec("y", "number"), ToolArgumentSpec("window_id", "text"),
+    ),
+    "computer_mouse_click": (
+        ToolArgumentSpec("x", "number"), ToolArgumentSpec("y", "number"), ToolArgumentSpec("button", "text"),
+        ToolArgumentSpec("clicks", "number"), ToolArgumentSpec("window_id", "text"),
+    ),
+    "computer_mouse_drag": (
+        ToolArgumentSpec("start_x", "number"), ToolArgumentSpec("start_y", "number"),
+        ToolArgumentSpec("end_x", "number"), ToolArgumentSpec("end_y", "number"),
+        ToolArgumentSpec("button", "text"), ToolArgumentSpec("window_id", "text"),
+    ),
+    "computer_mouse_scroll": (
+        ToolArgumentSpec("x", "number"), ToolArgumentSpec("y", "number"), ToolArgumentSpec("amount", "number"),
+        ToolArgumentSpec("horizontal", "boolean"), ToolArgumentSpec("window_id", "text"),
+    ),
+    "computer_type_text": (ToolArgumentSpec("text", "text"), ToolArgumentSpec("window_id", "text")),
+    "computer_key_press": (
+        ToolArgumentSpec("keys", "text"), ToolArgumentSpec("repeat", "number"), ToolArgumentSpec("window_id", "text"),
+    ),
     "browser_run_headless": (
         ToolArgumentSpec("target", "text"), ToolArgumentSpec("viewportWidth", "number"),
         ToolArgumentSpec("viewportHeight", "number"), ToolArgumentSpec("virtualTimeBudgetMs", "number"),
@@ -39999,17 +40118,24 @@ class DesktopTools(_StoragePathBound):
         out.mkdir(parents=True, exist_ok=True)
         return out
 
-    def _write_png_result(self, chat_id: str, data: bytes) -> dict[str, Any]:
+    def _write_png_result(
+        self,
+        chat_id: str,
+        data: bytes,
+        *,
+        record_kind: str = "desktop_screenshot",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not data:
             raise RuntimeError("screenshot capture returned no bytes")
         captured_at = now_iso()
         safe_ts = re.sub(r"[^0-9A-Za-z_-]+", "", captured_at.replace(":", "").replace(".", ""))
-        filename = f"desktop_screenshot_{safe_ts}_{uuid_v4()[:8]}.png"
+        filename = f"{record_kind}_{safe_ts}_{uuid_v4()[:8]}.png"
         out = self._screenshots_dir(chat_id) / filename
         file_write_bytes(out, data)
         width, height = image_size_from_file(out)
         meta = {
-            "schema": data_schema('desktop_screenshot'),
+            "schema": data_schema(record_kind),
             "chat_id": chat_id,
             "captured_at": captured_at,
             "filename": filename,
@@ -40019,8 +40145,10 @@ class DesktopTools(_StoragePathBound):
             "width": int(width or 0),
             "height": int(height or 0),
         }
+        if extra:
+            meta.update(copy.deepcopy(extra))
         atomic_write_json(out.with_suffix(".json"), meta)
-        _best_effort_lifecycle_log(self.storage, "desktop_screenshot", {"chat_id": chat_id, "path": meta["path"]})
+        _best_effort_lifecycle_log(self.storage, record_kind, {"chat_id": chat_id, "path": meta["path"]})
         return meta
 
     async def screenshot(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -40083,6 +40211,1045 @@ class DesktopTools(_StoragePathBound):
             except Exception as exc:
                 errors.append(f"{command[0]}: {type(exc).__name__}: {exc}")
         raise RuntimeError("Desktop screenshot failed. " + " | ".join(errors[:5]))
+
+# =============================================================================
+# Computer Use: global circuit breaker, Win32 desktop backend and native tools
+# =============================================================================
+
+
+class ComputerUseInterrupted(RuntimeError):
+    """A Computer Use action stopped early; every button/key it held was released."""
+
+
+class ComputerUseCircuitBreaker:
+    """Process-wide kill switch for simulated desktop input.
+
+    ``trip`` is thread-safe and is called directly from the global hotkey thread,
+    so an in-flight action stops even while the UI/event loop is busy. Each action
+    records the generation when it starts and checks it between individual input
+    events. Pausing Chats/Agents is a separate, loop-owned step.
+    """
+
+    DEBOUNCE_SECONDS = 1.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._last_trip_monotonic = -1e18
+        self.trip_count = 0
+        self.last_trip_source = ""
+        self.last_trip_at = ""
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def trip(self, source: str = "hotkey") -> bool:
+        """Abort in-flight input; return True only for a new (non-duplicate) trip."""
+        now = time.monotonic()
+        with self._lock:
+            self._generation += 1
+            fresh = now - self._last_trip_monotonic >= self.DEBOUNCE_SECONDS
+            self._last_trip_monotonic = now
+            if fresh:
+                self.trip_count += 1
+                self.last_trip_source = str(source or "hotkey")
+                self.last_trip_at = now_iso()
+            return fresh
+
+    def check(self, start_generation: int) -> None:
+        if self.generation != int(start_generation):
+            raise ComputerUseInterrupted(
+                f"Computer Use circuit breaker ({CIRCUIT_BREAKER_HOTKEY_LABEL}) tripped: the action was aborted, "
+                "held buttons/keys were released, and running Chats/Agents were paused. Capture the screen again "
+                "after the user resumes."
+            )
+
+
+COMPUTER_USE_BREAKER = ComputerUseCircuitBreaker()
+# Serializes desktop input across every Chat and Agent so sequences never interleave.
+COMPUTER_USE_INPUT_LOCK = threading.Lock()
+
+
+class CircuitBreakerHotkeyMonitor:
+    """Detect the global Ctrl+P+End chord on Windows regardless of window focus.
+
+    A low-cost poll of GetAsyncKeyState observes the physical key state of the
+    interactive desktop, including while another application (the one being
+    driven by Computer Use) owns focus. The chord fires once per press; it re-arms
+    only after it is released. Keys may be pressed in any order.
+    """
+
+    VK_CONTROL = 0x11
+    VK_P = 0x50
+    VK_END = 0x23
+    POLL_SECONDS = 0.02
+
+    def __init__(
+        self,
+        on_trip: Callable[[], Any],
+        *,
+        key_down: Callable[[int], bool] | None = None,
+        poll_seconds: float | None = None,
+        error_callback: Callable[[BaseException], Any] | None = None,
+    ) -> None:
+        self._on_trip = on_trip
+        self._key_down = key_down
+        self._poll_seconds = max(0.005, float(poll_seconds if poll_seconds is not None else self.POLL_SECONDS))
+        self._error_callback = error_callback
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._armed = True
+        self.trigger_count = 0
+
+    @staticmethod
+    def supported() -> bool:
+        return os.name == "nt"
+
+    @staticmethod
+    def _windows_key_down() -> Callable[[int], bool]:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_async_key_state = user32.GetAsyncKeyState
+        get_async_key_state.argtypes = [ctypes.c_int]
+        get_async_key_state.restype = ctypes.c_short
+        return lambda vk: bool(int(get_async_key_state(int(vk))) & 0x8000)
+
+    def chord_down(self) -> bool:
+        key_down = self._key_down
+        if key_down is None:
+            return False
+        return bool(key_down(self.VK_CONTROL) and key_down(self.VK_P) and key_down(self.VK_END))
+
+    def poll_once(self) -> bool:
+        """Evaluate one sample; return True when this sample trips the breaker."""
+        if self.chord_down():
+            if not self._armed:
+                return False
+            self._armed = False
+            self.trigger_count += 1
+            self._on_trip()
+            return True
+        self._armed = True
+        return False
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return bool(thread and thread.is_alive())
+
+    def start(self) -> bool:
+        if self.running:
+            return True
+        if self._key_down is None:
+            if not self.supported():
+                return False
+            self._key_down = self._windows_key_down()
+        self._stop.clear()
+        self._armed = not self.chord_down()
+        thread = threading.Thread(target=self._run, name="velox-circuit-breaker-hotkey", daemon=True)
+        self._thread = thread
+        thread.start()
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._poll_seconds):
+            try:
+                self.poll_once()
+            except Exception as exc:  # keep the safety monitor alive
+                callback = self._error_callback
+                if callback is not None:
+                    try:
+                        callback(exc)
+                    except Exception:
+                        pass
+                self._stop.wait(0.25)
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(max(0.0, float(timeout)))
+
+
+def pause_all_running_work(chat_runtime: Any, agent_runtime: Any) -> dict[str, list[str]]:
+    """Request Pause for every running Chat, then every remaining running Agent.
+
+    Chats go first so a Chat-owned child Agent is paused (and later resumed)
+    together with its Chat. Already paused or pausing work is left unchanged.
+    """
+    paused_chats: list[str] = []
+    paused_agents: list[str] = []
+    errors: list[str] = []
+    running_chats = getattr(chat_runtime, "running", {}) if chat_runtime is not None else {}
+    for chat_id, task in list(running_chats.items()):
+        if task is None or task.done():
+            continue
+        try:
+            if chat_runtime.pause(str(chat_id)):
+                paused_chats.append(str(chat_id))
+        except Exception as exc:
+            errors.append(f"chat {chat_id}: {type(exc).__name__}: {exc}")
+    running_agents = getattr(agent_runtime, "running", {}) if agent_runtime is not None else {}
+    for agent_id, task in list(running_agents.items()):
+        if task is None or task.done():
+            continue
+        try:
+            if agent_runtime.pause(str(agent_id)):
+                paused_agents.append(str(agent_id))
+        except Exception as exc:
+            errors.append(f"agent {agent_id}: {type(exc).__name__}: {exc}")
+    return {"chats": paused_chats, "agents": paused_agents, "errors": errors}
+
+
+class _CUMouseInput(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_uint32),
+        ("dwFlags", ctypes.c_uint32), ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _CUKeybdInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_uint16), ("wScan", ctypes.c_uint16), ("dwFlags", ctypes.c_uint32),
+        ("time", ctypes.c_uint32), ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _CUHardwareInput(ctypes.Structure):
+    _fields_ = [("uMsg", ctypes.c_uint32), ("wParamL", ctypes.c_uint16), ("wParamH", ctypes.c_uint16)]
+
+
+class _CUInputUnion(ctypes.Union):
+    _fields_ = [("mi", _CUMouseInput), ("ki", _CUKeybdInput), ("hi", _CUHardwareInput)]
+
+
+class _CUInput(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint32), ("u", _CUInputUnion)]
+
+
+class _CUPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _CURect(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+COMPUTER_USE_MOUSE_BUTTONS = ("left", "right", "middle")
+COMPUTER_USE_MAX_TEXT_CHARS = 10_000
+COMPUTER_USE_MAX_KEY_REPEAT = 50
+COMPUTER_USE_MAX_SCROLL_NOTCHES = 50
+COMPUTER_USE_MAX_WINDOWS = 200
+# Marks events injected by Velox (visible to low-level hooks as dwExtraInfo).
+COMPUTER_USE_EXTRA_INFO = 0x56454C58
+_COMPUTER_USE_MODIFIER_VKS = frozenset({0x10, 0x11, 0x12, 0x5B})
+_COMPUTER_USE_EXTENDED_VKS = frozenset({
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x2D, 0x2E,
+    0x5B, 0x5C, 0x5D, 0x6F, 0x90, 0xA3, 0xA5,
+})
+_COMPUTER_USE_KEY_VKS: dict[str, int] = {
+    "ctrl": 0x11, "control": 0x11, "shift": 0x10, "alt": 0x12, "option": 0x12,
+    "win": 0x5B, "windows": 0x5B, "meta": 0x5B, "super": 0x5B, "cmd": 0x5B, "command": 0x5B,
+    "enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B, "space": 0x20,
+    "backspace": 0x08, "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "ins": 0x2D,
+    "home": 0x24, "end": 0x23, "pageup": 0x21, "pgup": 0x21, "pagedown": 0x22, "pgdn": 0x22,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+    "arrowleft": 0x25, "arrowup": 0x26, "arrowright": 0x27, "arrowdown": 0x28,
+    "capslock": 0x14, "printscreen": 0x2C, "prtsc": 0x2C, "menu": 0x5D, "apps": 0x5D,
+    "contextmenu": 0x5D, "pause": 0x13,
+    "semicolon": 0xBA, ";": 0xBA, "equals": 0xBB, "equal": 0xBB, "=": 0xBB, "comma": 0xBC, ",": 0xBC,
+    "minus": 0xBD, "-": 0xBD, "period": 0xBE, ".": 0xBE, "slash": 0xBF, "/": 0xBF,
+    "backquote": 0xC0, "grave": 0xC0, "`": 0xC0, "bracketleft": 0xDB, "[": 0xDB,
+    "backslash": 0xDC, "\\": 0xDC, "bracketright": 0xDD, "]": 0xDD, "quote": 0xDE, "'": 0xDE,
+    **{f"f{index}": 0x6F + index for index in range(1, 25)},
+    **{f"numpad{index}": 0x60 + index for index in range(10)},
+    **{chr(code).lower(): code for code in range(ord("A"), ord("Z") + 1)},
+    **{str(index): 0x30 + index for index in range(10)},
+}
+
+
+def parse_computer_key_combo(keys: Any) -> list[int]:
+    """Parse "ctrl+shift+s", "enter", "alt+f4" or DOM codes such as "KeyS" into VKs."""
+    text = str(keys or "").strip()
+    if not text:
+        raise ValueError("keys must name at least one key, for example 'enter' or 'ctrl+s'")
+    tokens = [token.strip() for token in text.split("+")]
+    if any(not token for token in tokens):
+        raise ValueError(f"Malformed key combination {text!r}; join keys with '+', for example 'ctrl+shift+t'")
+    if len(tokens) > 5:
+        raise ValueError("A key combination may contain at most 5 keys")
+    vks: list[int] = []
+    for token in tokens:
+        name = token.lower().replace(" ", "").replace("_", "")
+        if re.fullmatch(r"key[a-z]", name):
+            name = name[-1]
+        elif re.fullmatch(r"digit[0-9]", name):
+            name = name[-1]
+        elif name.endswith(("left", "right")) and name[:-4 if name.endswith("left") else -5] in {
+            "control", "shift", "alt", "meta", "os",
+        }:
+            name = name[:-4 if name.endswith("left") else -5]
+            name = "win" if name in {"meta", "os"} else name
+        vk = _COMPUTER_USE_KEY_VKS.get(name)
+        if vk is None:
+            raise ValueError(f"Unknown key {token!r} in {text!r}")
+        if vk in vks:
+            raise ValueError(f"Key {token!r} appears twice in {text!r}")
+        vks.append(vk)
+    return vks
+
+
+class _Win32Desktop:
+    """Minimal user32/dwmapi wrapper. Every coordinate is a physical screen pixel."""
+
+    INPUT_MOUSE = 0
+    INPUT_KEYBOARD = 1
+    MOUSEEVENTF_MOVE = 0x0001
+    MOUSEEVENTF_ABSOLUTE = 0x8000
+    MOUSEEVENTF_VIRTUALDESK = 0x4000
+    MOUSEEVENTF_WHEEL = 0x0800
+    MOUSEEVENTF_HWHEEL = 0x1000
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_UNICODE = 0x0004
+    BUTTON_FLAGS = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010), "middle": (0x0020, 0x0040)}
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Computer Use desktop control currently supports Windows only")
+        from ctypes import wintypes
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        try:
+            self.dwmapi = ctypes.WinDLL("dwmapi")
+        except OSError:
+            self.dwmapi = None
+        u, k = self.user32, self.kernel32
+        hwnd = wintypes.HWND
+        self.enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, hwnd, wintypes.LPARAM)
+        u.EnumWindows.argtypes = [self.enum_proc_type, wintypes.LPARAM]
+        u.EnumWindows.restype = wintypes.BOOL
+        for name in ("IsWindow", "IsWindowVisible", "IsIconic", "IsZoomed", "SetForegroundWindow", "BringWindowToTop"):
+            getattr(u, name).argtypes = [hwnd]
+            getattr(u, name).restype = wintypes.BOOL
+        u.GetWindowTextLengthW.argtypes = [hwnd]
+        u.GetWindowTextLengthW.restype = ctypes.c_int
+        u.GetWindowTextW.argtypes = [hwnd, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowTextW.restype = ctypes.c_int
+        u.GetClassNameW.argtypes = [hwnd, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.restype = ctypes.c_int
+        u.GetWindowThreadProcessId.argtypes = [hwnd, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.GetWindowLongPtrW.argtypes = [hwnd, ctypes.c_int]
+        u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        u.GetWindow.argtypes = [hwnd, wintypes.UINT]
+        u.GetWindow.restype = hwnd
+        u.GetAncestor.argtypes = [hwnd, wintypes.UINT]
+        u.GetAncestor.restype = hwnd
+        u.GetForegroundWindow.argtypes = []
+        u.GetForegroundWindow.restype = hwnd
+        u.ShowWindow.argtypes = [hwnd, ctypes.c_int]
+        u.ShowWindow.restype = wintypes.BOOL
+        u.WindowFromPoint.argtypes = [_CUPoint]
+        u.WindowFromPoint.restype = hwnd
+        u.GetWindowRect.argtypes = [hwnd, ctypes.POINTER(_CURect)]
+        u.GetWindowRect.restype = wintypes.BOOL
+        u.GetCursorPos.argtypes = [ctypes.POINTER(_CUPoint)]
+        u.GetCursorPos.restype = wintypes.BOOL
+        u.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        u.SetCursorPos.restype = wintypes.BOOL
+        u.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_CUInput), ctypes.c_int]
+        u.SendInput.restype = wintypes.UINT
+        u.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u.GetSystemMetrics.restype = ctypes.c_int
+        u.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        u.MapVirtualKeyW.restype = wintypes.UINT
+        u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        u.AttachThreadInput.restype = wintypes.BOOL
+        self._set_dpi_context = getattr(u, "SetThreadDpiAwarenessContext", None)
+        if self._set_dpi_context is not None:
+            self._set_dpi_context.argtypes = [ctypes.c_void_p]
+            self._set_dpi_context.restype = ctypes.c_void_p
+        k.GetCurrentThreadId.argtypes = []
+        k.GetCurrentThreadId.restype = wintypes.DWORD
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        if self.dwmapi is not None:
+            self.dwmapi.DwmGetWindowAttribute.argtypes = [hwnd, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+            self.dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+    # -- coordinate space -------------------------------------------------
+    @contextlib.contextmanager
+    def dpi_aware(self):
+        """Use physical pixels for this thread, matching PIL's screen capture."""
+        setter = self._set_dpi_context
+        previous = None
+        if setter is not None:
+            previous = setter(ctypes.c_void_p(-4)) or setter(ctypes.c_void_p(-3))
+        try:
+            yield self
+        finally:
+            if setter is not None and previous:
+                setter(ctypes.c_void_p(previous))
+
+    def virtual_screen(self) -> dict[str, int]:
+        u = self.user32
+        return {"x": int(u.GetSystemMetrics(76)), "y": int(u.GetSystemMetrics(77)),
+                "width": int(u.GetSystemMetrics(78)), "height": int(u.GetSystemMetrics(79))}
+
+    def cursor(self) -> dict[str, int]:
+        point = _CUPoint()
+        if not self.user32.GetCursorPos(ctypes.byref(point)):
+            raise OSError(f"GetCursorPos failed: WinError {ctypes.get_last_error()}")
+        return {"x": int(point.x), "y": int(point.y)}
+
+    # -- windows ----------------------------------------------------------
+    @staticmethod
+    def _handle(value: Any) -> int:
+        return int(value or 0)
+
+    def is_window(self, hwnd: int) -> bool:
+        return bool(hwnd) and bool(self.user32.IsWindow(hwnd))
+
+    def foreground(self) -> int:
+        return self._handle(self.user32.GetForegroundWindow())
+
+    def root(self, hwnd: int) -> int:
+        return self._handle(self.user32.GetAncestor(hwnd, 2)) if hwnd else 0
+
+    def root_owner(self, hwnd: int) -> int:
+        return self._handle(self.user32.GetAncestor(hwnd, 3)) if hwnd else 0
+
+    def bounds(self, hwnd: int) -> dict[str, int]:
+        rect = _CURect()
+        ok = False
+        if self.dwmapi is not None:
+            ok = self.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) == 0
+        if not ok and not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            raise OSError(f"GetWindowRect failed: WinError {ctypes.get_last_error()}")
+        return {"x": int(rect.left), "y": int(rect.top),
+                "width": max(0, int(rect.right - rect.left)), "height": max(0, int(rect.bottom - rect.top))}
+
+    def _cloaked(self, hwnd: int) -> bool:
+        if self.dwmapi is None:
+            return False
+        value = ctypes.c_uint32(0)
+        result = self.dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(value), ctypes.sizeof(value))
+        return result == 0 and bool(value.value)
+
+    def _process_name(self, pid: int) -> str:
+        handle = self.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ""
+        try:
+            size = ctypes.c_uint32(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if self.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return Path(buffer.value).name
+            return ""
+        finally:
+            self.kernel32.CloseHandle(handle)
+
+    def window_info(self, hwnd: int, *, foreground: int | None = None) -> dict[str, Any]:
+        u = self.user32
+        length = max(0, int(u.GetWindowTextLengthW(hwnd)))
+        title_buffer = ctypes.create_unicode_buffer(min(length, 4096) + 1)
+        u.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+        class_buffer = ctypes.create_unicode_buffer(256)
+        u.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+        pid = ctypes.c_uint32(0)
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        owner = self._handle(u.GetWindow(hwnd, 4))
+        fg = self.foreground() if foreground is None else int(foreground)
+        info: dict[str, Any] = {
+            "window_id": str(int(hwnd)),
+            "title": title_buffer.value,
+            "class_name": class_buffer.value,
+            "process_id": int(pid.value),
+            "process_name": self._process_name(int(pid.value)),
+            **self.bounds(hwnd),
+            "minimized": bool(u.IsIconic(hwnd)),
+            "maximized": bool(u.IsZoomed(hwnd)),
+            "visible": bool(u.IsWindowVisible(hwnd)),
+            "foreground": bool(fg) and (fg == int(hwnd) or self.root_owner(fg) == int(hwnd)),
+            "is_velox": int(pid.value) == os.getpid(),
+        }
+        if owner:
+            info["owner_window_id"] = str(owner)
+        return info
+
+    def list_windows(self, limit: int = COMPUTER_USE_MAX_WINDOWS) -> list[dict[str, Any]]:
+        handles: list[int] = []
+
+        def collect(hwnd: Any, _lparam: Any) -> bool:
+            handle = self._handle(hwnd)
+            try:
+                if (
+                    self.user32.IsWindowVisible(handle)
+                    and self.user32.GetWindowTextLengthW(handle) > 0
+                    and not self._cloaked(handle)
+                ):
+                    ex_style = int(self.user32.GetWindowLongPtrW(handle, -20))
+                    if not (ex_style & 0x00000080) or (ex_style & 0x00040000):
+                        handles.append(handle)
+            except Exception:
+                pass
+            return len(handles) < int(limit)
+
+        callback = self.enum_proc_type(collect)
+        self.user32.EnumWindows(callback, 0)
+        fg = self.foreground()
+        rows: list[dict[str, Any]] = []
+        for handle in handles:
+            try:
+                info = self.window_info(handle, foreground=fg)
+            except Exception:
+                continue
+            if info["minimized"] or (info["width"] > 0 and info["height"] > 0):
+                rows.append(info)
+        return rows
+
+    def window_at(self, x: int, y: int) -> int:
+        return self.root(self._handle(self.user32.WindowFromPoint(_CUPoint(int(x), int(y)))))
+
+    def _is_foreground(self, hwnd: int) -> bool:
+        fg = self.foreground()
+        return bool(fg) and (fg == hwnd or self.root_owner(fg) == hwnd)
+
+    def _wait_foreground(self, hwnd: int, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while True:
+            if self._is_foreground(hwnd):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.03)
+
+    def focus(self, hwnd: int) -> bool:
+        u = self.user32
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, 9)  # SW_RESTORE
+        if self._wait_foreground(hwnd, 0.0):
+            return True
+        u.SetForegroundWindow(hwnd)
+        if self._wait_foreground(hwnd, 0.3):
+            return True
+        # Foreground-lock rules let the process that produced the last input
+        # activate windows; a zero-distance relative mouse move is harmless input.
+        self.send([self._mouse_input(self.MOUSEEVENTF_MOVE)])
+        u.SetForegroundWindow(hwnd)
+        u.BringWindowToTop(hwnd)
+        if self._wait_foreground(hwnd, 0.4):
+            return True
+        fg = self.foreground()
+        fg_thread = int(u.GetWindowThreadProcessId(fg, None)) if fg else 0
+        current_thread = int(self.kernel32.GetCurrentThreadId())
+        attached = bool(fg_thread and fg_thread != current_thread and u.AttachThreadInput(current_thread, fg_thread, True))
+        try:
+            u.BringWindowToTop(hwnd)
+            u.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                u.AttachThreadInput(current_thread, fg_thread, False)
+        return self._wait_foreground(hwnd, 0.6)
+
+    # -- input --------------------------------------------------------------
+    def _mouse_input(self, flags: int, *, dx: int = 0, dy: int = 0, data: int = 0) -> _CUInput:
+        item = _CUInput()
+        item.type = self.INPUT_MOUSE
+        item.u.mi = _CUMouseInput(int(dx), int(dy), int(data) & 0xFFFFFFFF, int(flags), 0, COMPUTER_USE_EXTRA_INFO)
+        return item
+
+    def _key_input(self, vk: int, scan: int, flags: int) -> _CUInput:
+        item = _CUInput()
+        item.type = self.INPUT_KEYBOARD
+        item.u.ki = _CUKeybdInput(int(vk), int(scan), int(flags), 0, COMPUTER_USE_EXTRA_INFO)
+        return item
+
+    def send(self, inputs: list[_CUInput]) -> None:
+        if not inputs:
+            return
+        array = (_CUInput * len(inputs))(*inputs)
+        sent = int(self.user32.SendInput(len(inputs), array, ctypes.sizeof(_CUInput)))
+        if sent != len(inputs):
+            raise OSError(
+                f"SendInput delivered {sent} of {len(inputs)} input events (WinError {ctypes.get_last_error()}). "
+                "Input can be blocked by a locked session, a secure desktop (UAC/Ctrl+Alt+Del) or a "
+                "higher-integrity target window."
+            )
+
+    def move_cursor(self, x: int, y: int) -> None:
+        screen = self.virtual_screen()
+        span_x = max(1, screen["width"] - 1)
+        span_y = max(1, screen["height"] - 1)
+        nx = int(round((int(x) - screen["x"]) * 65535 / span_x))
+        ny = int(round((int(y) - screen["y"]) * 65535 / span_y))
+        self.send([self._mouse_input(
+            self.MOUSEEVENTF_MOVE | self.MOUSEEVENTF_ABSOLUTE | self.MOUSEEVENTF_VIRTUALDESK,
+            dx=max(0, min(65535, nx)), dy=max(0, min(65535, ny)),
+        )])
+        current = self.cursor()
+        if current["x"] != int(x) or current["y"] != int(y):
+            # Normalized absolute coordinates can round by a pixel; land exactly.
+            self.user32.SetCursorPos(int(x), int(y))
+
+    def mouse_button(self, button: str, down: bool) -> None:
+        flags = self.BUTTON_FLAGS[str(button)][0 if down else 1]
+        self.send([self._mouse_input(flags)])
+
+    def wheel(self, notches: int, *, horizontal: bool = False) -> None:
+        flag = self.MOUSEEVENTF_HWHEEL if horizontal else self.MOUSEEVENTF_WHEEL
+        self.send([self._mouse_input(flag, data=int(notches) * 120)])
+
+    def key(self, vk: int, down: bool) -> None:
+        flags = 0 if down else self.KEYEVENTF_KEYUP
+        if int(vk) in _COMPUTER_USE_EXTENDED_VKS:
+            flags |= self.KEYEVENTF_EXTENDEDKEY
+        scan = int(self.user32.MapVirtualKeyW(int(vk), 0)) & 0xFF
+        self.send([self._key_input(int(vk), scan, flags)])
+
+    def unicode_unit(self, unit: int, down: bool) -> None:
+        flags = self.KEYEVENTF_UNICODE | (0 if down else self.KEYEVENTF_KEYUP)
+        self.send([self._key_input(0, int(unit) & 0xFFFF, flags)])
+
+    # -- capture ------------------------------------------------------------
+    def capture_png(self, bbox: tuple[int, int, int, int] | None) -> bytes:
+        from PIL import ImageGrab  # type: ignore
+        image = ImageGrab.grab(bbox=bbox, all_screens=True)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+class _ComputerInputGuard:
+    """Check the circuit breaker and tool cancellation between input events."""
+
+    def __init__(self, breaker: ComputerUseCircuitBreaker, ctx: ToolContext) -> None:
+        self.breaker = breaker
+        self.ctx = ctx
+        self.start_generation = breaker.generation
+
+    def check(self) -> None:
+        self.breaker.check(self.start_generation)
+        self.ctx.raise_if_cancelled("Computer Use action cancelled")
+
+    def sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            self.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.01, remaining))
+
+
+class ComputerUseTools(_StoragePathBound):
+    """Native Computer Use tools. Advertised only when a Task holds Computer Use."""
+
+    LOCK_WAIT_SECONDS = 60.0
+
+    def __init__(
+        self,
+        storage: Storage,
+        desktop_tools: DesktopTools,
+        *,
+        backend_factory: Callable[[], Any] | None = None,
+        breaker: ComputerUseCircuitBreaker | None = None,
+        input_lock: Any = None,
+    ) -> None:
+        super().__init__(storage)
+        self.desktop_tools = desktop_tools
+        self._backend_factory = backend_factory or _Win32Desktop
+        self._backend: Any = None
+        self._backend_lock = threading.Lock()
+        self.breaker = breaker or COMPUTER_USE_BREAKER
+        self.input_lock = input_lock or COMPUTER_USE_INPUT_LOCK
+        # Bound by ToolRegistry: returns a non-empty reason when the owning
+        # Chat/Agent has a pending or active Pause, so no input starts then.
+        self.hold_check: Callable[[ToolContext], str] | None = None
+
+    def backend(self) -> Any:
+        with self._backend_lock:
+            if self._backend is None:
+                self._backend = self._backend_factory()
+            return self._backend
+
+    @staticmethod
+    def _require_chat(ctx: ToolContext, tool_name: str) -> str:
+        chat_id = str(ctx.chat_id or "").strip()
+        if not chat_id:
+            raise ValueError(f"{tool_name} requires an active chat")
+        return chat_id
+
+    @staticmethod
+    def _window_handle(value: Any, *, required: bool = False) -> int:
+        text = str(value or "").strip()
+        if not text:
+            if required:
+                raise ValueError("window_id is required; use computer_list_windows to find it")
+            return 0
+        if not text.isdigit() or int(text) <= 0:
+            raise ValueError(f"Invalid window_id {text!r}; use a window_id returned by computer_list_windows")
+        return int(text)
+
+    @staticmethod
+    def _coordinate(args: dict[str, Any], name: str) -> int:
+        value = (args or {}).get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be a finite number of pixels")
+        return int(round(float(value)))
+
+    def _resolve_point(self, backend: Any, x: int, y: int, window_id: int) -> tuple[int, int, dict[str, Any] | None]:
+        """Map window-relative or screen coordinates to a validated screen point."""
+        if window_id:
+            if not backend.is_window(window_id):
+                raise ValueError(f"window_id {window_id} no longer exists; call computer_list_windows again")
+            info = backend.window_info(window_id)
+            if info["minimized"]:
+                raise ValueError(f"Window {window_id} is minimized; call computer_focus_window first")
+            if not (0 <= x < int(info["width"]) and 0 <= y < int(info["height"])):
+                raise ValueError(
+                    f"({x}, {y}) is outside window {window_id} ({info['width']}x{info['height']}); "
+                    "window coordinates are pixels of its computer_screenshot"
+                )
+            screen_x, screen_y = int(info["x"]) + x, int(info["y"]) + y
+            hit = backend.window_at(screen_x, screen_y)
+            if hit and hit != window_id and backend.root_owner(hit) != window_id:
+                covering = backend.window_info(hit)
+                raise ValueError(
+                    f"Point ({x}, {y}) of window {window_id} is covered by window {hit} "
+                    f"({covering.get('title')!r}); focus the target window or use the covering window_id"
+                )
+            return screen_x, screen_y, info
+        screen = backend.virtual_screen()
+        if not (screen["x"] <= x < screen["x"] + screen["width"] and screen["y"] <= y < screen["y"] + screen["height"]):
+            raise ValueError(
+                f"Screen point ({x}, {y}) is outside the virtual desktop "
+                f"x={screen['x']}..{screen['x'] + screen['width'] - 1}, y={screen['y']}..{screen['y'] + screen['height'] - 1}"
+            )
+        return x, y, None
+
+    def _describe(self, backend: Any, hwnd: int) -> dict[str, Any] | None:
+        if not hwnd:
+            return None
+        try:
+            return backend.window_info(hwnd)
+        except Exception:
+            return None
+
+    def _run_input(self, ctx: ToolContext, action: str, operation: Callable[[Any, _ComputerInputGuard], dict[str, Any]]) -> dict[str, Any]:
+        chat_id = self._require_chat(ctx, f"computer_{action}")
+        hold = self.hold_check(ctx) if self.hold_check is not None else ""
+        if hold:
+            raise ComputerUseInterrupted(hold)
+        guard = _ComputerInputGuard(self.breaker, ctx)
+        deadline = time.monotonic() + self.LOCK_WAIT_SECONDS
+        while not self.input_lock.acquire(timeout=0.05):
+            guard.check()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Another Computer Use action is still running; retry after it finishes")
+        try:
+            guard.check()
+            backend = self.backend()
+            with backend.dpi_aware():
+                result = operation(backend, guard)
+                foreground = backend.foreground()
+                result.setdefault("foreground_window", self._describe(backend, foreground))
+                result.setdefault("cursor", backend.cursor())
+        finally:
+            self.input_lock.release()
+        result = {"ok": True, "action": action, **result}
+        _best_effort_lifecycle_log(self.storage, "computer_use.action", {
+            "chat_id": chat_id, "agent_id": str(ctx.agent_id or ""), "action": action,
+        })
+        return result
+
+    # -- observation tools ------------------------------------------------
+    async def list_windows(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        del args
+        self._require_chat(ctx, "computer_list_windows")
+
+        def run() -> dict[str, Any]:
+            backend = self.backend()
+            with backend.dpi_aware():
+                windows = backend.list_windows(COMPUTER_USE_MAX_WINDOWS)
+                return {
+                    "schema": data_schema("computer_window_list"),
+                    "windows": windows,
+                    "count": len(windows),
+                    "foreground_window_id": str(backend.foreground() or ""),
+                    "virtual_screen": backend.virtual_screen(),
+                    "cursor": backend.cursor(),
+                    "note": "Ordered front to back. Coordinates are physical screen pixels. "
+                            "is_velox marks this application's own windows.",
+                }
+
+        return await asyncio.to_thread(run)
+
+    async def screenshot(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        chat_id = self._require_chat(ctx, "computer_screenshot")
+        window_id = self._window_handle((args or {}).get("window_id"))
+
+        def capture() -> tuple[bytes, dict[str, Any]]:
+            backend = self.backend()
+            with backend.dpi_aware():
+                if window_id:
+                    if not backend.is_window(window_id):
+                        raise ValueError(f"window_id {window_id} no longer exists; call computer_list_windows again")
+                    info = backend.window_info(window_id)
+                    if info["minimized"] or info["width"] <= 0 or info["height"] <= 0:
+                        raise ValueError(f"Window {window_id} is minimized or empty; call computer_focus_window first")
+                    origin = {"x": int(info["x"]), "y": int(info["y"])}
+                    bbox = (origin["x"], origin["y"], origin["x"] + int(info["width"]), origin["y"] + int(info["height"]))
+                    extra: dict[str, Any] = {
+                        "coordinate_space": "window",
+                        "window": info,
+                        "window_is_foreground": bool(info["foreground"]),
+                    }
+                else:
+                    screen = backend.virtual_screen()
+                    origin = {"x": screen["x"], "y": screen["y"]}
+                    bbox = None
+                    extra = {"coordinate_space": "screen", "virtual_screen": screen}
+                data = backend.capture_png(bbox)
+            extra["screen_origin"] = origin
+            extra["coordinate_note"] = (
+                f"Image pixel (px, py) is screen point ({origin['x']} + px, {origin['y']} + py). "
+                + ("Pass this window_id with image pixel coordinates to the mouse tools. Pixels are read from the "
+                   "screen, so any window overlapping this one appears in the capture; focus it first if needed."
+                   if window_id else "Pass screen coordinates without window_id to the mouse tools.")
+            )
+            return data, extra
+
+        data, extra = await asyncio.to_thread(capture)
+        meta = await asyncio.to_thread(
+            self.desktop_tools._write_png_result, chat_id, data, record_kind="computer_screenshot", extra=extra,
+        )
+        meta["absolute_path"] = (self.paths.chat_dir(chat_id) / meta["path"]).as_posix()
+        return meta
+
+    # -- input tools ----------------------------------------------------------
+    async def focus_window(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        window_id = self._window_handle((args or {}).get("window_id"), required=True)
+
+        def operation(backend: Any, guard: _ComputerInputGuard) -> dict[str, Any]:
+            if not backend.is_window(window_id):
+                raise ValueError(f"window_id {window_id} no longer exists; call computer_list_windows again")
+            focused = bool(backend.focus(window_id))
+            guard.check()
+            info = backend.window_info(window_id)
+            if not focused:
+                raise RuntimeError(
+                    f"Windows refused to bring window {window_id} ({info.get('title')!r}) to the foreground"
+                )
+            return {"window": info}
+
+        return await asyncio.to_thread(self._run_input, ctx, "focus_window", operation)
+
+    async def mouse_move(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        x, y = self._coordinate(args, "x"), self._coordinate(args, "y")
+        window_id = self._window_handle((args or {}).get("window_id"))
+
+        def operation(backend: Any, guard: _ComputerInputGuard) -> dict[str, Any]:
+            screen_x, screen_y, window = self._resolve_point(backend, x, y, window_id)
+            guard.check()
+            backend.move_cursor(screen_x, screen_y)
+            return {"screen_x": screen_x, "screen_y": screen_y, "window": window,
+                    "window_at_point": self._describe(backend, backend.window_at(screen_x, screen_y))}
+
+        return await asyncio.to_thread(self._run_input, ctx, "mouse_move", operation)
+
+    async def mouse_click(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        x, y = self._coordinate(args, "x"), self._coordinate(args, "y")
+        window_id = self._window_handle((args or {}).get("window_id"))
+        button = str((args or {}).get("button") or "left").strip().lower()
+        if button not in COMPUTER_USE_MOUSE_BUTTONS:
+            raise ValueError("button must be left, right or middle")
+        raw_clicks = (args or {}).get("clicks", 1)
+        if isinstance(raw_clicks, bool) or not isinstance(raw_clicks, (int, float)) or int(raw_clicks) != raw_clicks or not 1 <= int(raw_clicks) <= 3:
+            raise ValueError("clicks must be 1, 2 or 3")
+        clicks = int(raw_clicks)
+
+        def operation(backend: Any, guard: _ComputerInputGuard) -> dict[str, Any]:
+            screen_x, screen_y, window = self._resolve_point(backend, x, y, window_id)
+            target = self._describe(backend, backend.window_at(screen_x, screen_y))
+            guard.check()
+            backend.move_cursor(screen_x, screen_y)
+            guard.sleep(0.04)
+            held = False
+            try:
+                for index in range(clicks):
+                    guard.check()
+                    backend.mouse_button(button, True)
+                    held = True
+                    guard.sleep(0.03)
+                    backend.mouse_button(button, False)
+                    held = False
+                    if index + 1 < clicks:
+                        guard.sleep(0.06)
+            finally:
+                if held:
+                    backend.mouse_button(button, False)
+            guard.sleep(0.05)
+            return {"screen_x": screen_x, "screen_y": screen_y, "button": button, "clicks": clicks,
+                    "window": window, "window_at_point": target}
+
+        return await asyncio.to_thread(self._run_input, ctx, "mouse_click", operation)
+
+    async def mouse_drag(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        start_x, start_y = self._coordinate(args, "start_x"), self._coordinate(args, "start_y")
+        end_x, end_y = self._coordinate(args, "end_x"), self._coordinate(args, "end_y")
+        window_id = self._window_handle((args or {}).get("window_id"))
+        button = str((args or {}).get("button") or "left").strip().lower()
+        if button not in COMPUTER_USE_MOUSE_BUTTONS:
+            raise ValueError("button must be left, right or middle")
+
+        def operation(backend: Any, guard: _ComputerInputGuard) -> dict[str, Any]:
+            sx, sy, window = self._resolve_point(backend, start_x, start_y, window_id)
+            # The destination may legitimately be another window (drag and drop).
+            if window_id:
+                ex, ey = int(window["x"]) + end_x, int(window["y"]) + end_y  # type: ignore[index]
+                self._resolve_point(backend, ex, ey, 0)
+            else:
+                ex, ey, _ = self._resolve_point(backend, end_x, end_y, 0)
+            distance = math.hypot(ex - sx, ey - sy)
+            steps = int(max(8, min(60, distance / 20.0)))
+            guard.check()
+            backend.move_cursor(sx, sy)
+            guard.sleep(0.05)
+            held = False
+            try:
+                backend.mouse_button(button, True)
+                held = True
+                guard.sleep(0.08)
+                for step in range(1, steps + 1):
+                    guard.check()
+                    backend.move_cursor(int(round(sx + (ex - sx) * step / steps)), int(round(sy + (ey - sy) * step / steps)))
+                    guard.sleep(0.015)
+                guard.sleep(0.08)
+                backend.mouse_button(button, False)
+                held = False
+            finally:
+                if held:
+                    backend.mouse_button(button, False)
+            guard.sleep(0.05)
+            return {"start": {"x": sx, "y": sy}, "end": {"x": ex, "y": ey}, "button": button,
+                    "steps": steps, "window": window,
+                    "window_at_end": self._describe(backend, backend.window_at(ex, ey))}
+
+        return await asyncio.to_thread(self._run_input, ctx, "mouse_drag", operation)
+
+    async def mouse_scroll(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        x, y = self._coordinate(args, "x"), self._coordinate(args, "y")
+        window_id = self._window_handle((args or {}).get("window_id"))
+        raw_amount = (args or {}).get("amount")
+        if (
+            isinstance(raw_amount, bool) or not isinstance(raw_amount, (int, float))
+            or int(raw_amount) != raw_amount or raw_amount == 0
+            or abs(int(raw_amount)) > COMPUTER_USE_MAX_SCROLL_NOTCHES
+        ):
+            raise ValueError(f"amount must be a non-zero integer from -{COMPUTER_USE_MAX_SCROLL_NOTCHES} to {COMPUTER_USE_MAX_SCROLL_NOTCHES}")
+        amount = int(raw_amount)
+        horizontal = (args or {}).get("horizontal") is True
+
+        def operation(backend: Any, guard: _ComputerInputGuard) -> dict[str, Any]:
+            screen_x, screen_y, window = self._resolve_point(backend, x, y, window_id)
+            guard.check()
+            backend.move_cursor(screen_x, screen_y)
+            guard.sleep(0.04)
+            direction = 1 if amount > 0 else -1
+            for _ in range(abs(amount)):
+                guard.check()
+                backend.wheel(direction, horizontal=horizontal)
+                guard.sleep(0.03)
+            return {"screen_x": screen_x, "screen_y": screen_y, "amount": amount, "horizontal": horizontal,
+                    "window": window, "window_at_point": self._describe(backend, backend.window_at(screen_x, screen_y))}
+
+        return await asyncio.to_thread(self._run_input, ctx, "mouse_scroll", operation)
+
+    def _ensure_keyboard_target(self, backend: Any, guard: _ComputerInputGuard, window_id: int) -> dict[str, Any] | None:
+        if not window_id:
+            return None
+        if not backend.is_window(window_id):
+            raise ValueError(f"window_id {window_id} no longer exists; call computer_list_windows again")
+        if not backend.focus(window_id):
+            raise RuntimeError(f"Could not focus window {window_id}; keyboard input was not sent")
+        guard.sleep(0.05)
+        return backend.window_info(window_id)
+
+    async def type_text(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        text = (args or {}).get("text")
+        if not isinstance(text, str) or not text:
+            raise ValueError("text must be a non-empty string")
+        if len(text) > COMPUTER_USE_MAX_TEXT_CHARS:
+            raise ValueError(f"text exceeds {COMPUTER_USE_MAX_TEXT_CHARS} characters; type it in smaller parts")
+        window_id = self._window_handle((args or {}).get("window_id"))
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        def operation(backend: Any, guard: _ComputerInputGuard) -> dict[str, Any]:
+            window = self._ensure_keyboard_target(backend, guard, window_id)
+            typed = 0
+            for char in normalized:
+                guard.check()
+                if char == "\n":
+                    backend.key(0x0D, True)
+                    backend.key(0x0D, False)
+                elif char == "\t":
+                    backend.key(0x09, True)
+                    backend.key(0x09, False)
+                else:
+                    encoded = char.encode("utf-16-le")
+                    units = [int.from_bytes(encoded[i:i + 2], "little") for i in range(0, len(encoded), 2)]
+                    for unit in units:
+                        backend.unicode_unit(unit, True)
+                    for unit in units:
+                        backend.unicode_unit(unit, False)
+                typed += 1
+                guard.sleep(0.004)
+            return {"characters_typed": typed, "window": window}
+
+        return await asyncio.to_thread(self._run_input, ctx, "type_text", operation)
+
+    async def key_press(self, ctx: ToolContext, args: dict[str, Any]) -> dict[str, Any]:
+        keys = str((args or {}).get("keys") or "")
+        vks = parse_computer_key_combo(keys)
+        raw_repeat = (args or {}).get("repeat", 1)
+        if (
+            isinstance(raw_repeat, bool) or not isinstance(raw_repeat, (int, float))
+            or int(raw_repeat) != raw_repeat or not 1 <= int(raw_repeat) <= COMPUTER_USE_MAX_KEY_REPEAT
+        ):
+            raise ValueError(f"repeat must be an integer from 1 to {COMPUTER_USE_MAX_KEY_REPEAT}")
+        repeat = int(raw_repeat)
+        window_id = self._window_handle((args or {}).get("window_id"))
+
+        def operation(backend: Any, guard: _ComputerInputGuard) -> dict[str, Any]:
+            window = self._ensure_keyboard_target(backend, guard, window_id)
+            held: list[int] = []
+            try:
+                for index in range(repeat):
+                    for vk in vks:
+                        guard.check()
+                        backend.key(vk, True)
+                        held.append(vk)
+                        guard.sleep(0.015)
+                    while held:
+                        backend.key(held.pop(), False)
+                    if index + 1 < repeat:
+                        guard.sleep(0.04)
+            finally:
+                while held:
+                    backend.key(held.pop(), False)
+            guard.sleep(0.03)
+            return {"keys": keys, "repeat": repeat, "window": window}
+
+        return await asyncio.to_thread(self._run_input, ctx, "key_press", operation)
+
 
 class _CDPWebSocket:
     """Minimal RFC 6455 client for Chrome DevTools Protocol JSON messages."""
@@ -45021,6 +46188,8 @@ class ToolRegistry:
         self.web_tools = WebTools(storage)
         self.doc_tools = DocumentTools(storage)
         self.desktop_tools = DesktopTools(storage)
+        self.computer_use_tools = ComputerUseTools(storage, self.desktop_tools)
+        self.computer_use_tools.hold_check = self._computer_use_hold_reason
         self.llm = LLMClient(storage)
         self.image_tools = ImageTools(storage, self.llm)
         self.browser_tools = BrowserTools(storage, self.llm, self.image_tools)
@@ -45140,6 +46309,7 @@ class ToolRegistry:
         self.register("doc_read", "Read one supported local document as complete Markdown within the configured limit", self._schema({"path": path_schema}, ["path"]), self.doc_tools.read_markdown)
         self.register("doc_pdf_images", "Render one PDF to page images using configured DPI and page limits", self._schema({"path": path_schema}, ["path"]), self.doc_tools.read_pdf_to_images)
         self.register("desktop_screenshot", "Capture the primary desktop display", self._schema({}), self.desktop_tools.screenshot)
+        self._register_computer_use_tools()
         self.register(
             "browser_run_headless",
             "Run one isolated Chromium-family headless browser session at 1280x720 through 3820x2160; use 1920x1080 by default, and return structured DOM, screenshots, optional application snapshot-data sidecars, console, exceptions, logs, network failures, markers, and one useful delegated textual visual review per screenshot",
@@ -45464,6 +46634,109 @@ class ToolRegistry:
         _extend_agent_start_schema(self)
 
 
+    def _register_computer_use_tools(self) -> None:
+        """Register the narrow Computer Use surface (advertised only when enabled)."""
+        tools = self.computer_use_tools
+        window_id_schema = {
+            "type": "string",
+            "description": "Optional window_id from computer_list_windows. When set, x/y are pixels of that window's computer_screenshot; when empty, x/y are physical screen pixels.",
+        }
+        pixel_schema = {"type": "integer", "description": "Pixel coordinate."}
+        button_schema = {"type": "string", "enum": list(COMPUTER_USE_MOUSE_BUTTONS), "description": "Mouse button; defaults to left."}
+        self.register(
+            "computer_list_windows",
+            "List visible top-level desktop windows front to back with window_id, title, process, bounds, minimized and foreground state, plus the virtual screen and cursor",
+            self._schema({}), tools.list_windows,
+        )
+        self.register(
+            "computer_focus_window",
+            "Restore if minimized and bring one window to the foreground so it receives keyboard input",
+            self._schema({"window_id": {"type": "string", "minLength": 1, "description": "window_id from computer_list_windows."}}, ["window_id"]),
+            tools.focus_window,
+        )
+        self.register(
+            "computer_screenshot",
+            "Capture the whole virtual desktop, or one window's on-screen rectangle when window_id is set, and return the PNG path with its coordinate mapping for the mouse tools",
+            self._schema({"window_id": {"type": "string", "description": "Optional window_id; empty captures every monitor."}}),
+            tools.screenshot,
+        )
+        self.register(
+            "computer_mouse_move",
+            "Move the mouse pointer to one point (hover) without clicking",
+            self._schema({"x": pixel_schema, "y": pixel_schema, "window_id": window_id_schema}, ["x", "y"]),
+            tools.mouse_move,
+        )
+        self.register(
+            "computer_mouse_click",
+            "Move to one point and click; clicks=2 double-clicks. With window_id the point must be visible in that window",
+            self._schema({
+                "x": pixel_schema, "y": pixel_schema, "button": button_schema,
+                "clicks": {"type": "integer", "minimum": 1, "maximum": 3, "description": "1, 2 (double-click) or 3; defaults to 1."},
+                "window_id": window_id_schema,
+            }, ["x", "y"]),
+            tools.mouse_click,
+        )
+        self.register(
+            "computer_mouse_drag",
+            "Press a mouse button at the start point, move smoothly to the end point and release it",
+            self._schema({
+                "start_x": pixel_schema, "start_y": pixel_schema, "end_x": pixel_schema, "end_y": pixel_schema,
+                "button": button_schema, "window_id": window_id_schema,
+            }, ["start_x", "start_y", "end_x", "end_y"]),
+            tools.mouse_drag,
+        )
+        self.register(
+            "computer_mouse_scroll",
+            "Scroll the mouse wheel over one point; positive amount scrolls up (or right when horizontal), negative scrolls down (or left)",
+            self._schema({
+                "x": pixel_schema, "y": pixel_schema,
+                "amount": {"type": "integer", "minimum": -COMPUTER_USE_MAX_SCROLL_NOTCHES, "maximum": COMPUTER_USE_MAX_SCROLL_NOTCHES, "description": "Non-zero number of wheel notches."},
+                "horizontal": {"type": "boolean", "description": "Scroll horizontally; defaults to false."},
+                "window_id": window_id_schema,
+            }, ["x", "y", "amount"]),
+            tools.mouse_scroll,
+        )
+        self.register(
+            "computer_type_text",
+            "Type literal Unicode text into the focused window (newline presses Enter, tab presses Tab); window_id focuses that window first",
+            self._schema({
+                "text": {"type": "string", "minLength": 1, "maxLength": COMPUTER_USE_MAX_TEXT_CHARS},
+                "window_id": {"type": "string", "description": "Optional window_id to focus before typing."},
+            }, ["text"]),
+            tools.type_text,
+        )
+        self.register(
+            "computer_key_press",
+            "Press one key or chord such as enter, escape, ctrl+s, alt+tab, ctrl+shift+t or f5 in the focused window; window_id focuses that window first",
+            self._schema({
+                "keys": {"type": "string", "minLength": 1, "description": "Key names joined by '+': ctrl, shift, alt, win, enter, tab, escape, space, backspace, delete, home, end, pageup, pagedown, arrows, f1-f24, letters, digits and punctuation."},
+                "repeat": {"type": "integer", "minimum": 1, "maximum": COMPUTER_USE_MAX_KEY_REPEAT, "description": "Times to press it; defaults to 1."},
+                "window_id": {"type": "string", "description": "Optional window_id to focus before pressing."},
+            }, ["keys"]),
+            tools.key_press,
+        )
+
+    def _computer_use_hold_reason(self, ctx: ToolContext) -> str:
+        """Refuse new desktop input while the owning Task has a Pause pending/active."""
+        runtime = self.agent_runtime
+        if ctx.agent_id:
+            try:
+                agent = AgentStore(self.storage).load_agent(str(ctx.agent_id))
+            except Exception:
+                return "Computer Use is unavailable because the owning Agent record could not be read"
+            if bool(agent.get("pause_requested")) or str(agent.get("status") or "") == "paused":
+                return "The owning Agent is pausing; Computer Use input was not sent"
+            return ""
+        chat_runtime = getattr(runtime, "chat_runtime", None) if runtime is not None else None
+        chat_id = str(ctx.chat_id or "")
+        if chat_runtime is not None and chat_id:
+            try:
+                if chat_runtime.is_pause_requested(chat_id) or chat_runtime.is_paused(chat_id):
+                    return "This Chat is pausing; Computer Use input was not sent"
+            except Exception:
+                pass
+        return ""
+
     def register(self, name: str, description: str, parameters: dict[str, Any], handler: Callable[[ToolContext, dict[str, Any]], Any]) -> None:
         canonical_signature = TOOL_POSITIONAL_SIGNATURES.get(name)
         if canonical_signature is None:
@@ -45489,6 +46762,8 @@ class ToolRegistry:
         canonical = str(name or "")
         if canonical in EXPERT_MODE_TOOL_NAMES or canonical in set(globals().get("CHECKLIST_TOOL_NAMES", ())):
             return "checklists_enabled"
+        if canonical.startswith(COMPUTER_USE_TOOL_PREFIX):
+            return COMPUTER_USE_FEATURE_KEY
         if canonical.startswith(FILE_TOOL_PREFIXES):
             return "file_tools_enabled"
         if canonical.startswith("web_") or canonical.startswith("browser_"):
@@ -45514,6 +46789,10 @@ class ToolRegistry:
             return bool(features.get("agent_tools_enabled", default))
         if group_key == "chat_history_enabled":
             return bool(features.get("chat_history_enabled", default))
+        if group_key == COMPUTER_USE_FEATURE_KEY:
+            # There is no application-wide grant: only a Chat (or an Agent that
+            # inherited it from one) can enable desktop control.
+            return False
         return bool(default)
 
     def _chat_group_enabled(
@@ -45532,6 +46811,11 @@ class ToolRegistry:
             return global_default
         if group_key == "checklists_enabled":
             return bool(ChatStore(self.storage).load_chat_view(str(chat_id))["features"][group_key])
+        if group_key == COMPUTER_USE_FEATURE_KEY:
+            try:
+                return computer_use_enabled_in(ChatStore(self.storage).load_chat_view(str(chat_id))["features"])
+            except Exception:
+                return False
         return ChatStore(self.storage).get_chat_feature(APP_SCOPE_ID, str(chat_id), group_key, global_default)
 
     def _enabled_tool_definitions(
@@ -46966,6 +48250,12 @@ class ToolRegistry:
             return float(configured) + 30.0
         if name == "desktop_screenshot":
             return float(tool_setting_int(cfg, "desktop_screenshot_timeout_seconds")) + 30.0
+        if name == "computer_screenshot":
+            return float(tool_setting_int(cfg, "desktop_screenshot_timeout_seconds")) + 30.0
+        if name.startswith(COMPUTER_USE_TOOL_PREFIX):
+            # Bounded by input limits (10,000 typed characters, 50 repeats or
+            # notches) plus the cross-Task input lock wait.
+            return 180.0
         if name in {"image_analyze", "image_analyze_ui", "image_analyze_3D_scene"}:
             return None  # Current-context handoff or independently guarded LLM stream.
         fallback = tool_setting_int(cfg, "fallback_timeout_seconds")
@@ -46991,6 +48281,10 @@ class ToolRegistry:
                 if not _role_allows_tool(str(role.get("subtype") or AGENT_SUBTYPE_GENERAL), name):
                     raise PermissionError(f"Agent role {role.get('subtype')!r} cannot execute {name!r}")
                 feature_overrides = normalize_tool_feature_flags(agent.get("tool_features"))
+                if group_key == COMPUTER_USE_FEATURE_KEY:
+                    # Defense in depth against an edited agent.json: the stored
+                    # Agent grant is bounded by its source Chat and parent Agent.
+                    feature_overrides[COMPUTER_USE_FEATURE_KEY] = self._agent_computer_use_allowed(agent)
         if self._chat_group_enabled(
             scope_id, chat_id, group_key, default=True,
             feature_overrides=feature_overrides,
@@ -47013,8 +48307,30 @@ class ToolRegistry:
             "agent_tools_enabled": "agent tools (start, list, pause, resume, stop, and inspect current-chat agents)",
             "chat_history_enabled": "chat history tools (chat search and summaries)",
             "checklists_enabled": "Checklist tools",
+            COMPUTER_USE_FEATURE_KEY: (
+                "Computer Use tools (window listing/focus, screen capture and simulated mouse/keyboard input)"
+            ),
         }.get(group_key, group_key)
         raise PermissionError(f"{label} are disabled for {scope}")
+
+    def _agent_computer_use_allowed(self, agent: dict[str, Any], *, _depth: int = 0) -> bool:
+        """Return the effective, never-broadened Computer Use grant for one Agent."""
+        if not computer_use_enabled_in(agent.get("tool_features")) or _depth > 32:
+            return False
+        try:
+            chat_features = ChatStore(self.storage).load_chat_view(str(agent.get("source_chat_id") or ""))["features"]
+        except Exception:
+            return False
+        if not computer_use_enabled_in(chat_features):
+            return False
+        parent_id = str(agent.get("parent_agent_id") or "").strip()
+        if not parent_id:
+            return True
+        try:
+            parent = AgentStore(self.storage).load_agent(parent_id)
+        except Exception:
+            return False
+        return self._agent_computer_use_allowed(parent, _depth=_depth + 1)
 
     @staticmethod
     def _expert_mode_tool_result(
@@ -48639,9 +49955,10 @@ class AgentRuntime:
                     "FILE TOOL BOUNDARY\n\nFile tools are disabled. Do not use shell_exec, python_exec, "
                     "terminal tools, or another System tool as a substitute for local file operations."
                 )
+            sections.append(ContextAssembler.computer_use_guidance(bool(tool_features.get(COMPUTER_USE_FEATURE_KEY))))
         else:
             sections.append(
-                "NO TOOLS - ALL CAPABILITIES DISABLED\n\nFile, System, Web, Agent, Chat-history and Checklist tools are disabled. "
+                "NO TOOLS - ALL CAPABILITIES DISABLED\n\nFile, System, Web, Agent, Chat-history, Checklist and Computer Use tools are disabled. "
                 "Work otherwise only from the assigned task and supplied context. Do not claim unavailable actions ran."
             )
 
@@ -60799,10 +62116,14 @@ class UIInput:
     ctrl_down: bool = False
     cmd_down: bool = False
     shift_down: bool = False
+    # Held-state of P for the in-window Ctrl+P+End circuit-breaker fallback.
+    p_key_down: bool = False
+    circuit_breaker_requested: bool = False
     quit: bool = False
 
     def begin_frame(self) -> None:
         self.mouse_moved = False
+        self.circuit_breaker_requested = False
         self.mouse_press_x = -1
         self.mouse_press_y = -1
         self.mouse_release_x = -1
@@ -61196,6 +62517,7 @@ class SDLHost:
         # or replay a paste/Enter that preceded minimize or focus loss.
         input_state.suppress_for_background_overlay()
         input_state.ctrl_down = input_state.cmd_down = input_state.shift_down = False
+        input_state.p_key_down = False
 
     def _handle_window_event(self, event: Any, input_state: UIInput) -> bool:
         actions = {
@@ -61324,7 +62646,15 @@ class SDLHost:
             input_state.cmd_down = True
         if mod_shift:
             input_state.shift_down = True
+        if key in (ord("p"), ord("P")) or eq("SDLK_P") or eq("SDLK_p"):
+            input_state.p_key_down = down
         if not down:
+            return
+        if eq("SDLK_END") and input_state.p_key_down and (input_state.ctrl_down or mod_ctrl):
+            # Ctrl+P+End is the global Computer Use circuit breaker. This in-window
+            # path complements the system-wide Windows monitor (and is the only
+            # path on other platforms); it never also scrolls to End.
+            input_state.circuit_breaker_requested = True
             return
         primary = input_state.ctrl_down or input_state.cmd_down or mod_ctrl or mod_gui
         is_v = key in (ord("v"), ord("V")) or eq("SDLK_v") or eq("SDLK_V")
@@ -81457,7 +82787,18 @@ class Panels:
         former_card_w = min(max(420, view.w - 80), 760)
         target_card_w = max(252, int(round(former_card_w * 0.60)))
         card_w = min(max(1, view.w - 24), target_card_w)
-        target_card_h = 294 + SETTINGS_CONTROL_H + 12
+        tool_grid_rows = (len(CHAT_TOOL_CATEGORY_LABELS) + 1) // 2
+        title_font = getattr(self.widgets, "bold_font", self.f)
+        # Height is derived from exactly the rows drawn below (title, two
+        # endpoint rows, TOOLS heading, toggle grid) plus the 18 px inset on
+        # every side, so the bottom padding matches the top and sides.
+        target_card_h = (
+            18 + self.f.line_h + 12
+            + 2 * (SETTINGS_CONTROL_H + 12)
+            + self.f.line_h + 6
+            + tool_grid_rows * SETTINGS_CONTROL_H + max(0, tool_grid_rows - 1) * SETTINGS_ROW_GAP
+            + 18
+        )
         card_h = min(max(1, view.h - 24), target_card_h)
         card = Rect(
             view.x + max(0, (view.w - card_w) // 2),
@@ -81467,7 +82808,6 @@ class Panels:
         )
         self.r.draw_card(card, radius=18, fill=Palette.panel, border=theme_alpha(Palette.accent, 150))
         inner = card.inset(18)
-        title_font = getattr(self.widgets, "bold_font", self.f)
         self.r.draw_text_run_font(title_font, "NEW CHAT SETTINGS", inner.x, inner.y, Palette.white)
         y = inner.y + self.f.line_h + 12
 
@@ -81514,19 +82854,29 @@ class Panels:
             "agent_tools_enabled": "Start, list, pause, resume, stop, and inspect background agents owned by this chat.",
             "chat_history_enabled": "Stored chat search and summary functions.",
             "checklists_enabled": "Allow durable Checklists, implementation steps and independent review. Off disables Checklist tools and automatic Checklist continuation for this chat and its agents. Locked at the first user message.",
+            COMPUTER_USE_FEATURE_KEY: (
+                "Let this chat and the agents it starts control this computer: list and focus windows, capture the "
+                "screen, and send simulated mouse and keyboard input. Off removes those tools and tells the model not "
+                "to touch your mouse, keyboard or window focus. Agents inherit this setting and cannot enable it "
+                "themselves. Press " + CIRCUIT_BREAKER_HOTKEY_LABEL + " anywhere to abort input and pause all running "
+                "chats and agents. Locked at the first user message."
+            ),
         }
         column_gap = 16
         column_w = max(1, (inner.w - column_gap) // 2)
         for index, (key, label) in enumerate(CHAT_TOOL_CATEGORY_LABELS):
             row_index = index // 2
             column_index = index % 2
+            # A final toggle alone in its row (Computer Use) spans the full card
+            # width so its label is never truncated by the empty second column.
+            alone_in_row = column_index == 0 and index == len(CHAT_TOOL_CATEGORY_LABELS) - 1
             toggle_rect = Rect(
                 inner.x + column_index * (column_w + column_gap),
                 y + row_index * (SETTINGS_CONTROL_H + SETTINGS_ROW_GAP),
-                column_w,
+                inner.w if alone_in_row else column_w,
                 SETTINGS_CONTROL_H,
             )
-            current = bool(features[key])
+            current = bool(features.get(key, False))
             next_value = self.widgets.toggle(
                 f"chat.task_setup.{key}", toggle_rect,
                 label, current, tooltip=tooltip_by_key[key],
@@ -81859,6 +83209,7 @@ class Panels:
 
         endpoint_label_text = "No endpoint - No Tools"
         endpoint_tooltip = "Create or select a Chat to configure its Task."
+        computer_use_on = False
         if self.state.active_chat_id:
             try:
                 config = self.services.storage.load_config_view()
@@ -81868,10 +83219,17 @@ class Panels:
                 endpoint_label_text = self._chat_task_label_cached(
                     self.state.active_chat_id, chat, config,
                 )
+                computer_use_on = computer_use_enabled_in(chat.get("features"))
                 endpoint_tooltip = (
                     endpoint_label_text
                     + "\nLocked for this Chat Task after the first user message. Agents spawned from it "
                     "inherit the same endpoint and tool categories."
+                    + (
+                        "\nComputer Use is ON: this chat may move the mouse, type and change window focus. "
+                        "Press " + CIRCUIT_BREAKER_HOTKEY_LABEL + " anywhere to abort input and pause all running work."
+                        if computer_use_on else
+                        "\nComputer Use is OFF: the model is told not to touch the mouse, keyboard or window focus."
+                    )
                 )
             except Exception as exc:
                 endpoint_label_text = "Endpoint unavailable"
@@ -81885,7 +83243,10 @@ class Panels:
         label_x = panel.x + left_cluster_w + 10
         label_right = panel.x + panel.w - right_controls_w - 12
         label_w = max(1, label_right - label_x)
-        label_rows = self.widgets._wrap_display_rows(endpoint_label_text, label_w)
+        # The Computer Use state always starts its own row so "On"/"Off" is
+        # never orphaned from its name when the policy label wraps.
+        display_label_text = endpoint_label_text.replace(" - Computer Use: ", "\nComputer Use: ")
+        label_rows = self.widgets._wrap_display_rows(display_label_text, label_w)
         footer_h = max(42, len(label_rows) * self.f.line_h + 10)
         input_area = Rect(panel.x, panel.y, panel.w, max(1, panel.h - footer_gap - footer_h))
         controls = Rect(panel.x, panel.y + panel.h - footer_h, panel.w, footer_h)
@@ -81955,13 +83316,15 @@ class Panels:
         for row_index, row in enumerate(label_rows):
             row_text = str(row.text)
             row_x = label_rect.x + max(0, (label_rect.w - int(row.width)) // 2)
+            is_computer_use_row = row_text.startswith("Computer Use: ")
             self.r.draw_text(
-                row_text, row_x, label_y + row_index * self.f.line_h, Palette.muted2,
+                row_text, row_x, label_y + row_index * self.f.line_h,
+                Palette.warn if computer_use_on and is_computer_use_row else Palette.muted2,
             )
         self.r.pop_clip()
         self.widgets._queue_tooltip(
             "composer.task_label", label_rect, endpoint_tooltip,
-            visible_text=endpoint_label_text, visible_text_fully_shown=True,
+            visible_text=display_label_text, visible_text_fully_shown=True,
         )
 
         pause_label = "Resume" if pause_mode else "Pause"
@@ -86995,6 +88358,7 @@ class VeloxApp:
         )
         self.context.set_week_chat_selection_provider(self._calendar_context_selection)
         self.sdl_host: SDLHost | None = None
+        self.circuit_breaker_monitor: CircuitBreakerHotkeyMonitor | None = None
         self.renderer: Renderer | None = None
         self.font: FontAtlas | None = None
         self.bold_font: FontAtlas | None = None
@@ -87329,12 +88693,17 @@ class VeloxApp:
             self.agent_runtime.report_unreported_agent_events()
             self.init_ui()
             assert self.sdl_host and self.renderer and self.widgets
+            self._start_circuit_breaker_hotkey()
             config = self.storage.load_config()
             frame_delay = 1.0 / max(1, int(config["ui"].get("target_fps", 60)))
             while self.sdl_host.running:
                 await self._run_ui_iteration(frame_delay)
         finally:
             original_failure = sys.exc_info()[1]
+            async with cleanup_step('circuit breaker hotkey'):
+                monitor = getattr(self, "circuit_breaker_monitor", None)
+                if monitor is not None:
+                    await asyncio.to_thread(monitor.stop)
             async with cleanup_step('settings'):
                 if self.panels and isinstance(self.ui_state.config_draft, dict):
                     self.ui_state.active_widget = None
@@ -87459,6 +88828,9 @@ class VeloxApp:
         # Feature: SDL input updates UI state and enqueues commands for app services.
         if self.ui_state.input.quit:
             return
+        if self.ui_state.input.circuit_breaker_requested:
+            self.ui_state.input.circuit_breaker_requested = False
+            self.trip_circuit_breaker("in-window " + CIRCUIT_BREAKER_HOTKEY_LABEL)
         if self.ui_state.input.key_escape:
             if self.ui_state.modal:
                 self.ui_state.modal = None
@@ -87476,6 +88848,57 @@ class VeloxApp:
                 self.ui_state.input.key_escape = False
             elif self.sdl_host:
                 self.sdl_host.running = False
+
+    def _start_circuit_breaker_hotkey(self) -> bool:
+        """Watch Ctrl+P+End system-wide so the breaker works while other apps have focus."""
+        loop = asyncio.get_running_loop()
+
+        def on_trip() -> None:
+            # Abort in-flight Computer Use input immediately on this thread, then
+            # let the event loop own the Chat/Agent pause transitions.
+            if COMPUTER_USE_BREAKER.trip("global " + CIRCUIT_BREAKER_HOTKEY_LABEL):
+                loop.call_soon_threadsafe(self._pause_all_for_circuit_breaker, "global " + CIRCUIT_BREAKER_HOTKEY_LABEL)
+
+        def on_error(exc: BaseException) -> None:
+            _best_effort_lifecycle_log(self.storage, "computer_use.circuit_breaker_monitor_error", {
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+        self.circuit_breaker_monitor = CircuitBreakerHotkeyMonitor(on_trip, error_callback=on_error)
+        try:
+            started = self.circuit_breaker_monitor.start()
+        except Exception as exc:
+            on_error(exc)
+            started = False
+        _best_effort_lifecycle_log(self.storage, "computer_use.circuit_breaker_monitor", {
+            "global_hotkey": bool(started), "hotkey": CIRCUIT_BREAKER_HOTKEY_LABEL,
+        })
+        return bool(started)
+
+    def trip_circuit_breaker(self, source: str = CIRCUIT_BREAKER_HOTKEY_LABEL) -> dict[str, Any] | None:
+        """Abort Computer Use input and pause all running work (duplicates are ignored)."""
+        if not COMPUTER_USE_BREAKER.trip(source):
+            return None
+        return self._pause_all_for_circuit_breaker(source)
+
+    def _pause_all_for_circuit_breaker(self, source: str) -> dict[str, Any]:
+        result = pause_all_running_work(self.chat, self.agent_runtime)
+        chats, agents = len(result["chats"]), len(result["agents"])
+        _best_effort_lifecycle_log(self.storage, "computer_use.circuit_breaker", {
+            "source": str(source or ""), "paused_chat_ids": result["chats"],
+            "paused_agent_ids": result["agents"], "errors": result["errors"],
+        })
+        if chats or agents:
+            detail = (
+                f"Paused {chats} chat{'s' if chats != 1 else ''} and {agents} agent{'s' if agents != 1 else ''}; "
+                "in-flight mouse/keyboard input was aborted. Use Resume when ready."
+            )
+        else:
+            detail = "No chats or agents were running; any in-flight Computer Use input was aborted."
+        if result["errors"]:
+            detail += " Some pauses failed: " + "; ".join(result["errors"][:3])
+        self.ui_state.add_toast(f"Circuit breaker ({CIRCUIT_BREAKER_HOTKEY_LABEL})", detail, "error")
+        return result
 
     def _consume_summary_task_result(self, task: asyncio.Task) -> None:
         try:
@@ -89682,6 +91105,7 @@ async def _run_managed_reviewer_agent(runtime: Any, system_prompt: str, user_pro
             endpoint_profile_id = DEFAULT_ENDPOINT_PROFILE_ID
 
     inherited_features = {key: True for key in CHAT_TOOL_FEATURE_KEYS}
+    inherited_features[COMPUTER_USE_FEATURE_KEY] = False
     try:
         owner_agent_id = str(owner.get("agent_id") or "")
         if owner_agent_id:
@@ -89691,6 +91115,8 @@ async def _run_managed_reviewer_agent(runtime: Any, system_prompt: str, user_pro
             inherited_features = normalize_tool_feature_flags(chat.get("features"))
     except Exception:
         inherited_features = {key: True for key in CHAT_TOOL_FEATURE_KEYS}
+        # An unreadable owner never grants desktop control.
+        inherited_features[COMPUTER_USE_FEATURE_KEY] = False
     inherited_features["agent_tools_enabled"] = False
     inherited_features["chat_history_enabled"] = False
 
@@ -91812,6 +93238,7 @@ _PLANNER_EXECUTION_TOOLS = {
     "shell_exec", "python_exec", "terminal_open", "terminal_write",
     "terminal_read", "terminal_close",
 }
+_COMPUTER_USE_OBSERVATION_TOOL_NAMES = frozenset({"computer_list_windows", "computer_screenshot"})
 
 
 def _is_agent_management_tool(name: str) -> bool:
@@ -91851,6 +93278,9 @@ def _role_allows_tool(subtype: str, name: str) -> bool:
         if _is_agent_management_tool(lowered):
             return False
         if lowered in _PLANNER_EXECUTION_TOOLS:
+            return False
+        if lowered.startswith(COMPUTER_USE_TOOL_PREFIX) and lowered not in _COMPUTER_USE_OBSERVATION_TOOL_NAMES:
+            # Planners may observe an inherited desktop but never drive it.
             return False
         if _is_mutating_project_tool(lowered):
             return False
@@ -92645,6 +94075,8 @@ async def _tool_verify_checklist(self: ToolRegistry, *args: Any, **kwargs: Any) 
             self, owner, checklist, endpoint_profile_id=endpoint_profile_id,
         )
         inherited_features = {key: True for key in CHAT_TOOL_FEATURE_KEYS}
+        # An unreadable owner never grants desktop control.
+        inherited_features[COMPUTER_USE_FEATURE_KEY] = False
         try:
             if owner.get("agent_id"):
                 inherited_features = normalize_tool_feature_flags(agent_runtime.agents.load_agent(str(owner.get("agent_id") or "")).get("tool_features"))

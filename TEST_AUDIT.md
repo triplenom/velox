@@ -1,3 +1,29 @@
+# Unit test audit — release 334 (Computer Use)
+
+Release 334 adds a per-chat **Computer Use** permission, nine `computer_*` desktop tools and the global **Ctrl+P+End** circuit breaker. No test was deleted. The following tests were updated because the contract they pin changed by request:
+
+- The category tuple and key count now include `("computer_use_enabled", "Computer Use")` (7 keys): `test_appearance_order_and_new_chat_tool_category_labels`, `test_five_way_tool_categories_filter_native_schemas`, `ChecklistToggleTests.test_new_chats_default_off_and_existing_permission_is_not_global`.
+- The exhaustive tool-group mapping now routes `computer_*` to Computer Use: `test_file_and_system_toggles_exhaustively_control_their_tool_groups`.
+- The chat feature set and locked tool-feature dict include `computer_use_enabled`: `test_chat_feature_model_includes_locked_tool_categories_without_persisted_autoscroll`, `test_first_send_snapshots_history_and_locks_endpoint_and_tool_categories`.
+- The composer label now always states `Computer Use: On|Off`: `test_new_chat_settings_uses_a_two_column_three_row_tool_grid`, `test_composer_label_distinguishes_checklists_only_and_no_tools` (which gained On cases).
+- The NEW CHAT SETTINGS card draws 7 toggles: `test_new_chat_ui_draws_six_controls_and_actual_click_persists_off`.
+
+The Computer Use Off prompt section is kept short so the existing 13,500-character base-prompt budget (`StallAndProgressTests`, `RunnerPortabilityRegressionTests`) still passes. The limit was not raised.
+
+## Added coverage (34 tests)
+
+- `ComputerUsePolicyTests` (10): off by default, per-chat persistence and first-message lock; older chat/agent records without the flag validate and read as off, while wrong types and unknown keys are rejected; fail-closed normalization (no default or partial dict can enable it); tools are hidden and rejected when off, with no app-scope grant, and are exposed when on; agents inherit from the chat and parent agent and cannot broaden; a runtime guard bounds an edited `agent.json`; `agents_start` from a PA with Computer Use off yields a child with it off; Planner subagents can only observe and Reader subagents get nothing; chat and agent prompts state the On/Off policy; the real NEW CHAT SETTINGS draw/click path persists the toggle, keeps the full-width Computer Use row inside the card, and leaves bottom padding equal to the inset.
+- `ComputerUseToolTests` (14, fake desktop backend): window-relative to screen mapping; out-of-window, covered, off-desktop or invalid arguments send no input; the breaker aborts a drag, a chord or typing mid-sequence and releases every held button/key; a new action after a trip works; Unicode/surrogate/newline/tab typing; no keystrokes if focus fails; key-combo parsing; scroll/repeat/text bounds; a pending Chat/Agent pause holds input; tool cancellation; screenshot coordinate metadata and sidecar; registered schemas and handlers.
+- `ComputerUseCircuitBreakerTests` (9): generation and debounce; once-per-chord detection in any key order with re-arm; monitor thread start/stop; the in-window SDL fallback (which does not also scroll to End); pause-all ordering (chats before agents) and error isolation; pause-all through the real `AgentRuntime.pause`; the app trip path (abort, pause, single notification, duplicate ignored); the global hotkey thread handing off to the event-loop thread; `handle_events` routing.
+- `ComputerUseRealDesktopTests` (1, opt-in): drives a private Tk window through the real Win32 backend (focus, click, Unicode typing, Backspace, button click, drag, wheel). It moves the real mouse and keyboard, so it is skipped unless `VELOX_REAL_DESKTOP_INPUT_TESTS=1`.
+
+## Validation (Windows 11, Python 3.13, PySDL3 0.9.12b1, November 8, 2026)
+
+- `python test_velox.py`: **2,591 confirmed tests run, 1 failure, 5 skipped**, 1,067 s. The single failure, `Release316PresentationTests.test_card_order_and_compact_mockup_weights_are_consistent`, fails identically on the unmodified release-333 checkout (2,557 run, same failure, 4 skipped). It concerns Dashboard cost-card ordering and is unrelated to this change. The extra skip is the opt-in real-desktop test.
+- Real Win32 backend, read-only checks on the live desktop: window enumeration, a window capture matching the screen pixel-for-pixel at the reported origin, virtual-screen and cursor queries, the hotkey monitor thread, and acceptance of the `SendInput` structure (40 bytes on x64) through a zero-distance mouse move. The cursor and foreground window were unchanged afterwards.
+- Offscreen SDL captures of the real UI (`SDL_VIDEO_DRIVER=offscreen`, software renderer): the NEW CHAT SETTINGS card with Computer Use off and on, the composer summary for locked On/Off chats, and the circuit-breaker notification.
+- **Not verified:** real mouse/keyboard injection and focus switching on a live desktop (the opt-in test was not run, to avoid taking over an in-use desktop); the physical Ctrl+P+End press (detection was exercised through the same `poll_once` path with simulated key state); and Linux/macOS, where Computer Use tools report that they are Windows-only and only the in-window breaker exists.
+
 # Unit test audit — release 328 (config.json)
 
 This release moves all application configuration (settings, endpoint profiles, account credentials) into one `config.json` beside `velox.py`, leaves per-root UI state in `<root>/state.json`, and removes the tests' dependence on the shipped endpoint presets. No test was deleted to make the suite pass; tests whose contract changed were rewritten, and two inventory-only tests were replaced by structural invariants.

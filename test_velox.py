@@ -1624,7 +1624,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             self.assertEqual(set(features), {
                 "file_tools_enabled", "system_tools_enabled", "web_tools_enabled",
                 "agent_tools_enabled", "chat_history_enabled", "checklists_enabled",
-                "show_reasoning_content",
+                "computer_use_enabled", "show_reasoning_content",
             })
             self.assertEqual(set(chats.get_chat_tool_features(chat["chat_id"])), set(velox.CHAT_TOOL_FEATURE_KEYS))
             self.assertNotIn("persistence_mode_enabled", features)
@@ -1809,6 +1809,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
                 "agent_tools_enabled": False,
                 "chat_history_enabled": True,
                 "checklists_enabled": True,
+                "computer_use_enabled": False,
             })
             with self.assertRaisesRegex(ValueError, "locked"):
                 chats.set_chat_feature(velox.APP_SCOPE_ID, chat_id, "chat_history_enabled", False)
@@ -1993,6 +1994,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             ("agent_tools_enabled", "Agent"),
             ("chat_history_enabled", "Chat"),
             ("checklists_enabled", "Checklists"),
+            ("computer_use_enabled", "Computer Use"),
         ))
         self.assertIn("CHAT_TOOL_CATEGORY_LABELS", setup)
         self.assertIn('("agent_tools_enabled", "Agent tools", True)', defaults)
@@ -4993,6 +4995,7 @@ class ApplicationTests(_DataRootsIsolatedTestMixin, unittest.TestCase):
             for name in registry.tools:
                 expected = (
                     "checklists_enabled" if name in velox.EXPERT_MODE_TOOL_NAMES or name in velox.CHECKLIST_TOOL_NAMES
+                    else "computer_use_enabled" if name.startswith("computer_")
                     else "file_tools_enabled" if name.startswith(velox.FILE_TOOL_PREFIXES)
                     else "web_tools_enabled" if name.startswith(("web_", "browser_"))
                     else "chat_history_enabled" if name.startswith("chats_")
@@ -20695,6 +20698,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
                 ("agent_tools_enabled", "Agent"),
                 ("chat_history_enabled", "Chat"),
                 ("checklists_enabled", "Checklists"),
+                ("computer_use_enabled", "Computer Use"),
             ),
         )
         self.assertEqual(velox.CHAT_TOOL_FEATURE_KEYS, tuple(key for key, _label in velox.CHAT_TOOL_CATEGORY_LABELS))
@@ -20778,7 +20782,7 @@ class ToolPolicyAndImageExecutionTests(_DataRootsIsolatedTestMixin, unittest.Tes
             velox.chat_task_settings_label(
                 "Endpoint", {key: True for key in velox.CHAT_TOOL_FEATURE_KEYS},
             ),
-            "Endpoint - Tools [File, System, Web, Agent, Chat, Checklists]",
+            "Endpoint - Tools [File, System, Web, Agent, Chat, Checklists] - Computer Use: On",
         )
 
     def test_consecutive_image_groups_preserve_boundaries_and_order(self) -> None:
@@ -42052,7 +42056,7 @@ class ChecklistToggleTests(_StorageFixture):
         self.assertIs(velox.ChatStore(self.storage).load_chat(self.cid)['features']['checklists_enabled'],False)
         other=self.chats.create_chat('Independent defaults')
         self.assertIs(other['features']['checklists_enabled'],False)
-        self.assertEqual(len(velox.CHAT_TOOL_FEATURE_KEYS),6)
+        self.assertEqual(len(velox.CHAT_TOOL_FEATURE_KEYS),7)
         self.assertIn(('checklists_enabled','Checklists'),velox.CHAT_TOOL_CATEGORY_LABELS)
 
     def test_first_real_message_locks_checklists_but_display_preference_stays_editable(self) -> None:
@@ -42155,7 +42159,7 @@ class ChecklistToggleTests(_StorageFixture):
             calls.append((key,rect,label,value)); return original(key,rect,label,value,**kwargs)
         with mock.patch.object(panel.widgets,'toggle',side_effect=toggle):
             self.assertTrue(panel._draw_new_chat_task_settings(velox.Rect(0,0,1000,600)))
-        self.assertEqual(len(calls),6)
+        self.assertEqual(len(calls),7)
         key,rect,label,value=next(row for row in calls if row[0].endswith('checklists_enabled'))
         self.assertEqual(label,'Checklists'); self.assertTrue(value)
         panel.widgets.inp.mouse_x=rect.x+rect.w-20; panel.widgets.inp.mouse_y=rect.y+rect.h//2
@@ -42168,9 +42172,13 @@ class ChecklistToggleTests(_StorageFixture):
 
     def test_composer_label_distinguishes_checklists_only_and_no_tools(self) -> None:
         flags=dict.fromkeys(velox.CHAT_TOOL_FEATURE_KEYS,False)
-        self.assertEqual(velox.chat_task_settings_label('Endpoint',flags),'Endpoint - No Tools')
+        self.assertEqual(velox.chat_task_settings_label('Endpoint',flags),'Endpoint - No Tools - Computer Use: Off')
         flags['checklists_enabled']=True
-        self.assertEqual(velox.chat_task_settings_label('Endpoint',flags),'Endpoint - Tools [Checklists]')
+        self.assertEqual(velox.chat_task_settings_label('Endpoint',flags),'Endpoint - Tools [Checklists] - Computer Use: Off')
+        flags['computer_use_enabled']=True
+        self.assertEqual(velox.chat_task_settings_label('Endpoint',flags),'Endpoint - Tools [Checklists] - Computer Use: On')
+        flags['checklists_enabled']=False
+        self.assertEqual(velox.chat_task_settings_label('Endpoint',flags),'Endpoint - Computer Use: On')
 
 
     def test_copies_and_branches_preserve_disabled_policy_instead_of_new_chat_defaults(self) -> None:
@@ -50931,6 +50939,734 @@ class HourAlignedHistoryV333Tests(unittest.TestCase):
                 self.assertTrue(all(b-a==3600 for a,b in rows[:-1]))
                 self.assertTrue(all(datetime.fromtimestamp(a).minute==0 for a,b in rows))
                 self.assertAlmostEqual(rows[-1][1]-rows[-1][0],1800)
+
+
+class _FakeComputerBackend:
+    """Deterministic Computer Use backend: records input, never touches the desktop."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[Any, ...]] = []
+        self.cursor_pos = {"x": 5, "y": 5}
+        self.foreground_id = 101
+        self.windows: dict[int, dict[str, Any]] = {
+            101: {"window_id": "101", "title": "Editor", "class_name": "Edit", "process_id": 7,
+                  "process_name": "editor.exe", "x": 100, "y": 200, "width": 400, "height": 300,
+                  "minimized": False, "maximized": False, "visible": True, "foreground": True, "is_velox": False},
+            202: {"window_id": "202", "title": "Popup", "class_name": "Pop", "process_id": 8,
+                  "process_name": "popup.exe", "x": 150, "y": 250, "width": 50, "height": 50,
+                  "minimized": False, "maximized": False, "visible": True, "foreground": False, "is_velox": False},
+        }
+        self.on_event: Callable[[tuple[Any, ...]], None] | None = None
+        self.focus_result = True
+
+    def _record(self, *event: Any) -> None:
+        self.events.append(event)
+        if self.on_event is not None:
+            self.on_event(event)
+
+    @contextlib.contextmanager
+    def dpi_aware(self):
+        yield self
+
+    def virtual_screen(self) -> dict[str, int]:
+        return {"x": 0, "y": 0, "width": 1920, "height": 1080}
+
+    def cursor(self) -> dict[str, int]:
+        return dict(self.cursor_pos)
+
+    def is_window(self, hwnd: int) -> bool:
+        return int(hwnd) in self.windows
+
+    def foreground(self) -> int:
+        return self.foreground_id
+
+    def root_owner(self, hwnd: int) -> int:
+        return int(hwnd)
+
+    def window_info(self, hwnd: int, *, foreground: int | None = None) -> dict[str, Any]:
+        return dict(self.windows[int(hwnd)], foreground=int(hwnd) == self.foreground_id)
+
+    def list_windows(self, limit: int = 200) -> list[dict[str, Any]]:
+        return [self.window_info(hwnd) for hwnd in list(self.windows)[:limit]]
+
+    def window_at(self, x: int, y: int) -> int:
+        popup = self.windows.get(202)
+        if popup and popup["x"] <= x < popup["x"] + popup["width"] and popup["y"] <= y < popup["y"] + popup["height"]:
+            return 202
+        editor = self.windows[101]
+        if editor["x"] <= x < editor["x"] + editor["width"] and editor["y"] <= y < editor["y"] + editor["height"]:
+            return 101
+        return 0
+
+    def focus(self, hwnd: int) -> bool:
+        self._record("focus", int(hwnd))
+        if self.focus_result:
+            self.foreground_id = int(hwnd)
+        return self.focus_result
+
+    def move_cursor(self, x: int, y: int) -> None:
+        self.cursor_pos = {"x": int(x), "y": int(y)}
+        self._record("move", int(x), int(y))
+
+    def mouse_button(self, button: str, down: bool) -> None:
+        self._record("button", button, bool(down))
+
+    def wheel(self, notches: int, *, horizontal: bool = False) -> None:
+        self._record("wheel", int(notches), bool(horizontal))
+
+    def key(self, vk: int, down: bool) -> None:
+        self._record("key", int(vk), bool(down))
+
+    def unicode_unit(self, unit: int, down: bool) -> None:
+        self._record("unicode", int(unit), bool(down))
+
+    def capture_png(self, bbox: Any) -> bytes:
+        from PIL import Image
+        width, height = (1920, 1080) if bbox is None else (bbox[2] - bbox[0], bbox[3] - bbox[1])
+        buffer = io.BytesIO()
+        Image.new("RGB", (width, height), (10, 20, 30)).save(buffer, format="PNG")
+        self._record("capture", bbox)
+        return buffer.getvalue()
+
+
+class ComputerUsePolicyTests(_StorageFixture):
+    """Per-chat Computer Use permission, inheritance, prompts and tool exposure."""
+
+    def _names(self, registry: Any, chat_id: str | None = None, **kwargs: Any) -> set[str]:
+        return {row["function"]["name"] for row in registry.build_openai_chat_completion_tools(
+            velox.APP_SCOPE_ID, chat_id or self.cid, **kwargs)}
+
+    def test_new_chats_default_off_persist_per_chat_and_lock_at_first_message(self) -> None:
+        self.assertIs(self.chat["features"]["computer_use_enabled"], False)
+        self.assertFalse(self.chats.get_chat_tool_features(self.cid)["computer_use_enabled"])
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
+        self.assertTrue(velox.ChatStore(self.storage).load_chat(self.cid)["features"]["computer_use_enabled"])
+        other = self.chats.create_chat("Independent")
+        self.assertIs(other["features"]["computer_use_enabled"], False)
+        self.chats.append_turn(velox.APP_SCOPE_ID, self.cid, velox.make_turn(self.cid, "user", "Go"))
+        with self.assertRaisesRegex(ValueError, "locked"):
+            self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", False)
+        self.assertTrue(self.chats.get_chat_tool_features(self.cid)["computer_use_enabled"])
+
+    def test_missing_flag_from_older_records_reads_off_and_wrong_type_is_rejected(self) -> None:
+        path = self.paths.chat_json(self.cid)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["features"]["computer_use_enabled"] = True
+        legacy = copy.deepcopy(raw)
+        del legacy["features"]["computer_use_enabled"]
+        velox.validate_chat_record(legacy)
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        reloaded = velox.ChatStore(self.storage)
+        self.assertIs(reloaded.load_chat(self.cid)["features"]["computer_use_enabled"], False)
+        self.assertFalse(reloaded.get_chat_tool_features(self.cid)["computer_use_enabled"])
+        wrong = copy.deepcopy(raw)
+        wrong["features"]["computer_use_enabled"] = "true"
+        with self.assertRaises(ValueError):
+            velox.validate_chat_record(wrong)
+        unknown = copy.deepcopy(raw)
+        unknown["features"]["mouse_enabled"] = True
+        with self.assertRaises(velox.UnsupportedDataVersionError):
+            velox.validate_chat_record(unknown)
+        agent = velox.AgentStore(self.storage).create_agent(self.cid, "Legacy agent")
+        legacy_agent = copy.deepcopy(agent)
+        del legacy_agent["tool_features"]["computer_use_enabled"]
+        velox.validate_agent_record(legacy_agent)
+        unknown_agent = copy.deepcopy(agent)
+        unknown_agent["tool_features"]["mouse_enabled"] = True
+        with self.assertRaises(velox.UnsupportedDataVersionError):
+            velox.validate_agent_record(unknown_agent)
+        self.assertFalse(velox.normalize_tool_feature_flags(legacy_agent["tool_features"])["computer_use_enabled"])
+
+    def test_normalization_fails_closed_for_defaults_and_partial_dicts(self) -> None:
+        everything = {key: True for key in velox.CHAT_TOOL_FEATURE_KEYS}
+        self.assertFalse(velox.normalize_tool_feature_flags({}, everything)["computer_use_enabled"])
+        self.assertFalse(velox.normalize_tool_feature_flags(None)["computer_use_enabled"])
+        self.assertFalse(velox.normalize_tool_feature_flags({"computer_use_enabled": 1})["computer_use_enabled"])
+        self.assertTrue(velox.normalize_tool_feature_flags({"computer_use_enabled": True})["computer_use_enabled"])
+        self.assertFalse(velox.normalize_tool_feature_flags({"file_tools_enabled": True})["computer_use_enabled"])
+
+    def test_tools_are_advertised_only_when_on_and_execution_is_rejected_when_off(self) -> None:
+        registry = velox.ToolRegistry(self.storage)
+        computer_names = {name for name in registry.tools if name.startswith("computer_")}
+        self.assertEqual(computer_names, {
+            "computer_list_windows", "computer_focus_window", "computer_screenshot", "computer_mouse_move",
+            "computer_mouse_click", "computer_mouse_drag", "computer_mouse_scroll", "computer_type_text",
+            "computer_key_press",
+        })
+        for name in computer_names:
+            self.assertEqual(registry._tool_group_for_name(name), "computer_use_enabled")
+        self.assertEqual(registry._tool_group_for_name("desktop_screenshot"), "system_tools_enabled")
+        off = self._names(registry)
+        self.assertFalse(computer_names.intersection(off))
+        self.assertIn("python_exec", off)
+        for name in computer_names:
+            with self.assertRaisesRegex(PermissionError, "Computer Use tools"):
+                registry._reject_disabled_tool(velox.APP_SCOPE_ID, name, self.cid)
+        # No application-level grant exists for app-scoped (chat-less) contexts.
+        self.assertNotIn("computer_mouse_click", {row["function"]["name"] for row in registry.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, None)})
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
+        on = self._names(registry)
+        self.assertTrue(computer_names.issubset(on))
+        registry._reject_disabled_tool(velox.APP_SCOPE_ID, "computer_mouse_click", self.cid)
+        for key in velox.CHAT_TOOL_FEATURE_KEYS:
+            if key != "computer_use_enabled":
+                self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, key, False)
+        self.assertEqual(self._names(registry), computer_names)
+
+    def test_agents_inherit_and_can_never_broaden_computer_use(self) -> None:
+        agents = velox.AgentStore(self.storage)
+        everything = {key: True for key in velox.CHAT_TOOL_FEATURE_KEYS}
+        requested_on = agents.create_agent(self.cid, "Asks for desktop control", tool_features=everything)
+        self.assertFalse(requested_on["tool_features"]["computer_use_enabled"], "chat is off; request must not broaden")
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
+        inherited = agents.create_agent(self.cid, "Inherits")
+        self.assertTrue(inherited["tool_features"]["computer_use_enabled"])
+        narrowed = agents.create_agent(self.cid, "Narrowed", tool_features=dict(everything, computer_use_enabled=False))
+        self.assertFalse(narrowed["tool_features"]["computer_use_enabled"])
+        child_of_narrowed = agents.create_agent(
+            self.cid, "Child asks for more", tool_features=everything,
+            parent_agent_id=narrowed["agent_id"], parent_task_run_id=narrowed["task_run_id"],
+        )
+        self.assertFalse(child_of_narrowed["tool_features"]["computer_use_enabled"])
+        child_of_inherited = agents.create_agent(
+            self.cid, "Child keeps it", tool_features=everything,
+            parent_agent_id=inherited["agent_id"], parent_task_run_id=inherited["task_run_id"],
+        )
+        self.assertTrue(child_of_inherited["tool_features"]["computer_use_enabled"])
+        # The grant is captured at creation: later Chat changes cannot widen it.
+        self.assertFalse(agents.load_agent(requested_on["agent_id"])["tool_features"]["computer_use_enabled"])
+
+    def test_runtime_guard_bounds_an_edited_agent_record_by_chat_and_parent(self) -> None:
+        registry = velox.ToolRegistry(self.storage)
+        agents = velox.AgentStore(self.storage)
+        agent = agents.create_agent(self.cid, "Edited")
+        self.assertFalse(agent["tool_features"]["computer_use_enabled"])
+        agents.update_agent(agent["agent_id"], {"tool_features": dict(agent["tool_features"], computer_use_enabled=True)})
+        with self.assertRaisesRegex(PermissionError, "Computer Use tools"):
+            registry._reject_disabled_tool(velox.APP_SCOPE_ID, "computer_type_text", self.cid, agent_id=agent["agent_id"])
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
+        registry._reject_disabled_tool(velox.APP_SCOPE_ID, "computer_type_text", self.cid, agent_id=agent["agent_id"])
+        parent = agents.create_agent(self.cid, "Parent", tool_features={**self.chats.get_chat_tool_features(self.cid), "computer_use_enabled": False})
+        child = agents.create_agent(self.cid, "Child", parent_agent_id=parent["agent_id"], parent_task_run_id=parent["task_run_id"])
+        agents.update_agent(child["agent_id"], {"tool_features": dict(child["tool_features"], computer_use_enabled=True)})
+        with self.assertRaisesRegex(PermissionError, "Computer Use tools"):
+            registry._reject_disabled_tool(velox.APP_SCOPE_ID, "computer_type_text", self.cid, agent_id=child["agent_id"])
+
+    def test_start_from_tool_child_inherits_parent_permission(self) -> None:
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
+        agents = velox.AgentStore(self.storage)
+        tools = velox.ToolRegistry(self.storage)
+        runtime = velox.AgentRuntime(self.storage, agents, self.chats, velox.ContextAssembler(self.paths), object(), tools)
+        started: list[str] = []
+        runtime.start_agent = lambda agent_id: started.append(agent_id)  # type: ignore[method-assign]
+        pa = agents.create_agent(self.cid, "PA", agent_kind=velox.AGENT_KIND_PERSONAL_ASSISTANT,
+                                 tool_features={**self.chats.get_chat_tool_features(self.cid), "computer_use_enabled": False})
+        ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, agent_id=pa["agent_id"])
+        result = asyncio.run(runtime.start_from_tool(ctx, {"task": "Child"}))
+        self.assertFalse(result["tool_features"]["computer_use_enabled"])
+        self.assertFalse(agents.load_agent(result["agent_id"])["tool_features"]["computer_use_enabled"])
+        chat_ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid)
+        from_chat = asyncio.run(runtime.start_from_tool(chat_ctx, {"task": "Chat child"}))
+        self.assertTrue(from_chat["tool_features"]["computer_use_enabled"])
+
+    def test_planner_and_reader_roles_cannot_drive_the_desktop(self) -> None:
+        for name in ("computer_mouse_click", "computer_type_text", "computer_key_press", "computer_focus_window",
+                     "computer_mouse_drag", "computer_mouse_move", "computer_mouse_scroll"):
+            self.assertFalse(velox._role_allows_tool(velox.AGENT_SUBTYPE_PLANNER, name), name)
+            self.assertFalse(velox._role_allows_tool(velox.AGENT_SUBTYPE_READER, name), name)
+            self.assertTrue(velox._role_allows_tool(velox.AGENT_SUBTYPE_IMPLEMENTER, name), name)
+        self.assertTrue(velox._role_allows_tool(velox.AGENT_SUBTYPE_PLANNER, "computer_screenshot"))
+        self.assertFalse(velox._role_allows_tool(velox.AGENT_SUBTYPE_READER, "computer_screenshot"))
+
+    def test_chat_and_agent_prompts_state_the_desktop_policy(self) -> None:
+        context = velox.ContextAssembler(self.paths)
+        off_prompt = context.assemble_chat_context(velox.APP_SCOPE_ID, self.cid)[0]["content"]
+        self.assertIn("COMPUTER USE\n\nComputer Use is OFF", off_prompt)
+        self.assertIn("never move or click the mouse, send keystrokes, change window focus", off_prompt)
+        self.assertNotIn("computer_mouse_click", off_prompt)
+        self.assertNotIn("Computer Use]", off_prompt)
+        agents = velox.AgentStore(self.storage)
+        runtime = velox.AgentRuntime(self.storage, agents, self.chats, context, object(), velox.ToolRegistry(self.storage))
+        off_agent = runtime.build_standard_system_prompt(agents.create_agent(self.cid, "Off"))
+        self.assertIn("Computer Use is OFF", off_agent)
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
+        on_prompt = context.assemble_chat_context(velox.APP_SCOPE_ID, self.cid)[0]["content"]
+        self.assertIn("COMPUTER USE\n\nComputer Use is ON", on_prompt)
+        self.assertIn("Computer Use. Use no other category", on_prompt)
+        self.assertIn("Ctrl+P+End", on_prompt)
+        self.assertNotIn("Computer Use is OFF", on_prompt)
+        on_agent = runtime.build_standard_system_prompt(agents.create_agent(self.cid, "On"))
+        self.assertIn("Computer Use is ON", on_agent)
+        self.assertIn("computer_mouse_click", on_agent)
+
+    def test_new_chat_settings_draws_computer_use_toggle_inside_card_and_click_persists(self) -> None:
+        panel = object.__new__(velox.Panels); panel.widgets = ChecklistRenderingTests.widgets(); panel.state = panel.widgets.state
+        panel.state.active_chat_id = self.cid; panel.services = SimpleNamespace(storage=self.storage, chats=self.chats)
+        calls: list[tuple[Any, ...]] = []; cards: list[velox.Rect] = []
+        original_toggle = panel.widgets.toggle; original_card = panel.r.draw_card
+        def toggle(key: str, rect: velox.Rect, label: str, value: bool, **kwargs: Any) -> bool:
+            calls.append((key, rect, label, value, kwargs.get("tooltip", ""))); return original_toggle(key, rect, label, value, **kwargs)
+        def draw_card(rect: velox.Rect, *args: Any, **kwargs: Any) -> Any:
+            cards.append(rect); return original_card(rect, *args, **kwargs)
+        view = velox.Rect(0, 0, 1000, 700)
+        with mock.patch.object(panel.widgets, "toggle", side_effect=toggle), mock.patch.object(panel.r, "draw_card", side_effect=draw_card):
+            self.assertTrue(panel._draw_new_chat_task_settings(view))
+        self.assertEqual(len(calls), 7)
+        key, rect, label, value, tooltip = calls[-1]
+        self.assertEqual((key, label, value), ("chat.task_setup.computer_use_enabled", "Computer Use", False))
+        self.assertIn("Ctrl+P+End", tooltip)
+        card = cards[0]
+        for _key, toggle_rect, *_rest in calls:
+            self.assertGreaterEqual(toggle_rect.y, card.y)
+            self.assertLessEqual(toggle_rect.y + toggle_rect.h, card.y + card.h - 12, "toggle must sit inside the card padding")
+        # Alone in the last row, Computer Use spans the card so its label is not truncated,
+        # and the card height is derived from the drawn rows (18 px inset on every side).
+        self.assertEqual((rect.x, rect.w), (card.x + 18, card.w - 36))
+        self.assertEqual(card.y + card.h - (rect.y + rect.h), 18)
+        self.assertLess(calls[-2][1].w, rect.w)
+        panel.widgets.inp.mouse_x = rect.x + rect.w - 20; panel.widgets.inp.mouse_y = rect.y + rect.h // 2
+        panel.widgets.inp.mouse_pressed = True; panel.widgets.inp.mouse_down = True
+        panel._draw_new_chat_task_settings(view)
+        self.assertTrue(self.chats.get_chat_tool_features(self.cid)["computer_use_enabled"])
+        self.assertTrue(velox.ChatStore(self.storage).load_chat(self.cid)["features"]["computer_use_enabled"])
+
+
+class ComputerUseToolTests(_StorageFixture):
+    """Input mapping, safety guards and the circuit breaker with a fake desktop."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.backend = _FakeComputerBackend()
+        self.breaker = velox.ComputerUseCircuitBreaker()
+        self.tools = velox.ComputerUseTools(
+            self.storage, velox.DesktopTools(self.storage), backend_factory=lambda: self.backend,
+            breaker=self.breaker, input_lock=threading.Lock(),
+        )
+        self.ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid)
+
+    def run_tool(self, method: Callable[..., Any], args: dict[str, Any]) -> dict[str, Any]:
+        return asyncio.run(method(self.ctx, args))
+
+    def test_window_relative_click_maps_to_screen_and_reports_target(self) -> None:
+        result = self.run_tool(self.tools.mouse_click, {"x": 10, "y": 20, "window_id": "101", "clicks": 2})
+        self.assertEqual((result["screen_x"], result["screen_y"]), (110, 220))
+        self.assertEqual(result["window_at_point"]["window_id"], "101")
+        self.assertEqual(self.backend.events, [
+            ("move", 110, 220), ("button", "left", True), ("button", "left", False),
+            ("button", "left", True), ("button", "left", False),
+        ])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["foreground_window"]["window_id"], "101")
+
+    def test_points_outside_or_covered_and_bad_arguments_send_no_input(self) -> None:
+        cases = [
+            ({"x": 400, "y": 10, "window_id": "101"}, "outside window"),
+            ({"x": 60, "y": 60, "window_id": "101"}, "covered by window 202"),
+            ({"x": 5000, "y": 10}, "outside the virtual desktop"),
+            ({"x": 10, "y": 10, "window_id": "999"}, "no longer exists"),
+            ({"x": 10, "y": 10, "button": "side"}, "button"),
+            ({"x": 10, "y": 10, "clicks": 4}, "clicks"),
+            ({"x": True, "y": 10}, "finite number"),
+            ({"x": 10, "y": 10, "window_id": "abc"}, "Invalid window_id"),
+        ]
+        for args, message in cases:
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.run_tool(self.tools.mouse_click, args)
+        self.assertEqual(self.backend.events, [])
+
+    def test_breaker_aborts_drag_mid_motion_and_releases_the_button(self) -> None:
+        moves = {"count": 0}
+        def on_event(event: tuple[Any, ...]) -> None:
+            if event[0] == "move":
+                moves["count"] += 1
+                if moves["count"] == 4:
+                    self.breaker.trip("test")
+        self.backend.on_event = on_event
+        with self.assertRaisesRegex(velox.ComputerUseInterrupted, "circuit breaker"):
+            self.run_tool(self.tools.mouse_drag, {"start_x": 10, "start_y": 10, "end_x": 300, "end_y": 200, "window_id": "101"})
+        buttons = [event for event in self.backend.events if event[0] == "button"]
+        self.assertEqual(buttons, [("button", "left", True), ("button", "left", False)])
+        self.assertEqual(self.backend.events[-1], ("button", "left", False))
+        self.assertLess(moves["count"], 10, "the drag must stop promptly after the trip")
+        # A new action after the trip starts from the new generation and works.
+        self.backend.on_event = None; self.backend.events.clear()
+        self.run_tool(self.tools.mouse_move, {"x": 50, "y": 60})
+        self.assertEqual(self.backend.events, [("move", 50, 60)])
+
+    def test_breaker_during_chord_releases_every_held_key(self) -> None:
+        def on_event(event: tuple[Any, ...]) -> None:
+            if event == ("key", 0x10, True):
+                self.breaker.trip("test")
+        self.backend.on_event = on_event
+        with self.assertRaises(velox.ComputerUseInterrupted):
+            self.run_tool(self.tools.key_press, {"keys": "ctrl+shift+t"})
+        downs = [event[1] for event in self.backend.events if event[0] == "key" and event[2]]
+        ups = [event[1] for event in self.backend.events if event[0] == "key" and not event[2]]
+        self.assertEqual(downs, [0x11, 0x10])
+        self.assertEqual(ups, [0x10, 0x11])
+
+    def test_breaker_stops_typing_promptly(self) -> None:
+        typed = {"units": 0}
+        def on_event(event: tuple[Any, ...]) -> None:
+            if event[0] == "unicode" and event[2]:
+                typed["units"] += 1
+                if typed["units"] == 3:
+                    self.breaker.trip("test")
+        self.backend.on_event = on_event
+        with self.assertRaises(velox.ComputerUseInterrupted):
+            self.run_tool(self.tools.type_text, {"text": "abcdefghij" * 10})
+        self.assertEqual(typed["units"], 3)
+        downs = sum(1 for event in self.backend.events if event[0] == "unicode" and event[2])
+        ups = sum(1 for event in self.backend.events if event[0] == "unicode" and not event[2])
+        self.assertEqual(downs, ups, "every typed unit is released")
+
+    def test_type_text_focuses_target_and_encodes_unicode_newlines_and_tabs(self) -> None:
+        self.backend.foreground_id = 202
+        result = self.run_tool(self.tools.type_text, {"text": "a\u00e9\U0001F600\r\nb\tc", "window_id": "101"})
+        self.assertEqual(result["characters_typed"], 7)
+        self.assertEqual(self.backend.events[0], ("focus", 101))
+        units = [event[1] for event in self.backend.events if event[0] == "unicode" and event[2]]
+        self.assertEqual(units, [ord("a"), 0xE9, 0xD83D, 0xDE00, ord("b"), ord("c")])
+        keys = [event[1] for event in self.backend.events if event[0] == "key" and event[2]]
+        self.assertEqual(keys, [0x0D, 0x09])
+
+    def test_keyboard_input_is_not_sent_when_focus_fails(self) -> None:
+        self.backend.focus_result = False
+        with self.assertRaisesRegex(RuntimeError, "Could not focus"):
+            self.run_tool(self.tools.key_press, {"keys": "enter", "window_id": "202"})
+        self.assertEqual(self.backend.events, [("focus", 202)])
+
+    def test_key_combo_parser_accepts_friendly_and_dom_names(self) -> None:
+        parse = velox.parse_computer_key_combo
+        self.assertEqual(parse("ctrl+shift+s"), [0x11, 0x10, 0x53])
+        self.assertEqual(parse("Alt+F4"), [0x12, 0x73])
+        self.assertEqual(parse("ControlLeft+KeyC"), [0x11, 0x43])
+        self.assertEqual(parse("page_down"), [0x22])
+        self.assertEqual(parse("win+Digit1"), [0x5B, 0x31])
+        self.assertEqual(parse("ArrowLeft"), [0x25])
+        for bad in ("", "ctrl+", "ctrl+ctrl", "hyper+a", "a+b+c+d+e+f"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse(bad)
+
+    def test_scroll_and_repeat_bounds(self) -> None:
+        result = self.run_tool(self.tools.mouse_scroll, {"x": 10, "y": 10, "amount": -3, "window_id": "101"})
+        self.assertEqual([event for event in self.backend.events if event[0] == "wheel"], [("wheel", -1, False)] * 3)
+        self.assertEqual(result["amount"], -3)
+        for amount in (0, 51, 1.5, True):
+            with self.subTest(amount=amount), self.assertRaises(ValueError):
+                self.run_tool(self.tools.mouse_scroll, {"x": 10, "y": 10, "amount": amount})
+        with self.assertRaises(ValueError):
+            self.run_tool(self.tools.key_press, {"keys": "a", "repeat": 51})
+        with self.assertRaises(ValueError):
+            self.run_tool(self.tools.type_text, {"text": "x" * (velox.COMPUTER_USE_MAX_TEXT_CHARS + 1)})
+
+    def test_pending_pause_holds_new_input(self) -> None:
+        self.tools.hold_check = lambda ctx: "This Chat is pausing; Computer Use input was not sent"
+        with self.assertRaisesRegex(velox.ComputerUseInterrupted, "pausing"):
+            self.run_tool(self.tools.mouse_click, {"x": 10, "y": 10})
+        self.assertEqual(self.backend.events, [])
+
+    def test_registry_hold_check_follows_chat_and_agent_pause_state(self) -> None:
+        registry = velox.ToolRegistry(self.storage)
+        chat_runtime = SimpleNamespace(is_pause_requested=lambda cid: cid == self.cid, is_paused=lambda cid: False)
+        registry.agent_runtime = SimpleNamespace(chat_runtime=chat_runtime)  # type: ignore[assignment]
+        self.assertIn("pausing", registry._computer_use_hold_reason(self.ctx))
+        chat_runtime.is_pause_requested = lambda cid: False
+        self.assertEqual(registry._computer_use_hold_reason(self.ctx), "")
+        agents = velox.AgentStore(self.storage)
+        agent = agents.create_agent(self.cid, "Agent")
+        agent_ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, agent_id=agent["agent_id"])
+        self.assertEqual(registry._computer_use_hold_reason(agent_ctx), "")
+        agents.update_agent(agent["agent_id"], {"pause_requested": True})
+        self.assertIn("pausing", registry._computer_use_hold_reason(agent_ctx))
+
+    def test_cancelled_tool_context_stops_input(self) -> None:
+        event = threading.Event(); event.set()
+        ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid, cancel_event=event)
+        with self.assertRaises(velox.ToolCancelledError):
+            asyncio.run(self.tools.mouse_click(ctx, {"x": 10, "y": 10}))
+        self.assertEqual(self.backend.events, [])
+
+    def test_screenshots_and_window_list_report_coordinate_mapping(self) -> None:
+        whole = self.run_tool(self.tools.screenshot, {})
+        self.assertEqual((whole["width"], whole["height"]), (1920, 1080))
+        self.assertEqual(whole["coordinate_space"], "screen")
+        self.assertTrue(Path(whole["absolute_path"]).is_file())
+        self.assertTrue(whole["filename"].startswith("computer_screenshot_"))
+        window = self.run_tool(self.tools.screenshot, {"window_id": "101"})
+        self.assertEqual((window["width"], window["height"]), (400, 300))
+        self.assertEqual(window["screen_origin"], {"x": 100, "y": 200})
+        self.assertIn("(100 + px, 200 + py)", window["coordinate_note"])
+        sidecar = json.loads(Path(window["absolute_path"]).with_suffix(".json").read_text(encoding="utf-8"))
+        self.assertEqual(sidecar["screen_origin"], {"x": 100, "y": 200})
+        listed = self.run_tool(self.tools.list_windows, {})
+        self.assertEqual([row["window_id"] for row in listed["windows"]], ["101", "202"])
+        self.assertEqual(listed["foreground_window_id"], "101")
+        no_chat = velox.ToolContext(velox.APP_SCOPE_ID)
+        with self.assertRaisesRegex(ValueError, "active chat"):
+            asyncio.run(self.tools.screenshot(no_chat, {}))
+
+    def test_registered_tool_schemas_match_handlers(self) -> None:
+        registry = velox.ToolRegistry(self.storage)
+        self.chats.set_chat_feature(velox.APP_SCOPE_ID, self.cid, "computer_use_enabled", True)
+        rows = {row["function"]["name"]: row["function"] for row in registry.build_openai_chat_completion_tools(velox.APP_SCOPE_ID, self.cid)}
+        self.assertEqual(rows["computer_mouse_click"]["parameters"]["required"], ["x", "y"])
+        self.assertEqual(rows["computer_mouse_drag"]["parameters"]["required"], ["start_x", "start_y", "end_x", "end_y"])
+        self.assertEqual(rows["computer_key_press"]["parameters"]["required"], ["keys"])
+        self.assertEqual(rows["computer_focus_window"]["parameters"]["required"], ["window_id"])
+        self.assertIs(registry.tools["computer_mouse_click"].handler.__self__, registry.computer_use_tools)
+        self.assertIs(registry.computer_use_tools.hold_check.__self__, registry)
+
+
+class ComputerUseCircuitBreakerTests(_StorageFixture):
+    """Ctrl+P+End: global hotkey detection, in-window fallback and pause-all."""
+
+    def test_breaker_generation_and_debounce(self) -> None:
+        breaker = velox.ComputerUseCircuitBreaker()
+        start = breaker.generation
+        self.assertTrue(breaker.trip("first"))
+        self.assertFalse(breaker.trip("duplicate within debounce"))
+        self.assertEqual(breaker.generation, start + 2)
+        self.assertEqual(breaker.trip_count, 1)
+        with self.assertRaises(velox.ComputerUseInterrupted):
+            breaker.check(start)
+        breaker.check(breaker.generation)
+
+    def test_hotkey_monitor_fires_once_per_chord_in_any_order(self) -> None:
+        pressed: set[int] = set()
+        trips: list[int] = []
+        monitor = velox.CircuitBreakerHotkeyMonitor(lambda: trips.append(1), key_down=lambda vk: vk in pressed)
+        ctrl, p_key, end = 0x11, 0x50, 0x23
+        for keys in ({ctrl}, {ctrl, p_key}, {p_key, end}, {ctrl, end}):
+            pressed.clear(); pressed.update(keys)
+            self.assertFalse(monitor.poll_once(), keys)
+        pressed.clear(); pressed.update({end, p_key, ctrl})
+        self.assertTrue(monitor.poll_once())
+        self.assertFalse(monitor.poll_once(), "holding the chord must not repeat")
+        pressed.discard(end)
+        self.assertFalse(monitor.poll_once())
+        pressed.add(end)
+        self.assertTrue(monitor.poll_once(), "releasing one key re-arms the chord")
+        self.assertEqual(len(trips), 2)
+
+    def test_hotkey_monitor_thread_start_stop(self) -> None:
+        pressed: set[int] = set()
+        fired = threading.Event()
+        monitor = velox.CircuitBreakerHotkeyMonitor(fired.set, key_down=lambda vk: vk in pressed, poll_seconds=0.005)
+        self.assertTrue(monitor.start())
+        self.assertTrue(monitor.running)
+        pressed.update({0x11, 0x50, 0x23})
+        self.assertTrue(fired.wait(2.0))
+        monitor.stop()
+        self.assertFalse(monitor.running)
+        self.assertEqual(monitor.trigger_count, 1)
+
+    def test_in_window_fallback_detects_chord_without_scrolling(self) -> None:
+        fake_sdl = SimpleNamespace(SDLK_LCTRL=1001, SDLK_RCTRL=1002, SDLK_END=1003, SDLK_P=ord("p"),
+                                   SDL_KMOD_CTRL=0x40, SDL_KMOD_GUI=0x400, SDL_KMOD_SHIFT=0x1)
+        host = object.__new__(velox.SDLHost)
+        state = velox.UIInput()
+        with mock.patch.object(velox, "sdl", fake_sdl):
+            host._apply_key(state, 1001, 0x40, True)
+            host._apply_key(state, ord("p"), 0x40, True)
+            host._apply_key(state, 1003, 0x40, True)
+            self.assertTrue(state.circuit_breaker_requested)
+            self.assertFalse(state.key_end)
+            state.begin_frame()
+            self.assertFalse(state.circuit_breaker_requested)
+            host._apply_key(state, ord("p"), 0x40, False)
+            host._apply_key(state, 1003, 0x40, True)
+            self.assertFalse(state.circuit_breaker_requested)
+            self.assertTrue(state.key_end, "plain Ctrl+End keeps its normal meaning")
+
+    def test_pause_all_pauses_chats_first_then_remaining_agents(self) -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            running = loop.create_future(); finished = loop.create_future(); finished.set_result(None)
+            calls: list[str] = []
+            chat_runtime = SimpleNamespace(running={"c1": running, "c2": finished, "c3": running},
+                                           pause=lambda cid: calls.append("chat:" + cid) or cid != "c3")
+            agent_runtime = SimpleNamespace(running={"a1": running, "a2": finished},
+                                            pause=lambda aid: calls.append("agent:" + aid) or True)
+            result = velox.pause_all_running_work(chat_runtime, agent_runtime)
+            self.assertEqual(calls, ["chat:c1", "chat:c3", "agent:a1"])
+            self.assertEqual(result, {"chats": ["c1"], "agents": ["a1"], "errors": []})
+            def broken(_cid: str) -> bool:
+                raise RuntimeError("boom")
+            chat_runtime.pause = broken
+            result = velox.pause_all_running_work(chat_runtime, agent_runtime)
+            self.assertEqual(len(result["errors"]), 2)
+            self.assertEqual(result["agents"], ["a1"])
+        finally:
+            loop.close()
+
+    def test_pause_all_uses_the_real_agent_pause_path(self) -> None:
+        async def scenario() -> None:
+            agents = velox.AgentStore(self.storage)
+            runtime = velox.AgentRuntime(self.storage, agents, self.chats, velox.ContextAssembler(self.paths), object(), velox.ToolRegistry(self.storage))
+            agent = agents.create_agent(self.cid, "Queued work")
+            blocker = asyncio.get_running_loop().create_future()
+            runtime.running[agent["agent_id"]] = blocker  # type: ignore[assignment]
+            result = velox.pause_all_running_work(SimpleNamespace(running={}), runtime)
+            self.assertEqual(result["agents"], [agent["agent_id"]])
+            self.assertEqual(agents.load_agent(agent["agent_id"])["status"], "paused")
+            again = velox.pause_all_running_work(SimpleNamespace(running={}), runtime)
+            self.assertEqual(again["agents"], [], "already paused work is left unchanged")
+            blocker.cancel()
+        asyncio.run(scenario())
+
+    def test_app_trip_aborts_input_pauses_work_and_notifies_once(self) -> None:
+        app = object.__new__(velox.VeloxApp)
+        app.storage = self.storage
+        app.ui_state = velox.UIState()
+        paused: list[str] = []
+        loop = asyncio.new_event_loop()
+        try:
+            task = loop.create_future()
+            app.chat = SimpleNamespace(running={"c1": task}, pause=lambda cid: paused.append(cid) or True)
+            app.agent_runtime = SimpleNamespace(running={}, pause=lambda aid: True)
+            breaker = velox.ComputerUseCircuitBreaker()
+            with mock.patch.object(velox, "COMPUTER_USE_BREAKER", breaker):
+                start = breaker.generation
+                result = app.trip_circuit_breaker("test")
+                self.assertEqual(result["chats"], ["c1"])
+                self.assertGreater(breaker.generation, start)
+                self.assertIsNone(app.trip_circuit_breaker("duplicate"))
+            self.assertEqual(paused, ["c1"])
+            self.assertEqual(len(app.ui_state.toasts), 1)
+            self.assertIn("Ctrl+P+End", app.ui_state.toasts[0]["message"])
+            self.assertIn("Paused 1 chat and 0 agents", app.ui_state.toasts[0]["detail"])
+        finally:
+            loop.close()
+
+    def test_global_hotkey_thread_hands_off_to_the_event_loop(self) -> None:
+        pressed: set[int] = set()
+        real_monitor = velox.CircuitBreakerHotkeyMonitor
+
+        def fake_monitor(on_trip: Any, **kwargs: Any) -> Any:
+            return real_monitor(on_trip, key_down=lambda vk: vk in pressed, poll_seconds=0.005, **kwargs)
+
+        async def scenario() -> None:
+            app = object.__new__(velox.VeloxApp)
+            app.storage = self.storage
+            app.ui_state = velox.UIState()
+            loop_thread = threading.get_ident()
+            paused: list[tuple[str, int]] = []
+            running = asyncio.get_running_loop().create_future()
+            app.chat = SimpleNamespace(running={"c1": running}, pause=lambda cid: paused.append((cid, threading.get_ident())) or True)
+            app.agent_runtime = SimpleNamespace(running={}, pause=lambda aid: True)
+            breaker = velox.ComputerUseCircuitBreaker()
+            with mock.patch.object(velox, "CircuitBreakerHotkeyMonitor", fake_monitor), \
+                    mock.patch.object(velox, "COMPUTER_USE_BREAKER", breaker):
+                self.assertTrue(app._start_circuit_breaker_hotkey())
+                try:
+                    start = breaker.generation
+                    pressed.update({0x11, 0x50, 0x23})
+                    for _ in range(400):
+                        if paused:
+                            break
+                        await asyncio.sleep(0.005)
+                    self.assertEqual(paused, [("c1", loop_thread)], "pause runs on the event-loop thread")
+                    self.assertGreater(breaker.generation, start)
+                finally:
+                    app.circuit_breaker_monitor.stop()
+            running.cancel()
+            self.assertEqual(len(app.ui_state.toasts), 1)
+
+        asyncio.run(scenario())
+
+    def test_handle_events_routes_in_window_request(self) -> None:
+        app = object.__new__(velox.VeloxApp)
+        app.ui_state = velox.UIState()
+        app.sdl_host = None
+        app.ui_state.input.circuit_breaker_requested = True
+        sources: list[str] = []
+        app.trip_circuit_breaker = lambda source="": sources.append(source)  # type: ignore[method-assign]
+        asyncio.run(app.handle_events())
+        self.assertEqual(sources, ["in-window Ctrl+P+End"])
+        self.assertFalse(app.ui_state.input.circuit_breaker_requested)
+
+
+@unittest.skipUnless(
+    os.name == "nt" and os.environ.get("VELOX_REAL_DESKTOP_INPUT_TESTS") == "1",
+    "Real desktop input is opt-in: set VELOX_REAL_DESKTOP_INPUT_TESTS=1 on an interactive Windows desktop",
+)
+class ComputerUseRealDesktopTests(_StorageFixture):
+    """Drive a private Tk window through the real Win32 backend (moves the real mouse)."""
+
+    def test_real_window_focus_click_type_keys_drag_and_scroll(self) -> None:
+        import tkinter as tk
+        backend = velox._Win32Desktop()
+        with backend.dpi_aware():
+            original_cursor = backend.cursor(); original_foreground = backend.foreground()
+        ready = threading.Event(); done = threading.Event(); state: dict[str, Any] = {"clicks": 0, "drag": [], "wheel": 0}
+
+        def ui() -> None:
+            try:
+                import ctypes as _ct
+                _ct.windll.user32.SetThreadDpiAwarenessContext(_ct.c_void_p(-4))
+            except Exception:
+                pass
+            root = tk.Tk(); root.title("Velox Computer Use Test " + velox.uuid_v4()[:8]); root.geometry("640x420+200+160")
+            entry = tk.Entry(root, width=40); entry.place(x=20, y=20)
+            button = tk.Button(root, text="Press", command=lambda: state.__setitem__("clicks", state["clicks"] + 1)); button.place(x=20, y=60, width=120, height=40)
+            canvas = tk.Canvas(root, width=400, height=200, bg="white"); canvas.place(x=20, y=120)
+            canvas.bind("<B1-Motion>", lambda event: state["drag"].append((event.x, event.y)))
+            root.bind_all("<MouseWheel>", lambda event: state.__setitem__("wheel", state["wheel"] + event.delta))
+            root.bind("<Control-a>", lambda event: state.__setitem__("ctrl_a", True))
+            state["root"] = root; state["entry"] = entry; state["title"] = root.title()
+            root.after(100, ready.set)
+            def poll() -> None:
+                if done.is_set():
+                    root.destroy(); return
+                state["text"] = entry.get(); root.after(30, poll)
+            poll(); root.mainloop()
+
+        thread = threading.Thread(target=ui, daemon=True); thread.start()
+        self.assertTrue(ready.wait(10))
+        tools = velox.ComputerUseTools(self.storage, velox.DesktopTools(self.storage), backend_factory=lambda: backend,
+                                       breaker=velox.ComputerUseCircuitBreaker(), input_lock=threading.Lock())
+        ctx = velox.ToolContext(velox.APP_SCOPE_ID, chat_id=self.cid)
+        run = lambda method, args: asyncio.run(method(ctx, args))
+        try:
+            time.sleep(0.5)
+            listed = run(tools.list_windows, {})
+            match = [row for row in listed["windows"] if row["title"] == state["title"]]
+            self.assertEqual(len(match), 1, listed["windows"][:5])
+            window_id = match[0]["window_id"]
+            self.assertTrue(run(tools.focus_window, {"window_id": window_id})["window"]["foreground"])
+            shot = run(tools.screenshot, {"window_id": window_id})
+            self.assertGreater(shot["width"], 500)
+            entry_x = state["entry"].winfo_rootx() - int(match[0]["x"]) + 10
+            entry_y = state["entry"].winfo_rooty() - int(match[0]["y"]) + 8
+            run(tools.mouse_click, {"x": entry_x, "y": entry_y, "window_id": window_id})
+            run(tools.type_text, {"text": "Hello \u00e9\U0001F600", "window_id": window_id})
+            time.sleep(0.3)
+            self.assertEqual(state["text"], "Hello \u00e9\U0001F600")
+            run(tools.key_press, {"keys": "backspace", "repeat": 2, "window_id": window_id})
+            time.sleep(0.3)
+            self.assertEqual(state["text"], "Hello ")
+            origin_x, origin_y = state["root"].winfo_rootx() - int(match[0]["x"]), state["root"].winfo_rooty() - int(match[0]["y"])
+            run(tools.mouse_click, {"x": origin_x + 70, "y": origin_y + 80, "window_id": window_id})
+            time.sleep(0.3)
+            self.assertEqual(state["clicks"], 1)
+            run(tools.mouse_drag, {"start_x": origin_x + 60, "start_y": origin_y + 160, "end_x": origin_x + 300, "end_y": origin_y + 280, "window_id": window_id})
+            time.sleep(0.3)
+            self.assertGreater(len(state["drag"]), 5)
+            self.assertGreater(state["drag"][-1][0], state["drag"][0][0] + 150)
+            run(tools.mouse_scroll, {"x": origin_x + 200, "y": origin_y + 200, "amount": -2, "window_id": window_id})
+            time.sleep(0.3)
+            self.assertEqual(state["wheel"], -240)
+            tools.breaker.trip("real test")
+            # A trip between actions does not poison the next action.
+            run(tools.mouse_move, {"x": origin_x + 10, "y": origin_y + 10, "window_id": window_id})
+        finally:
+            done.set(); thread.join(5)
+            with backend.dpi_aware():
+                backend.user32.SetCursorPos(original_cursor["x"], original_cursor["y"])
+                if original_foreground and backend.is_window(original_foreground):
+                    backend.focus(original_foreground)
 
 
 def main() -> None:
