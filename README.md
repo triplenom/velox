@@ -107,7 +107,7 @@ The dashboard keeps the existing native layout: four summary cards, Chat/Agent/I
 
 ### Computer Use
 
-**Computer Use** is a per-chat toggle in **NEW CHAT SETTINGS**. It is off by default, is saved with the chat (copies and branches keep it), and locks with the other tool choices when the first message is sent. The composer's tool summary always shows the state: `… - Computer Use: Off`, or `Computer Use: On` in amber.
+**Computer Use** is a per-chat toggle in **NEW CHAT SETTINGS**, labelled **PC Control** there. It is off by default, is saved with the chat (copies and branches keep it), and locks with the other tool choices when the first message is sent. The composer's tool summary always shows the state: `… - Computer Use: Off`, or `Computer Use: On` in amber.
 
 - **Off:** no desktop-control tools are advertised or executable, and the system prompt tells the model to leave your mouse, keyboard, window focus and clipboard alone. That includes not using shell, Python, terminals or automation utilities to do it, and not opening visible GUI windows unless you ask. (No previously existing tool drove the mouse or keyboard; `desktop_screenshot` is a read-only capture and stays under System.)
 - **On:** nine Windows-only `computer_*` tools are available (see below), and the prompt tells the model to use only those tools for input, to capture and inspect the screen before and after acting, and to avoid sensitive dialogs unless you asked.

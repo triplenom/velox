@@ -1,3 +1,15 @@
+# Unit test audit — release 335 (PC Control label, real-desktop validation)
+
+The NEW CHAT SETTINGS toggle for Computer Use now reads **PC Control**. Only that visible label changed; the `computer_use_enabled` key, prompts, tool summary and permission messages still say Computer Use. `ComputerUsePolicyTests.test_new_chat_settings_draws_computer_use_toggle_inside_card_and_click_persists` now expects "PC Control".
+
+Real-desktop validation (Windows 11, interactive session):
+- `VELOX_REAL_DESKTOP_INPUT_TESTS=1 python test_velox.py --test-class ComputerUseRealDesktopTests`: **passed**. It covers focus, window screenshot, click, Unicode/emoji typing, Backspace with repeat, a Ctrl+A chord, button click, drag and wheel. The test's first run failed on its own expectation: Tk 8.6 deletes an emoji as two UTF-16 units, so two Backspaces left "Hello é". The test now checks repeat on BMP text and also asserts that the Ctrl+A chord arrives. No tool change was needed.
+- A separate end-to-end script drove a private Tk window through `ToolRegistry.execute_tool_call`: **18/18 checks passed**.
+  - Permissions: a PC Control-off chat advertises no `computer_*` tools, and its call is refused without moving the mouse.
+  - Tool calls: list, focus, screenshot size, click, exact Unicode/newline/tab typing, Ctrl+A replace, and a double-click giving two button presses.
+  - Circuit breaker: a real Ctrl+P+End chord, injected while `computer_type_text` was typing 3,000 characters, was seen by the global `GetAsyncKeyState` monitor. Typing stopped after 120 characters; the running chat was paused on the event-loop thread; one notification was shown; no keys were left held; and the next action succeeded.
+- Full suite: 2,591 run, 1 failure (the same pre-existing `Release316PresentationTests` card-order failure), 5 skipped.
+
 # Unit test audit — release 334 (Computer Use)
 
 Release 334 adds a per-chat **Computer Use** permission, nine `computer_*` desktop tools and the global **Ctrl+P+End** circuit breaker. No test was deleted. The following tests were updated because the contract they pin changed by request:
@@ -22,7 +34,7 @@ The Computer Use Off prompt section is kept short so the existing 13,500-charact
 - `python test_velox.py`: **2,591 confirmed tests run, 1 failure, 5 skipped**, 1,067 s. The single failure, `Release316PresentationTests.test_card_order_and_compact_mockup_weights_are_consistent`, fails identically on the unmodified release-333 checkout (2,557 run, same failure, 4 skipped). It concerns Dashboard cost-card ordering and is unrelated to this change. The extra skip is the opt-in real-desktop test.
 - Real Win32 backend, read-only checks on the live desktop: window enumeration, a window capture matching the screen pixel-for-pixel at the reported origin, virtual-screen and cursor queries, the hotkey monitor thread, and acceptance of the `SendInput` structure (40 bytes on x64) through a zero-distance mouse move. The cursor and foreground window were unchanged afterwards.
 - Offscreen SDL captures of the real UI (`SDL_VIDEO_DRIVER=offscreen`, software renderer): the NEW CHAT SETTINGS card with Computer Use off and on, the composer summary for locked On/Off chats, and the circuit-breaker notification.
-- **Not verified:** real mouse/keyboard injection and focus switching on a live desktop (the opt-in test was not run, to avoid taking over an in-use desktop); the physical Ctrl+P+End press (detection was exercised through the same `poll_once` path with simulated key state); and Linux/macOS, where Computer Use tools report that they are Windows-only and only the in-window breaker exists.
+- **Not verified in release 334:** real mouse/keyboard injection and the live Ctrl+P+End press. Both were verified in release 335 (see above). Linux and macOS remain unverified; there, Computer Use tools report that they are Windows-only and only the in-window breaker exists.
 
 # Unit test audit — release 328 (config.json)
 

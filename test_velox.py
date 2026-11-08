@@ -51213,7 +51213,7 @@ class ComputerUsePolicyTests(_StorageFixture):
             self.assertTrue(panel._draw_new_chat_task_settings(view))
         self.assertEqual(len(calls), 7)
         key, rect, label, value, tooltip = calls[-1]
-        self.assertEqual((key, label, value), ("chat.task_setup.computer_use_enabled", "Computer Use", False))
+        self.assertEqual((key, label, value), ("chat.task_setup.computer_use_enabled", "PC Control", False))
         self.assertIn("Ctrl+P+End", tooltip)
         card = cards[0]
         for _key, toggle_rect, *_rest in calls:
@@ -51644,9 +51644,14 @@ class ComputerUseRealDesktopTests(_StorageFixture):
             run(tools.type_text, {"text": "Hello \u00e9\U0001F600", "window_id": window_id})
             time.sleep(0.3)
             self.assertEqual(state["text"], "Hello \u00e9\U0001F600")
+            # Tk 8.6 edits astral characters as two UTF-16 units, so check repeat on BMP text.
+            run(tools.type_text, {"text": "xy", "window_id": window_id})
             run(tools.key_press, {"keys": "backspace", "repeat": 2, "window_id": window_id})
             time.sleep(0.3)
-            self.assertEqual(state["text"], "Hello ")
+            self.assertEqual(state["text"], "Hello \u00e9\U0001F600")
+            run(tools.key_press, {"keys": "ctrl+a", "window_id": window_id})
+            time.sleep(0.3)
+            self.assertTrue(state.get("ctrl_a"), "modifier chord must reach the window")
             origin_x, origin_y = state["root"].winfo_rootx() - int(match[0]["x"]), state["root"].winfo_rooty() - int(match[0]["y"])
             run(tools.mouse_click, {"x": origin_x + 70, "y": origin_y + 80, "window_id": window_id})
             time.sleep(0.3)

@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 334
+CURRENT_VERSION = 335
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -606,6 +606,9 @@ OPTIONAL_LEGACY_TOOL_FEATURE_KEYS = frozenset({COMPUTER_USE_FEATURE_KEY})
 # focus, screen capture with input coordinates or simulated mouse/keyboard input
 # uses this prefix and belongs only to the Computer Use category.
 COMPUTER_USE_TOOL_PREFIX = "computer_"
+# Visible NEW CHAT SETTINGS toggle text that differs from the category label
+# used in prompts, the tool summary and permission messages.
+NEW_CHAT_SETTINGS_TOGGLE_LABELS: dict[str, str] = {COMPUTER_USE_FEATURE_KEY: "PC Control"}
 # The global circuit breaker: hold Ctrl, P and End together (any order).
 CIRCUIT_BREAKER_HOTKEY_LABEL = "Ctrl+P+End"
 
@@ -82879,7 +82882,7 @@ class Panels:
             current = bool(features.get(key, False))
             next_value = self.widgets.toggle(
                 f"chat.task_setup.{key}", toggle_rect,
-                label, current, tooltip=tooltip_by_key[key],
+                NEW_CHAT_SETTINGS_TOGGLE_LABELS.get(key, label), current, tooltip=tooltip_by_key[key],
             )
             if next_value != current:
                 saved = self.services.chats.set_chat_feature(APP_SCOPE_ID, cid, key, next_value)
