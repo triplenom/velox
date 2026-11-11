@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 337
+CURRENT_VERSION = 338
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -13140,8 +13140,41 @@ def format_compact_duration_seconds(value: Any) -> str:
     return f"{hours}h {minutes}m {remaining:.0f}s"
 
 
+VISIBLE_TEXT_BOUNDS_MEMO_MAX = 4096
+
+
 def visible_text_vertical_bounds(font: Any, text: str) -> tuple[int, int]:
-    """Return top/bottom pixel bounds of visible glyph ink relative to draw y."""
+    """Return top/bottom pixel bounds of visible glyph ink relative to draw y.
+
+    Labels are measured every frame, so results are memoized per font and
+    invalidated when its atlas revision, glyph count or line height changes.
+    """
+    text = str(text or "")
+    glyphs = getattr(font, "glyphs", None)
+    revision = (
+        int(getattr(font, "_atlas_revision", 0) or 0),
+        len(glyphs) if isinstance(glyphs, dict) else -1,
+        int(getattr(font, "line_h", 1) or 1),
+    )
+    memo = getattr(font, "_visible_bounds_memo", None)
+    if not (isinstance(memo, tuple) and len(memo) == 2 and memo[0] == revision):
+        memo = (revision, {})
+        try:
+            font._visible_bounds_memo = memo
+        except Exception:
+            return _visible_text_vertical_bounds_uncached(font, text)
+    values = memo[1]
+    hit = values.get(text)
+    if hit is not None:
+        return hit
+    result = _visible_text_vertical_bounds_uncached(font, text)
+    if len(values) >= VISIBLE_TEXT_BOUNDS_MEMO_MAX:
+        values.clear()
+    values[text] = result
+    return result
+
+
+def _visible_text_vertical_bounds_uncached(font: Any, text: str) -> tuple[int, int]:
     line_h = max(1, int(getattr(font, "line_h", 1) or 1))
     glyphs = getattr(font, "glyphs", {})
     fallback_map = getattr(font, "fallback_map", FONT_FALLBACK_MAP if "FONT_FALLBACK_MAP" in globals() else {})
@@ -62573,6 +62606,127 @@ class UIInput:
         self.select_all = False
 
 
+def sdl_line_pixels(x1: int, y1: int, x2: int, y2: int) -> list[tuple[int, int]]:
+    """Pixels SDL3's default (points/Bresenham) line method lights, endpoints included."""
+    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    if x1 == x2 or y1 == y2:
+        return [(x, y) for y in range(min(y1, y2), max(y1, y2) + 1)
+                for x in range(min(x1, x2), max(x1, x2) + 1)]
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+    if dx >= dy:
+        count, d, inc1, inc2 = dx + 1, 2 * dy - dx, dy * 2, (dy - dx) * 2
+        xi1, xi2, yi1, yi2 = 1, 1, 0, 1
+    else:
+        count, d, inc1, inc2 = dy + 1, 2 * dx - dy, dx * 2, (dx - dy) * 2
+        xi1, xi2, yi1, yi2 = 0, 1, 1, 1
+    if x1 > x2:
+        xi1, xi2 = -xi1, -xi2
+    if y1 > y2:
+        yi1, yi2 = -yi1, -yi2
+    x, y = x1, y1
+    out: list[tuple[int, int]] = []
+    for _ in range(count):
+        out.append((x, y))
+        if d < 0:
+            d += inc1
+            x += xi1
+            y += yi1
+        else:
+            d += inc2
+            x += xi2
+            y += yi2
+    return out
+
+
+def rounded_fill_mask(radius: int) -> bytes:
+    """Alpha mask, (2r+1) square, matching the per-pixel rounded-strip fill.
+
+    The corner rows reproduce Renderer._rounded_rect_strips for one-pixel strips;
+    the centre row/column is the stretchable middle of a nine-slice draw.
+    """
+    r = max(1, int(radius))
+    size = 2 * r + 1
+    rr = r * r
+    mask = bytearray(size * size)
+    for row in range(size):
+        mid = float(row)
+        if mid < r:
+            dy = r - mid - 0.5
+            dx = int(max(0, r - math.sqrt(max(0.0, rr - dy * dy))))
+        elif mid >= size - r:
+            dy = mid - (size - r) + 0.5
+            dx = int(max(0, r - math.sqrt(max(0.0, rr - dy * dy))))
+        else:
+            dx = 0
+        width = max(1, size - 2 * dx)
+        start = row * size + dx
+        mask[start:start + width] = b"\xff" * width
+    return bytes(mask)
+
+
+def rounded_outline_mask(radius: int) -> bytes:
+    """Alpha mask, (2r+1) square, of the one-pixel rounded outline.
+
+    Uses the same straight edges and polyline arc approximation as the previous
+    per-frame SDL_RenderLine path, so a nine-slice draw is pixel-equivalent.
+    """
+    r = max(2, int(radius))
+    size = 2 * r + 1
+    last = size - 1
+    mask = bytearray(size * size)
+
+    def plot(points: list[tuple[int, int]]) -> None:
+        for px, py in points:
+            if 0 <= px < size and 0 <= py < size:
+                mask[py * size + px] = 255
+
+    plot(sdl_line_pixels(r, 0, last - r, 0))
+    plot(sdl_line_pixels(r, last, last - r, last))
+    plot(sdl_line_pixels(0, r, 0, last - r))
+    plot(sdl_line_pixels(last, r, last, last - r))
+    samples = max(3, min(8, r // 2 + 2))
+    corners: list[list[tuple[int, int]]] = [[], [], [], []]
+    for i in range(samples + 1):
+        a = (math.pi / 2.0) * i / max(1, samples)
+        ca = int(round(math.cos(a) * r))
+        sa = int(round(math.sin(a) * r))
+        corners[0].append((r - ca, r - sa))
+        corners[1].append((last - r + ca, r - sa))
+        corners[2].append((r - ca, last - r + sa))
+        corners[3].append((last - r + ca, last - r + sa))
+    for pts in corners:
+        for a, b in zip(pts, pts[1:]):
+            if a != b:
+                plot(sdl_line_pixels(a[0], a[1], b[0], b[1]))
+    return bytes(mask)
+
+
+def dash_pattern_mask(dash: int, gap: int) -> bytes:
+    """One tile of a dashed rule drawn as SDL lines of length `dash` every dash+gap px."""
+    period = max(1, int(dash) + int(gap))
+    return bytes(255 if i <= int(dash) else 0 for i in range(period))
+
+
+def heavy_text_alpha(alpha: bytes, width: int, height: int, scale: float = 0.84, offset: int = 1) -> bytes:
+    """Coverage of a glyph drawn twice: once normally, once offset right at `scale` alpha.
+
+    Two same-colour blends combine as 1-(1-a)(1-b), which is what baking the
+    heavy weight into the atlas has to reproduce. Output is `width + offset` wide.
+    """
+    out_w = width + offset
+    out = bytearray(out_w * height)
+    lut = [int(round(v * scale)) for v in range(256)]
+    for y in range(height):
+        row = alpha[y * width:(y + 1) * width]
+        base = y * out_w
+        for x in range(out_w):
+            a = row[x] if x < width else 0
+            b = lut[row[x - offset]] if 0 <= x - offset < width else 0
+            out[base + x] = 255 - ((255 - a) * (255 - b) + 127) // 255
+    return bytes(out)
+
+
 @dataclass(slots=True)
 class DrawCommand:
     kind: str
@@ -63501,6 +63655,8 @@ class Renderer:
                 self._render_outline_rect(*args)
             elif kind == "line":
                 self._render_line(*args)
+            elif kind == "dashed_hline":
+                self._render_dashed_hline(*args)
             elif kind == "ring":
                 self._render_ring(*args)
             elif kind == "text":
@@ -63707,6 +63863,21 @@ class Renderer:
         bottom = max(iy1, iy2) + 2
         if self._visible_bounds_for_record(left, top, max(1, right - left), max(1, bottom - top)):
             self._append_draw_command(overlay, "line", (ix1, iy1, ix2, iy2, color))
+
+    def draw_dashed_hline(self, x: int | float, y: int | float, width: int, color: Color, *, dash: int, gap: int, overlay: bool = False) -> None:
+        """Record a dashed horizontal rule as one command.
+
+        Pixels match a run of draw_line(x, y, x + dash, y) calls every dash+gap
+        pixels, but submission is one tiled-texture draw instead of one SDL
+        call (and one Python command object) per dash.
+        """
+        ix = int(round(x))
+        iy = int(round(y))
+        w = int(width)
+        if w <= 0:
+            return
+        if self._visible_bounds_for_record(ix - 1, iy - 1, w + 3, 3):
+            self._append_draw_command(overlay, "dashed_hline", (ix, iy, w, color, max(1, int(dash)), max(0, int(gap))))
 
     def draw_ring(
         self,
@@ -63941,8 +64112,207 @@ class Renderer:
             fr = self._to_frect(r)
             sdl.SDL_RenderFillRect(self.host.renderer, ctypes.byref(fr))
 
+    # -- Shape textures -----------------------------------------------------
+    # Rounded cards used to be submitted as dozens of strips or line segments,
+    # each a separate Python -> ctypes -> SDL call. Masks are now uploaded once
+    # per radius and drawn as a single nine-slice copy or one geometry call.
+
+    def _shape_textures_supported(self) -> bool:
+        cached = getattr(self, "_shape_textures_ok", None)
+        if cached is None:
+            cached = bool(
+                sdl is not None and getattr(self.host, "renderer", None)
+                and all(hasattr(sdl, name) for name in (
+                    "SDL_CreateSurfaceFrom", "SDL_CreateTextureFromSurface", "SDL_DestroySurface",
+                    "SDL_SetTextureColorMod", "SDL_SetTextureAlphaMod", "SDL_FRect",
+                ))
+            )
+            self._shape_textures_ok = cached
+        return bool(cached)
+
+    def _mask_texture(self, key: str, alpha: bytes, width: int, height: int) -> Any | None:
+        """Return a cached white RGBA texture whose alpha channel is `alpha`."""
+        textures = self.textures
+        texture = textures.get(key)
+        if texture is not None:
+            return texture
+        failed = getattr(self, "_mask_texture_failures", None)
+        if failed is None:
+            failed = set()
+            self._mask_texture_failures = failed
+        if key in failed or not self._shape_textures_supported():
+            return None
+        texture = None
+        try:
+            rgba = bytearray(b"\xff" * (width * height * 4))
+            rgba[3::4] = alpha
+            buffer = ctypes.create_string_buffer(bytes(rgba))
+            fmt = getattr(sdl, "SDL_PIXELFORMAT_RGBA32", getattr(sdl, "SDL_PIXELFORMAT_ABGR8888", 0))
+            surface = sdl.SDL_CreateSurfaceFrom(width, height, fmt, ctypes.cast(buffer, ctypes.c_void_p), width * 4)
+            if surface:
+                try:
+                    texture = sdl.SDL_CreateTextureFromSurface(self.host.renderer, surface)
+                finally:
+                    sdl.SDL_DestroySurface(surface)
+            if texture:
+                if hasattr(sdl, "SDL_SetTextureBlendMode"):
+                    sdl.SDL_SetTextureBlendMode(texture, getattr(sdl, "SDL_BLENDMODE_BLEND", 1))
+                if hasattr(sdl, "SDL_SetTextureScaleMode"):
+                    # Corners and dashes are copied 1:1; only uniform middle
+                    # texels are stretched, so nearest keeps edges exact.
+                    sdl.SDL_SetTextureScaleMode(texture, getattr(sdl, "SDL_SCALEMODE_NEAREST", 0))
+        except Exception:
+            texture = None
+        if not texture:
+            failed.add(key)
+            return None
+        textures[key] = texture
+        self.texture_sizes[key] = (int(width), int(height))
+        return texture
+
+    def _tint_texture(self, key: str, texture: Any, color: Color) -> None:
+        """Set colour/alpha modulation only when it differs from the last draw."""
+        tint = (color.r & 255, color.g & 255, color.b & 255, color.a & 255)
+        state = getattr(self, "_texture_tint_state", None)
+        if state is None:
+            state = {}
+            self._texture_tint_state = state
+        if state.get(key) == tint:
+            return
+        sdl.SDL_SetTextureColorMod(texture, tint[0], tint[1], tint[2])
+        sdl.SDL_SetTextureAlphaMod(texture, tint[3])
+        state[key] = tint
+
+    def _rounded_mask(self, kind: str, radius: int) -> tuple[str, Any] | None:
+        if not hasattr(sdl, "SDL_RenderTexture9Grid"):
+            return None
+        key = f"shape_mask:{kind}:{int(radius)}"
+        size = 2 * int(radius) + 1
+        texture = self.textures.get(key)
+        if texture is None:
+            alpha = rounded_fill_mask(radius) if kind == "fill" else rounded_outline_mask(radius)
+            texture = self._mask_texture(key, alpha, size, size)
+        return (key, texture) if texture is not None else None
+
+    def _render_nine_slice_mask(self, kind: str, rect: Rect, radius: int, color: Color) -> bool:
+        mask = self._rounded_mask(kind, radius)
+        if mask is None:
+            return False
+        key, texture = mask
+        self._tint_texture(key, texture, color)
+        edge = float(radius)
+        dst = sdl.SDL_FRect(float(rect.x), float(rect.y), float(rect.w), float(rect.h))
+        sdl.SDL_RenderTexture9Grid(self.host.renderer, texture, None, edge, edge, edge, edge, 1.0, ctypes.byref(dst))
+        return True
+
+    def _grid_indices(self, columns: int, rows: int) -> Any:
+        """Index buffer for a (columns x rows) vertex grid, cached per shape."""
+        cache = getattr(self, "_grid_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._grid_index_cache = cache
+        key = (int(columns), int(rows))
+        indices = cache.get(key)
+        if indices is None:
+            values: list[int] = []
+            for row in range(rows - 1):
+                for col in range(columns - 1):
+                    a = row * columns + col
+                    b = a + 1
+                    c = a + columns + 1
+                    d = a + columns
+                    values.extend((a, b, c, a, c, d))
+            indices = (ctypes.c_int * len(values))(*values)
+            cache[key] = indices
+        return indices
+
+    def _render_vertical_gradient_grid(
+        self, rect: Rect, top: Color, bottom: Color, texture: Any | None, radius: int,
+    ) -> None:
+        """One SDL_RenderGeometry call with per-row colours.
+
+        With a rounded mask the grid has nine cells (fixed corners, stretched
+        edges); vertex colours interpolate the gradient across the full height.
+        """
+        x0, y0, w, h = float(rect.x), float(rect.y), float(rect.w), float(rect.h)
+        if texture is not None:
+            r = float(radius)
+            size = 2.0 * r + 1.0
+            xs = (x0, x0 + r, x0 + w - r, x0 + w)
+            ys = (y0, y0 + r, y0 + h - r, y0 + h)
+            uv = (0.0, r / size, (r + 1.0) / size, 1.0)
+        else:
+            xs = (x0, x0 + w)
+            ys = (y0, y0 + h)
+            uv = (0.0, 1.0)
+        columns = len(xs)
+        rows = len(ys)
+        count = columns * rows
+        buffers = getattr(self, "_gradient_vertex_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self._gradient_vertex_buffers = buffers
+        vertices = buffers.get(count)
+        if vertices is None:
+            vertices = (sdl.SDL_Vertex * count)()
+            buffers[count] = vertices
+        tr, tg, tb, ta = top.r / 255.0, top.g / 255.0, top.b / 255.0, top.a / 255.0
+        dr, dg, db, da = (bottom.r - top.r) / 255.0, (bottom.g - top.g) / 255.0, (bottom.b - top.b) / 255.0, (bottom.a - top.a) / 255.0
+        index = 0
+        for row in range(rows):
+            vy = ys[row]
+            t = (vy - y0) / h if h > 0 else 0.0
+            cr, cg, cb, ca = tr + dr * t, tg + dg * t, tb + db * t, ta + da * t
+            v_coord = uv[row]
+            for col in range(columns):
+                vertex = vertices[index]
+                vertex.position.x = xs[col]
+                vertex.position.y = vy
+                vertex.color.r = cr
+                vertex.color.g = cg
+                vertex.color.b = cb
+                vertex.color.a = ca
+                vertex.tex_coord.x = uv[col]
+                vertex.tex_coord.y = v_coord
+                index += 1
+        indices = self._grid_indices(columns, rows)
+        sdl.SDL_RenderGeometry(self.host.renderer, texture, vertices, count, indices, len(indices))
+
+    def _gradient_geometry_supported(self) -> bool:
+        return bool(
+            hasattr(sdl, "SDL_RenderGeometry") and hasattr(sdl, "SDL_Vertex")
+            and self._shape_textures_supported() and self._text_geometry_backend_supported()
+        )
+
+    def _render_dashed_hline(self, x: int, y: int, width: int, color: Color, dash: int, gap: int) -> None:
+        if width <= 0:
+            return
+        period = max(1, dash + gap)
+        texture = None
+        key = f"dash_pattern:{dash}:{gap}"
+        if hasattr(sdl, "SDL_RenderTextureTiled"):
+            texture = self.textures.get(key) or self._mask_texture(key, dash_pattern_mask(dash, gap), period, 1)
+        if texture is None:
+            limit = x + width
+            start = x
+            while start < limit:
+                self._render_line(start, y, min(limit, start + dash), y, color)
+                start += period
+            return
+        # A dash starting at the right edge is never drawn; one ending there is
+        # (SDL lines include their last pixel), so the span covers that pixel
+        # unless a new period would begin exactly on it (with no gap, the
+        # previous dash still reaches it).
+        span = width + 1 if (width % period or gap <= 0) else width
+        self._tint_texture(key, texture, color)
+        dst = sdl.SDL_FRect(float(x), float(y), float(span), 1.0)
+        sdl.SDL_RenderTextureTiled(self.host.renderer, texture, None, 1.0, ctypes.byref(dst))
+
     def _render_gradient_rect(self, rect: Rect, top: Color, bottom: Color) -> None:
         if rect.w <= 0 or rect.h <= 0:
+            return
+        if self._gradient_geometry_supported():
+            self._render_vertical_gradient_grid(rect, top, bottom, None, 0)
             return
         steps = max(1, min(rect.h, 96))
         for i in range(steps):
@@ -63998,12 +64368,24 @@ class Renderer:
     def _render_round_rect(self, rect: Rect, radius: int, color: Color) -> None:
         if rect.w <= 0 or rect.h <= 0:
             return
+        r = int(clamp(radius, 0, max(0, min(rect.w, rect.h) // 2)))
+        if r <= 1:
+            self._render_fill_rect(rect, color)
+            return
+        if self._render_nine_slice_mask("fill", rect, r, color):
+            return
         strips = self._rounded_rect_strips(rect, radius)
         self._render_fill_rects(strips, color)
 
     def _render_round_gradient(self, rect: Rect, radius: int, top: Color, bottom: Color) -> None:
         if rect.w <= 0 or rect.h <= 0:
             return
+        if self._gradient_geometry_supported():
+            r = int(clamp(radius, 0, max(0, min(rect.w, rect.h) // 2)))
+            mask = self._rounded_mask("fill", r) if r > 1 else None
+            if r <= 1 or mask is not None:
+                self._render_vertical_gradient_grid(rect, top, bottom, mask[1] if mask else None, r)
+                return
         # performance: gradient rounded rects were previously one SDL call per
         # scanline. Large chat cards can be hundreds of pixels tall, so cap to a
         # visually smooth but much cheaper set of strips.
@@ -64025,6 +64407,8 @@ class Renderer:
         top = int(rect.y)
         bottom = int(rect.y + rect.h - 1)
         if right <= left or bottom <= top:
+            return
+        if self._render_nine_slice_mask("outline", rect, r, color):
             return
 
         # performance: rounded outlines used to draw dozens of one-pixel
@@ -64897,7 +65281,7 @@ class Renderer:
 
         font_weight = normalize_font_weight(getattr(font, "font_weight", "heavy"))
         light = font_weight == "light"
-        heavy = font_weight == "heavy"
+        heavy = font_weight == "heavy" and not bool(getattr(font, "_heavy_baked", False))
         if heavy:
             # Heavy UI text is a subtle second alpha pass, deliberately lighter
             # than the real bold atlas used for Markdown **bold**.
@@ -65087,15 +65471,68 @@ class FontAtlas:
         # compiling new geometry batches. Rebuilding the atlas clears the plans.
         self._glyph_geometry_plan_cache: dict[str, tuple[tuple[Any, ...], ...]] = {}
         self._atlas_revision: int = 0
+        # True when the atlas pixels already contain the heavy weight's second,
+        # offset pass. Draw paths then emit one quad per glyph instead of two.
+        self._heavy_baked: bool = False
         self.ready = False
 
     def set_font_weight(self, value: Any) -> bool:
-        """Apply a normalized draw-time weight and report whether it changed."""
+        """Apply a normalized weight and report whether it changed.
+
+        Light and regular are draw-time alpha choices. Heavy is baked into the
+        atlas, so switching into or out of it rebuilds a live atlas.
+        """
         normalized = normalize_font_weight(value)
         if normalized == self.font_weight:
             return False
+        previous = self.font_weight
         self.font_weight = normalized
+        if (previous == "heavy" or normalized == "heavy") and self.ready and self.texture:
+            if bool(getattr(self, "_heavy_baked", False)) != (normalized == "heavy"):
+                self.build()
         return True
+
+    def heavy_two_pass(self) -> bool:
+        """Whether heavy text must still be drawn as a second offset quad."""
+        return normalize_font_weight(getattr(self, "font_weight", "heavy")) == "heavy" and not bool(
+            getattr(self, "_heavy_baked", False)
+        )
+
+    def _bake_heavy_pixels(self, pixels: int, pitch: int, width: int, height: int,
+                           keep: list[tuple[int, int, int, int]]) -> bool:
+        """Bake the heavy weight into straight-RGBA pixels in place.
+
+        Every pixel becomes white with the two-pass coverage. Regions in `keep`
+        (colour emoji) are restored untouched. Requires Pillow; without it the
+        caller keeps the draw-time two-pass path.
+        """
+        try:
+            from PIL import Image, ImageChops  # type: ignore
+        except Exception:
+            return False
+        try:
+            raw = ctypes.string_at(pixels, pitch * height)
+            image = Image.frombuffer("RGBA", (width, height), raw, "raw", "RGBA", pitch, 1)
+            alpha = image.getchannel("A")
+            shifted = Image.new("L", (width, height), 0)
+            shifted.paste(alpha.crop((0, 0, max(1, width - int(FONT_HEAVY_X_OFFSET)), height)), (int(FONT_HEAVY_X_OFFSET), 0))
+            lut = [int(round(v * FONT_HEAVY_ALPHA_SCALE)) for v in range(256)]
+            combined = ImageChops.screen(alpha, shifted.point(lut))
+            white = Image.new("L", (width, height), 255)
+            baked = Image.merge("RGBA", (white, white, white, combined))
+            for x, y, w, h in keep:
+                if w > 0 and h > 0:
+                    baked.paste(image.crop((x, y, x + w, y + h)), (x, y))
+            data = baked.tobytes()
+            row = width * 4
+            if pitch == row:
+                ctypes.memmove(pixels, data, len(data))
+            else:
+                for y in range(height):
+                    ctypes.memmove(pixels + y * pitch, data[y * row:(y + 1) * row], row)
+            return True
+        except Exception:
+            return False
 
     def _ttf_style_flags(self, *, include_italic: bool = True) -> int:
         flags = 0
@@ -65118,6 +65555,7 @@ class FontAtlas:
             self.destroy()
         self._atlas_revision = int(getattr(self, "_atlas_revision", 0) or 0) + 1
         self._glyph_geometry_plan_cache.clear()
+        self._heavy_baked = False
         self._glyph_source_fonts.clear()
         self._glyph_scales.clear()
         self._color_glyphs.clear()
@@ -65648,12 +66086,32 @@ class FontAtlas:
                 self._remember_glyph_miss(ch)
                 return False
             ax, ay = self._atlas_free_slots[-1]
-            rect = sdl.SDL_Rect(ax, ay, width, height)
-            if not sdl.SDL_UpdateTexture(self.texture, ctypes.byref(rect),
-                    converted.contents.pixels, converted.contents.pitch):
+            upload_pixels = converted.contents.pixels
+            upload_pitch = converted.contents.pitch
+            upload_w = width
+            baked_buffer = None
+            bake = bool(getattr(self, "_heavy_baked", False)) and ch not in self._color_glyphs
+            if bake:
+                pad = int(FONT_HEAVY_X_OFFSET)
+                upload_w = width + pad
+                source = ctypes.string_at(converted.contents.pixels, int(converted.contents.pitch) * height)
+                padded = bytearray(upload_w * height * 4)
+                for row in range(height):
+                    start = row * int(converted.contents.pitch)
+                    padded[row * upload_w * 4:row * upload_w * 4 + width * 4] = source[start:start + width * 4]
+                baked_buffer = ctypes.create_string_buffer(bytes(padded))
+                if not self._bake_heavy_pixels(ctypes.addressof(baked_buffer), upload_w * 4, upload_w, height, []):
+                    self._remember_glyph_miss(ch)
+                    return False
+                upload_pixels = ctypes.cast(baked_buffer, ctypes.c_void_p)
+                upload_pitch = upload_w * 4
+            rect = sdl.SDL_Rect(ax, ay, upload_w, height)
+            if not sdl.SDL_UpdateTexture(self.texture, ctypes.byref(rect), upload_pixels, upload_pitch):
                 self._remember_glyph_miss(ch)
                 return False
             self.glyphs[ch] = self._atlas_glyph(ch, ax, ay, width, height)
+            if bake:
+                self.glyphs[ch].aw = upload_w
             self._atlas_free_slots.pop()
             self._atlas_revision += 1
             self._measure_cache.clear()
@@ -65764,6 +66222,17 @@ class FontAtlas:
                 except Exception:
                     pass
                 self.glyphs[ch] = self._atlas_glyph(ch, ax, ay, w, h)
+            if normalize_font_weight(self.font_weight) == "heavy":
+                surface_data = atlas_surface.contents
+                pixels = ctypes.cast(surface_data.pixels, ctypes.c_void_p).value
+                keep = [(g.ax, g.ay, g.aw, g.ah) for g in self.glyphs.values() if g.is_color]
+                if pixels and self._bake_heavy_pixels(pixels, int(surface_data.pitch), self.atlas_w, self.atlas_h, keep):
+                    # Each cell keeps a free column right of its glyph, so the
+                    # offset pass fits inside the cell.
+                    for glyph in self.glyphs.values():
+                        if not glyph.is_color and glyph.aw > 0:
+                            glyph.aw += int(FONT_HEAVY_X_OFFSET)
+                    self._heavy_baked = True
             self.texture = sdl.SDL_CreateTextureFromSurface(self.renderer.host.renderer, atlas_surface)
             if self.texture and hasattr(sdl, "SDL_GetTextureProperties") and hasattr(sdl, "SDL_GetNumberProperty"):
                 properties = sdl.SDL_GetTextureProperties(self.texture)
@@ -65880,7 +66349,7 @@ class FontAtlas:
         texture_enabled = bool(self.texture)
         font_weight = normalize_font_weight(getattr(self, "font_weight", "heavy"))
         light = font_weight == "light"
-        heavy = font_weight == "heavy"
+        heavy = font_weight == "heavy" and not bool(getattr(self, "_heavy_baked", False))
         base_color = Color(color.r, color.g, color.b, max(0, min(255, int(color.a * (FONT_LIGHT_ALPHA_SCALE if light else 1.0)))))
         heavy_color = Color(color.r, color.g, color.b, max(0, min(255, int(color.a * FONT_HEAVY_ALPHA_SCALE))))
         missing_glyph = glyphs.get("?") or Glyph("?", 0, 0, char_w, line_h, char_w)
@@ -69463,9 +69932,22 @@ class Widgets:
 
     def _single_line_text_h(self) -> int:
         # Glyph atlas line_h includes row leading. Use actual glyph height for visual centering in controls.
+        # The value depends only on the atlas, so it is memoized on the font and
+        # recomputed when the atlas revision, glyph count or line height changes.
+        # Scanning every atlas glyph per label used to dominate calendar frames.
+        font = self.font
         try:
-            heights = [g.ah for g in self.font.glyphs.values() if g and g.ah > 0]
-            return max(8, min(self.font.line_h, max(heights) if heights else self.font.line_h))
+            key = (int(getattr(font, "_atlas_revision", 0) or 0), len(font.glyphs), int(font.line_h))
+            cached = getattr(font, "_single_line_text_h_memo", None)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            heights = [g.ah for g in font.glyphs.values() if g and g.ah > 0]
+            value = max(8, min(font.line_h, max(heights) if heights else font.line_h))
+            try:
+                font._single_line_text_h_memo = (key, value)
+            except Exception:
+                pass
+            return value
         except Exception:
             return self.font.line_h
 
@@ -74245,11 +74727,7 @@ class Panels:
             self.r.draw_round_outline(content, 8, Palette.accent)
 
         def draw_dashed(y: int, color: Color, *, dash: int, gap: int) -> None:
-            x = content.x
-            limit = content.x + content.w
-            while x < limit:
-                self.r.draw_line(x, y, min(limit, x + dash), y, color)
-                x += dash + gap
+            self.r.draw_dashed_hline(content.x, y, content.w, color, dash=dash, gap=gap)
 
         self.r.push_clip(viewport)
         for hour in range(25):

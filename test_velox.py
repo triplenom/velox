@@ -48741,6 +48741,203 @@ class SoftwareTextRenderingTests(unittest.TestCase):
         fake.SDL_RenderTexture.assert_not_called()
 
 
+class RenderBatchingRegressionTests(unittest.TestCase):
+    """Batched shapes, dashes and baked heavy text must keep the old pixels."""
+
+    @staticmethod
+    def legacy_dash_pixels(x: int, width: int, dash: int, gap: int) -> set[int]:
+        pixels: set[int] = set()
+        start, limit = x, x + width
+        while start < limit:
+            pixels.update(px for px, _py in velox.sdl_line_pixels(start, 0, min(limit, start + dash), 0))
+            start += dash + gap
+        return pixels
+
+    def test_tiled_dash_pattern_reproduces_per_dash_lines(self) -> None:
+        for dash, gap in ((7, 5), (3, 7), (1, 1), (4, 0)):
+            pattern = velox.dash_pattern_mask(dash, gap)
+            period = dash + gap
+            for width in (1, 11, 12, 13, 24, 25, 199, 240, 241):
+                with self.subTest(dash=dash, gap=gap, width=width):
+                    span = width + 1 if (width % period or gap == 0) else width
+                    tiled = {10 + i for i in range(span) if pattern[i % period]}
+                    self.assertEqual(tiled, self.legacy_dash_pixels(10, width, dash, gap))
+
+    def test_dashed_rule_records_one_command_and_culls_offscreen(self) -> None:
+        renderer = velox.Renderer(SimpleNamespace(renderer=None, width=800, height=600, config={"ui": {}}))
+        renderer.draw_dashed_hline(10, 40, 500, velox.Palette.border, dash=7, gap=5)
+        renderer.draw_dashed_hline(10, 4000, 500, velox.Palette.border, dash=7, gap=5)
+        self.assertEqual([(c.kind, c.args[:3]) for c in renderer.commands], [("dashed_hline", (10, 40, 500))])
+        timeline = inspect.getsource(velox.Panels._draw_calendar_timeline)
+        self.assertIn("draw_dashed_hline", timeline)
+        self.assertNotIn("self.r.draw_line(x, y", timeline)
+
+    def test_rounded_fill_mask_matches_one_pixel_strips(self) -> None:
+        renderer = velox.Renderer(SimpleNamespace(renderer=None, config={"ui": {}}))
+        for radius in range(2, 25):
+            size = 2 * radius + 1
+            mask = velox.rounded_fill_mask(radius)
+            expected = set()
+            for strip in renderer._rounded_rect_strips(velox.Rect(0, 0, size, size), radius, steps=size):
+                expected.update((x, y) for y in range(strip.y, strip.y + strip.h) for x in range(strip.x, strip.x + strip.w))
+            actual = {(i % size, i // size) for i, a in enumerate(mask) if a}
+            self.assertEqual(actual, expected, radius)
+
+    def nine_slice(self, mask: bytes, radius: int, w: int, h: int) -> set[tuple[int, int]]:
+        size = 2 * radius + 1
+        def source(index: int, extent: int) -> int:
+            if index < radius:
+                return index
+            if index >= extent - radius:
+                return size - (extent - index)
+            return radius
+        return {(x, y) for y in range(h) for x in range(w) if mask[source(y, h) * size + source(x, w)]}
+
+    def legacy_outline_pixels(self, w: int, h: int, radius: int) -> set[tuple[int, int]]:
+        lines: list[tuple[int, int, int, int]] = []
+        renderer = velox.Renderer(SimpleNamespace(renderer=None, config={"ui": {}}))
+        renderer._render_line = lambda x1, y1, x2, y2, _color: lines.append((x1, y1, x2, y2))
+        renderer._render_nine_slice_mask = lambda *_args: False
+        renderer._render_round_outline(velox.Rect(0, 0, w, h), radius, velox.Palette.border)
+        return {p for line in lines for p in velox.sdl_line_pixels(*line)}
+
+    def test_rounded_outline_nine_slice_matches_previous_line_path(self) -> None:
+        for radius in (2, 3, 6, 7, 10, 14, 16, 18):
+            mask = velox.rounded_outline_mask(radius)
+            for w, h in ((2 * radius + 1, 2 * radius + 1), (2 * radius + 9, 2 * radius + 3), (300, 120)):
+                with self.subTest(radius=radius, w=w, h=h):
+                    self.assertEqual(self.nine_slice(mask, radius, w, h), self.legacy_outline_pixels(w, h, radius))
+
+    def fake_shape_sdl(self) -> SimpleNamespace:
+        class FRect(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_float) for name in ("x", "y", "w", "h")]
+        class Point(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_float), ("y", ctypes.c_float)]
+        class FColor(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_float) for name in ("r", "g", "b", "a")]
+        class Vertex(ctypes.Structure):
+            _fields_ = [("position", Point), ("color", FColor), ("tex_coord", Point)]
+        return SimpleNamespace(
+            SDL_FRect=FRect, SDL_Vertex=Vertex,
+            SDL_CreateSurfaceFrom=mock.Mock(return_value=object()), SDL_DestroySurface=mock.Mock(),
+            SDL_CreateTextureFromSurface=mock.Mock(side_effect=lambda *_a: object()),
+            SDL_SetTextureBlendMode=mock.Mock(), SDL_SetTextureScaleMode=mock.Mock(),
+            SDL_SetTextureColorMod=mock.Mock(), SDL_SetTextureAlphaMod=mock.Mock(),
+            SDL_RenderTexture9Grid=mock.Mock(), SDL_RenderTextureTiled=mock.Mock(),
+            SDL_RenderGeometry=mock.Mock(), SDL_RenderFillRect=mock.Mock(), SDL_RenderFillRects=mock.Mock(),
+            SDL_RenderLine=mock.Mock(), SDL_SetRenderDrawColor=mock.Mock(),
+            SDL_GetRendererName=mock.Mock(return_value=b"direct3d12"),
+        )
+
+    def test_rounded_shapes_and_dashes_are_single_sdl_draws(self) -> None:
+        fake = self.fake_shape_sdl()
+        renderer = velox.Renderer(SimpleNamespace(renderer=object(), config={"ui": {}}))
+        card = velox.Rect(10, 20, 400, 900)
+        with mock.patch.object(velox, "sdl", fake):
+            renderer._render_round_rect(card, 14, velox.Color(1, 2, 3, 200))
+            renderer._render_round_outline(card, 14, velox.Color(4, 5, 6, 255))
+            renderer._render_round_gradient(card, 14, velox.Color(10, 10, 10), velox.Color(30, 30, 30))
+            renderer._render_gradient_rect(card, velox.Color(9, 9, 14), velox.Color(15, 14, 23))
+            renderer._render_dashed_hline(10, 50, 300, velox.Color(80, 80, 80, 105), 7, 5)
+            renderer._render_round_rect(card, 14, velox.Color(1, 2, 3, 200))
+        self.assertEqual(fake.SDL_RenderTexture9Grid.call_count, 3)
+        self.assertEqual(fake.SDL_RenderGeometry.call_count, 2)
+        self.assertEqual(fake.SDL_RenderTextureTiled.call_count, 1)
+        for unused in (fake.SDL_RenderFillRect, fake.SDL_RenderFillRects, fake.SDL_RenderLine):
+            unused.assert_not_called()
+        # Fill, outline and dash masks upload once; the repeated fill reuses its
+        # texture and its unchanged tint costs no further SDL state calls.
+        self.assertEqual(fake.SDL_CreateTextureFromSurface.call_count, 3)
+        self.assertEqual(fake.SDL_SetTextureColorMod.call_count, 3)
+        args = fake.SDL_RenderTexture9Grid.call_args_list[0].args
+        self.assertEqual(args[3:8], (14.0, 14.0, 14.0, 14.0, 1.0))
+        rounded_gradient = fake.SDL_RenderGeometry.call_args_list[0].args
+        self.assertEqual((rounded_gradient[3], rounded_gradient[5]), (16, 54))
+
+    def test_shapes_fall_back_to_legacy_strips_without_nine_slice_support(self) -> None:
+        fake = self.fake_shape_sdl()
+        del fake.SDL_RenderTexture9Grid
+        renderer = velox.Renderer(SimpleNamespace(renderer=object(), config={"ui": {}}))
+        with mock.patch.object(velox, "sdl", fake):
+            renderer._render_round_rect(velox.Rect(0, 0, 80, 40), 10, velox.Color(1, 2, 3))
+        fake.SDL_RenderFillRects.assert_called_once()
+
+    def test_heavy_alpha_bake_matches_two_same_colour_blends(self) -> None:
+        alpha = bytes([0, 40, 255, 128, 7, 0, 200, 90])
+        baked = velox.heavy_text_alpha(alpha, 4, 2)
+        for y in range(2):
+            for x in range(5):
+                a = alpha[y * 4 + x] / 255 if x < 4 else 0.0
+                b = (round(alpha[y * 4 + x - 1] * velox.FONT_HEAVY_ALPHA_SCALE) / 255) if x >= 1 else 0.0
+                self.assertAlmostEqual(baked[y * 5 + x] / 255, 1 - (1 - a) * (1 - b), delta=1 / 255)
+
+    def test_atlas_bake_matches_reference_and_keeps_colour_glyphs(self) -> None:
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow unavailable")
+        width, height = 6, 2
+        alpha = [0, 60, 255, 30, 0, 0, 10, 200, 0, 0, 0, 0]
+        rgba = bytearray()
+        for value in alpha:
+            rgba += bytes((255, 255, 255, value))
+        rgba[(1 * width + 5) * 4:(1 * width + 5) * 4 + 4] = bytes((10, 20, 30, 77))  # colour glyph pixel
+        buffer = ctypes.create_string_buffer(bytes(rgba))
+        font = velox.FontAtlas(velox.Renderer(SimpleNamespace(renderer=None, config={"ui": {}})), "", 16)
+        self.assertTrue(font._bake_heavy_pixels(ctypes.addressof(buffer), width * 4, width, height, [(5, 1, 1, 1)]))
+        out = buffer.raw[:width * height * 4]
+        reference = velox.heavy_text_alpha(bytes(alpha[:width - 1] + alpha[width:2 * width - 1]), width - 1, height)
+        for y in range(height):
+            for x in range(width):
+                if (x, y) == (5, 1):
+                    self.assertEqual(out[(y * width + x) * 4:(y * width + x) * 4 + 4], bytes((10, 20, 30, 77)))
+                    continue
+                self.assertEqual(out[(y * width + x) * 4:(y * width + x) * 4 + 3], b"\xff\xff\xff")
+                self.assertAlmostEqual(out[(y * width + x) * 4 + 3], reference[y * width + x], delta=1)
+
+    def test_baked_heavy_font_draws_one_quad_per_glyph(self) -> None:
+        renderer = velox.Renderer(SimpleNamespace(renderer=object(), config={"ui": {}}))
+        font = velox.FontAtlas(renderer, "", 16, font_weight="heavy")
+        font.texture = object()
+        font.atlas_w = font.atlas_h = 256
+        font.glyphs = {chr(cp): velox.Glyph(chr(cp), cp, 0, 9, 16, 8) for cp in range(32, 127)}
+        self.assertTrue(font.heavy_two_pass())
+        self.assertEqual(len(font.layout_text_to_quads("AB", 0, 0, velox.Palette.text)), 4)
+        font._heavy_baked = True
+        self.assertFalse(font.heavy_two_pass())
+        quads = font.layout_text_to_quads("AB", 0, 0, velox.Palette.text)
+        self.assertEqual([(q.char, q.w, q.color.a) for q in quads], [("A", 9.0, 255), ("B", 9.0, 255)])
+
+    def test_font_weight_change_rebuilds_atlas_only_across_heavy(self) -> None:
+        font = velox.FontAtlas(velox.Renderer(SimpleNamespace(renderer=None, config={"ui": {}})), "", 16, font_weight="heavy")
+        font.ready, font.texture, font._heavy_baked = True, object(), True
+        with mock.patch.object(font, "build") as build:
+            self.assertTrue(font.set_font_weight("light"))
+            build.assert_called_once()
+            font._heavy_baked = False
+            self.assertTrue(font.set_font_weight("regular"))
+            build.assert_called_once()
+            self.assertTrue(font.set_font_weight("heavy"))
+            self.assertEqual(build.call_count, 2)
+
+    def test_label_metrics_are_memoized_per_atlas_revision(self) -> None:
+        class CountingGlyphs(dict):
+            scans = 0
+            def values(self):  # type: ignore[override]
+                type(self).scans += 1
+                return super().values()
+        font = SimpleNamespace(line_h=30, _atlas_revision=1, fallback_map={},
+                               glyphs=CountingGlyphs({"A": velox.Glyph("A", 0, 0, 9, 20, 9, y_offset=4)}))
+        widgets = velox.Widgets.__new__(velox.Widgets)
+        widgets.font = font
+        self.assertEqual([widgets._single_line_text_h() for _ in range(50)], [20] * 50)
+        self.assertEqual(CountingGlyphs.scans, 1)
+        self.assertEqual(velox.visible_text_vertical_bounds(font, "A"), (4, 24))
+        font.glyphs["A"] = velox.Glyph("A", 0, 0, 9, 24, 9, y_offset=2)
+        font._atlas_revision = 2
+        self.assertEqual(widgets._single_line_text_h(), 24)
+        self.assertEqual(velox.visible_text_vertical_bounds(font, "A"), (2, 26))
+
 class EmojiRenderingRegressionTests(unittest.TestCase):
     """Exercise glyph selection, metrics and submitted RGBA without a display."""
 
