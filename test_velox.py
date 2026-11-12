@@ -31,6 +31,7 @@ import json
 import math
 import platform
 import os
+import random
 import re
 import shutil
 import socket
@@ -49247,6 +49248,140 @@ class EmojiRenderingRegressionTests(unittest.TestCase):
         self.assertEqual([row.width for row in rows], [20, 20, 20])
         self.assertEqual("".join(row.text for row in rows), text)
 
+
+class MultilineWrapIncrementalTests(unittest.TestCase):
+    """Editor wrapping stays exact while editing re-wraps only what changed."""
+
+    @staticmethod
+    def advance(ch: str) -> int:
+        return 0 if ch in "\ufe0f\u200d" else 4 + (ord(ch) % 7)
+
+    @classmethod
+    def reference_rows(cls, text: str, max_width: int) -> list[tuple[str, int, int, int]]:
+        """The pre-v339 algorithm: one greedy pass over the whole buffer."""
+        rows: list[tuple[str, int, int, int]] = []
+        length = len(text)
+        line_start = 0
+        while line_start <= length:
+            newline = text.find("\n", line_start)
+            line_end = length if newline < 0 else newline
+            if line_end == line_start:
+                rows.append(("", line_start, line_start, 0))
+            else:
+                position = line_start
+                while position < line_end:
+                    scan, used, last_break, width_at_break, saw_nonspace = position, 0, -1, 0, False
+                    while scan < line_end:
+                        ch = text[scan]
+                        adv = cls.advance(ch)
+                        if scan > position and used + adv > max_width:
+                            break
+                        used += adv
+                        scan += 1
+                        if ch.isspace():
+                            if saw_nonspace:
+                                last_break, width_at_break = scan, used
+                        else:
+                            saw_nonspace = True
+                    if scan < line_end and last_break > position:
+                        row_end, row_width = last_break, width_at_break
+                    else:
+                        row_end, row_width = max(position + 1, scan), used
+                    rows.append((text[position:row_end], position, row_end, int(row_width)))
+                    position = row_end
+            if newline < 0:
+                break
+            line_start = line_end + 1
+        return rows or [("", 0, 0, 0)]
+
+    def widgets(self) -> Any:
+        widgets = velox.Widgets.__new__(velox.Widgets)
+        widgets.font = SimpleNamespace(font_size=16, char_w=8, line_h=20, _atlas_revision=1, glyphs={})
+        widgets._wrap_cache = {}
+        widgets._font_char_advance = lambda _font, ch: self.advance(ch)
+        return widgets
+
+    @staticmethod
+    def plain(rows: Iterable[Any]) -> list[tuple[str, int, int, int]]:
+        return [(row.text, row.start, row.end, row.width) for row in rows]
+
+    def test_common_prefix_and_suffix_lengths(self) -> None:
+        self.assertEqual(velox.common_prefix_length("abcdef", "abcxef"), 3)
+        self.assertEqual(velox.common_prefix_length("abc", "abcdef"), 3)
+        self.assertEqual(velox.common_prefix_length("", "abc"), 0)
+        self.assertEqual(velox.common_suffix_length("abcdef", "abxdef", 10), 3)
+        self.assertEqual(velox.common_suffix_length("aaaa", "aaaaa", 2), 2)
+        self.assertEqual(velox.common_suffix_length("abc", "xyz", 3), 0)
+
+    def test_random_edits_match_full_rewrap_exactly(self) -> None:
+        rng = random.Random(339)
+        words = ["alpha", "be", "gamma", "delta-epsilon", "x", "supercalifragilistic", " ", "  ", "\n", "\ufe0f", "\u00e9t\u00e9"]
+        alphabet = "abcdefghij klmnop,.-\u00e9\ufe0f\n"
+        for trial in range(18):
+            widgets = self.widgets()
+            pool = words if trial % 3 else [word for word in words if word != "\n"]
+            text = " ".join(rng.choice(pool) for _ in range(rng.randint(80, 700)))
+            for _step in range(25):
+                position = rng.randint(0, len(text))
+                choice = rng.random()
+                if choice < 0.5:
+                    text = text[:position] + rng.choice(alphabet) + text[position:]
+                elif choice < 0.75:
+                    text = text[:position] + text[position + rng.randint(1, 25):]
+                else:
+                    text = text[:position] + " ".join(rng.choice(words) for _ in range(rng.randint(1, 30))) + text[position:]
+                for width in (37, 160):
+                    with self.subTest(trial=trial, width=width):
+                        expected = self.reference_rows(text, width)
+                        self.assertEqual(self.plain(widgets._wrap_display_rows(text, width)), expected)
+                        self.assertEqual(widgets._wrap_row_count(text, width), len(expected))
+
+    def test_typing_rewraps_only_the_edited_line(self) -> None:
+        widgets = self.widgets()
+        lines = [f"line {i} " + "word " * (i % 9) for i in range(400)]
+        text = "\n".join(lines)
+        widgets._wrap_display_rows(text, 90)
+        wrapped: list[str] = []
+        original = widgets._wrap_line_compute
+        widgets._wrap_line_compute = lambda line, *args: (wrapped.append(line), original(line, *args))[1]
+        edited = text.replace("line 200 ", "line 200 typed ", 1)
+        self.assertEqual(self.plain(widgets._wrap_display_rows(edited, 90)), self.reference_rows(edited, 90))
+        self.assertEqual(wrapped, [lines[200].replace("line 200 ", "line 200 typed ", 1)])
+
+    def test_long_line_edit_reuses_rows_before_the_edit(self) -> None:
+        widgets = self.widgets()
+        line = " ".join(f"token{i}" for i in range(2000))
+        first = widgets._wrap_line_rows(line, 120, widgets._wrap_char_advances(widgets._wrap_font_key()), widgets._wrap_font_key())
+        middle = len(line) // 2
+        edited = line[:middle] + "Z" + line[middle:]
+        key = widgets._wrap_font_key()
+        second = widgets._wrap_line_rows(edited, 120, widgets._wrap_char_advances(key), key)
+        reused = sum(1 for a, b in zip(first, second) if a is b)
+        self.assertGreater(reused, len(first) // 3)
+        self.assertEqual([row[:4] for row in second],
+                         [(t, s, e, w) for t, s, e, w in self.reference_rows(edited, 120)])
+
+    def test_overflow_check_never_assembles_the_discarded_full_width_rows(self) -> None:
+        widgets = self.widgets()
+        text = "\n".join("some words on a line" for _ in range(300))
+        widths: list[int] = []
+        original = widgets._wrap_display_rows
+        widgets._wrap_display_rows = lambda value, width: (widths.append(width), original(value, width))[1]
+        rows, content_h = widgets._multiline_layout_rows(text, velox.Rect(0, 0, 400, 200))
+        self.assertEqual(widths, [400 - 14])
+        self.assertEqual(content_h, len(rows) * 20 + 10)
+        short_rows, _ = widgets._multiline_layout_rows("short", velox.Rect(0, 0, 400, 200))
+        self.assertEqual(widths[-1], 400 - 2)
+        self.assertEqual(self.plain(short_rows), self.reference_rows("short", 400 - 2))
+
+    def test_large_buffers_do_not_fill_the_wrap_cache_with_copies(self) -> None:
+        widgets = self.widgets()
+        text = "draft words " * 2000
+        for _ in range(60):
+            text += "a"
+            widgets._wrap_display_rows(text, 300)
+        self.assertEqual(widgets._wrap_cache, {})
+        self.assertLessEqual(len(widgets._wrap_cache_large), velox.TEXT_WRAP_CACHE_LARGE_ENTRIES)
 
 class MarkdownEmoticonTests(unittest.TestCase):
     """Common faces keep their mouths while ordinary Markdown remains styled."""

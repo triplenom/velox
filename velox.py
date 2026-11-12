@@ -293,7 +293,7 @@ def host_environment_prompt() -> str:
 
 
 APP_NAME = "Velox"
-CURRENT_VERSION = 338
+CURRENT_VERSION = 339
 BACKWARD_COMPATIBLE_VERSION = 316
 APP_VERSION = f"velox.v{CURRENT_VERSION}"
 SOURCE_REVISION = str(CURRENT_VERSION)
@@ -1171,6 +1171,51 @@ TABLE_CELL_PAD_Y = 13
 TABLE_MIN_COLUMN_WIDTH = 72
 SELECTION_EDGE_PAD_PX = 2
 TEXT_WRAP_CACHE_MAX_ENTRIES = 512
+# Whole-text wrap results for long editor buffers are kept in a small separate
+# cache: every keystroke produces a new buffer, and 512 copies of a large draft
+# (plus its rows) would hold tens of megabytes for no benefit.
+TEXT_WRAP_CACHE_LARGE_TEXT_CHARS = 4096
+TEXT_WRAP_CACHE_LARGE_ENTRIES = 8
+# Per-hard-line wrap results. Editing re-wraps only the changed line.
+TEXT_WRAP_LINE_CACHE_MAX_ENTRIES = 8192
+TEXT_WRAP_LINE_CACHE_CHAR_BUDGET = 2_000_000
+# Lines at least this long reuse the rows before and after an edit.
+TEXT_WRAP_INCREMENTAL_MIN_CHARS = 256
+# Same set as str.isspace() (Python's re uses the same Unicode table).
+TEXT_WRAP_SPACE_RE = re.compile(r"\s")
+
+
+def common_prefix_length(a: str, b: str) -> int:
+    """Length of the shared prefix, using C-level slice compares (O(log n) of them)."""
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def common_suffix_length(a: str, b: str, limit: int) -> int:
+    """Length of the shared suffix, capped at `limit` so it cannot overlap a prefix."""
+    la, lb = len(a), len(b)
+    n = min(la, lb, max(0, int(limit)))
+    if n <= 0:
+        return 0
+    if a[la - n:] == b[lb - n:]:
+        return n
+    lo, hi = 0, n
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[la - mid:la - lo] == b[lb - mid:lb - lo]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 def normalize_font_weight(value: Any) -> str:
     raw = str(value or "heavy").strip().lower().replace("_", "-")
@@ -70070,79 +70115,254 @@ class Widgets:
     def _cursor_from_x(self, text: str, x: int | float) -> int:
         return self._cursor_from_x_font(self.font, text, x)
 
+    def _wrap_font_key(self) -> tuple[Any, ...]:
+        """Identity of everything glyph advances depend on."""
+        font = self.font
+        glyphs = getattr(font, "glyphs", None)
+        return (
+            id(font), int(getattr(font, "font_size", 0) or 0),
+            int(getattr(font, "_atlas_revision", 0) or 0),
+            id(glyphs), len(glyphs) if isinstance(glyphs, dict) else -1,
+        )
+
+    def _wrap_char_advances(self, font_key: tuple[Any, ...]) -> dict[str, int]:
+        memo = getattr(self, "_wrap_advance_memo", None)
+        if memo is None or memo[0] != font_key:
+            memo = (font_key, {})
+            self._wrap_advance_memo = memo
+        return memo[1]
+
+    def _wrap_line_compute(
+        self, line: str, max_width: int, advances: dict[str, int],
+        previous: tuple[str, tuple[tuple[Any, ...], ...]] | None,
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Greedy word wrap of one hard line into relative rows.
+
+        Each row is (text, start, end, width, extent). `extent` is the last
+        index the row's decision examined (the overflowing character), or the
+        line length when the row ran to the end of the line. Given the previous
+        version of this line, rows whose extent lies in the unchanged prefix are
+        reused, and wrapping stops as soon as a row starts where an old row
+        started inside the unchanged suffix: greedy wrapping from a position
+        depends only on the text after it, so the remaining rows are identical.
+        """
+        length = len(line)
+        rows: list[tuple[Any, ...]] = []
+        position = 0
+        resync_from = length + 1
+        resync_delta = 0
+        resync_starts: dict[int, int] = {}
+        old_rows: tuple[tuple[Any, ...], ...] = ()
+        if previous is not None and length >= TEXT_WRAP_INCREMENTAL_MIN_CHARS:
+            old_line, old_rows = previous
+            prefix = common_prefix_length(old_line, line)
+            for row in old_rows:
+                if row[4] < prefix:
+                    rows.append(row)
+                    position = row[2]
+                else:
+                    break
+            suffix = common_suffix_length(old_line, line, min(len(old_line), length) - prefix)
+            if suffix > 0:
+                resync_from = length - suffix
+                resync_delta = length - len(old_line)
+                resync_starts = {row[1]: index for index, row in enumerate(old_rows)}
+        if position >= length:
+            return tuple(rows)
+        # Running widths and whitespace positions for the whole line, computed
+        # in C. Each row's overflow point and last word break are then binary
+        # searches instead of a Python loop over every character.
+        widths, spaces = self._wrap_line_metrics(line, advances)
+        bisect_right = bisect.bisect_right
+        bisect_left = bisect.bisect_left
+        while position < length:
+            if position >= resync_from:
+                index = resync_starts.get(position - resync_delta)
+                if index is not None:
+                    d = resync_delta
+                    rows.extend((t, s + d, e + d, w, x + d) for t, s, e, w, x in old_rows[index:])
+                    break
+            base = widths[position]
+            # The first character after `position` whose advance overflows the
+            # row ends it; the row always keeps at least one character, and
+            # zero-width selectors/joiners stay with the glyph they follow.
+            overflow = bisect_right(widths, base + max_width, position + 2) - 1
+            scan = overflow if overflow < length else length
+            row_end = scan
+            if scan < length:
+                # Last whitespace before the overflow that follows visible text.
+                space_index = bisect_left(spaces, scan) - 1
+                if space_index >= 0 and spaces[space_index] >= position:
+                    space = spaces[space_index]
+                    spaces_before = space_index - bisect_left(spaces, position)
+                    if spaces_before < space - position:
+                        row_end = space + 1
+            rows.append((line[position:row_end], position, row_end, int(widths[row_end] - base), scan))
+            position = row_end
+        return tuple(rows)
+
+    def _wrap_line_metrics(self, line: str, advances: dict[str, int]) -> tuple[list[int], list[int]]:
+        """Cumulative advances (len+1 entries) and whitespace indexes for one line."""
+        # The memo holds the advances table it was built from; a font change
+        # supplies a new table and therefore starts a fresh memo.
+        owner = getattr(self, "_wrap_metrics_memo", None)
+        if owner is None or owner[0] is not advances:
+            owner = (advances, {})
+            self._wrap_metrics_memo = owner
+        memo = owner[1]
+        key = line
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        missing = set(line).difference(advances)
+        if missing:
+            font = self.font
+            for ch in missing:
+                advances[ch] = self._font_char_advance(font, ch)
+        widths = [0]
+        widths.extend(itertools.accumulate(map(advances.__getitem__, line)))
+        spaces = [match.start() for match in TEXT_WRAP_SPACE_RE.finditer(line)]
+        result = (widths, spaces)
+        if len(memo) >= 8:
+            memo.pop(next(iter(memo)))
+        memo[key] = result
+        return result
+
+    def _wrap_line_rows(
+        self, line: str, max_width: int, advances: dict[str, int], font_key: tuple[Any, ...],
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Cached relative rows for one non-empty hard line."""
+        cache = getattr(self, "_wrap_line_cache", None)
+        if cache is None:
+            cache = {}
+            self._wrap_line_cache = cache
+            self._wrap_line_cache_chars = 0
+        key = (line, max_width, font_key)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        last = getattr(self, "_wrap_line_last", None)
+        if last is None:
+            last = {}
+            self._wrap_line_last = last
+        memo_key = (max_width, font_key)
+        rows = self._wrap_line_compute(line, max_width, advances, last.get(memo_key))
+        if len(line) >= TEXT_WRAP_INCREMENTAL_MIN_CHARS:
+            last[memo_key] = (line, rows)
+            if len(last) > 16:
+                last.pop(next(iter(last)))
+        chars = int(getattr(self, "_wrap_line_cache_chars", 0) or 0)
+        if len(cache) >= TEXT_WRAP_LINE_CACHE_MAX_ENTRIES or chars + len(line) > TEXT_WRAP_LINE_CACHE_CHAR_BUDGET:
+            stale = list(cache)[: max(1, len(cache) // 4)]
+            for stale_key in stale:
+                cache.pop(stale_key, None)
+                chars -= len(stale_key[0])
+            chars = max(0, chars)
+        cache[key] = rows
+        self._wrap_line_cache_chars = chars + len(line)
+        return rows
+
+    def _wrap_whole_text_cache(self, text: str) -> dict[Any, Any]:
+        if len(text) <= TEXT_WRAP_CACHE_LARGE_TEXT_CHARS:
+            cache = getattr(self, "_wrap_cache", None)
+            if cache is None:
+                cache = {}
+                self._wrap_cache = cache
+            return cache
+        cache = getattr(self, "_wrap_cache_large", None)
+        if cache is None:
+            cache = {}
+            self._wrap_cache_large = cache
+        return cache
+
     def _wrap_display_rows(self, text: str, max_width: int) -> tuple[WrappedTextRow, ...]:
-        """Return word-aware visual rows using real glyph advances and source indexes."""
+        """Return word-aware visual rows using real glyph advances and source indexes.
+
+        Rows are assembled from per-hard-line wrap results, so editing a long
+        buffer re-wraps only the edited line. Absolute row objects are reused
+        for unchanged lines that kept their source offset (everything before an
+        edit), which keeps typing cost independent of the buffer size.
+        """
         text = str(text or "")
         max_width = max(1, int(max_width))
+        font_key = self._wrap_font_key()
         # Exact text is part of the key. A sampled signature is unsafe for an
         # editable buffer because same-length edits may occur outside its samples.
-        key = (text, max_width, id(self.font), int(self.font.font_size))
-        cached = self._wrap_cache.get(key)
+        key = (text, max_width, font_key)
+        whole_cache = self._wrap_whole_text_cache(text)
+        cached = whole_cache.get(key)
         if cached is not None:
             return cached
 
+        advances = self._wrap_char_advances(font_key)
+        assemblies = getattr(self, "_wrap_assembly_memo", None)
+        if assemblies is None:
+            assemblies = {}
+            self._wrap_assembly_memo = assemblies
+        memo_key = (max_width, font_key)
+        previous = assemblies.get(memo_key)
+        prev_lines, prev_offsets, prev_rows = previous if previous is not None else ((), (), ())
+        lines = text.split("\n")
+        offsets: list[int] = []
+        line_rows: list[tuple[WrappedTextRow, ...]] = []
         rows: list[WrappedTextRow] = []
-        length = len(text)
-        line_start = 0
-        while line_start <= length:
-            newline = text.find("\n", line_start)
-            line_end = length if newline < 0 else newline
-            if line_end == line_start:
-                rows.append(WrappedTextRow("", line_start, line_start, 0))
+        offset = 0
+        prev_count = len(prev_lines)
+        for index, line in enumerate(lines):
+            if index < prev_count and prev_offsets[index] == offset and prev_lines[index] == line:
+                built = prev_rows[index]
+            elif not line:
+                built = (WrappedTextRow("", offset, offset, 0),)
             else:
-                position = line_start
-                while position < line_end:
-                    scan = position
-                    used = 0
-                    last_break = -1
-                    width_at_break = 0
-                    saw_nonspace = False
-                    while scan < line_end:
-                        ch = text[scan]
-                        advance = self._font_char_advance(self.font, ch)
-                        if scan > position and used + advance > max_width:
-                            break
-                        used += advance
-                        scan += 1
-                        if ch.isspace():
-                            if saw_nonspace:
-                                last_break = scan
-                                width_at_break = used
-                        else:
-                            saw_nonspace = True
-                        # Keep following zero-width selectors/joiners with this
-                        # row. The next visible character performs the width
-                        # check above; scan always advances, including at zero.
-                    if scan < line_end and last_break > position:
-                        row_end = last_break
-                        row_width = width_at_break
-                    else:
-                        row_end = max(position + 1, scan)
-                        row_width = used
-                    value = text[position:row_end]
-                    rows.append(WrappedTextRow(value, position, row_end, int(row_width)))
-                    position = row_end
-            if newline < 0:
-                break
-            line_start = line_end + 1
+                built = tuple(
+                    WrappedTextRow(t, s + offset, e + offset, w)
+                    for t, s, e, w, _x in self._wrap_line_rows(line, max_width, advances, font_key)
+                )
+            offsets.append(offset)
+            line_rows.append(built)
+            rows.extend(built)
+            offset += len(line) + 1
+        # Only long buffers benefit from row reuse; short labels would churn it.
+        if len(text) > TEXT_WRAP_CACHE_LARGE_TEXT_CHARS // 4:
+            assemblies[memo_key] = (lines, offsets, line_rows)
+            if len(assemblies) > 8:
+                assemblies.pop(next(iter(assemblies)))
 
-        if not rows:
-            rows = [WrappedTextRow("", 0, 0, 0)]
-        if len(self._wrap_cache) >= TEXT_WRAP_CACHE_MAX_ENTRIES:
-            for stale_key in list(self._wrap_cache)[: max(1, TEXT_WRAP_CACHE_MAX_ENTRIES // 4)]:
-                self._wrap_cache.pop(stale_key, None)
-        result = tuple(rows)
-        self._wrap_cache[key] = result
+        result = tuple(rows) if rows else (WrappedTextRow("", 0, 0, 0),)
+        limit = TEXT_WRAP_CACHE_MAX_ENTRIES if whole_cache is getattr(self, "_wrap_cache", None) else TEXT_WRAP_CACHE_LARGE_ENTRIES
+        if len(whole_cache) >= limit:
+            for stale_key in list(whole_cache)[: max(1, limit // 4)]:
+                whole_cache.pop(stale_key, None)
+        whole_cache[key] = result
         return result
+
+    def _wrap_row_count(self, text: str, max_width: int) -> int:
+        """Number of rows `_wrap_display_rows` would return, without assembling them."""
+        text = str(text or "")
+        max_width = max(1, int(max_width))
+        font_key = self._wrap_font_key()
+        cached = self._wrap_whole_text_cache(text).get((text, max_width, font_key))
+        if cached is not None:
+            return len(cached)
+        advances = self._wrap_char_advances(font_key)
+        return sum(
+            len(self._wrap_line_rows(line, max_width, advances, font_key)) if line else 1
+            for line in text.split("\n")
+        )
 
     def _multiline_layout_rows(self, text: str, inner: Rect) -> tuple[tuple[WrappedTextRow, ...], int]:
         # First use the full editor width. Reserve the scrollbar gutter only when
         # content actually overflows vertically, then reflow once at the final width.
-        rows = self._wrap_display_rows(text, max(1, inner.w - 2))
-        content_h = len(rows) * self.font.line_h + max(10, self.font.line_h // 2)
-        if content_h > inner.h:
+        # The overflow test only counts rows, so a long buffer is never assembled
+        # at the full width just to be discarded.
+        line_h = self.font.line_h
+        pad = max(10, line_h // 2)
+        full_width = max(1, inner.w - 2)
+        if self._wrap_row_count(text, full_width) * line_h + pad > inner.h:
             rows = self._wrap_display_rows(text, max(1, inner.w - 14))
-            content_h = len(rows) * self.font.line_h + max(10, self.font.line_h // 2)
+        else:
+            rows = self._wrap_display_rows(text, full_width)
+        content_h = len(rows) * line_h + pad
         return rows, max(inner.h, content_h)
 
 
